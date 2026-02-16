@@ -1930,6 +1930,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_pad_reflect_1d(params, tensor);
             } break;
+        case GGML_OP_IRFFT:
+            {
+                ggml_compute_forward_irfft(params, tensor);
+            } break;
+        case GGML_OP_FOLD:
+            {
+                ggml_compute_forward_fold(params, tensor);
+            } break;
         case GGML_OP_ROLL:
             {
                 ggml_compute_forward_roll(params, tensor);

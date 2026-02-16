@@ -7808,6 +7808,131 @@ void ggml_compute_forward_pad_reflect_1d(
     }
 }
 
+// ggml_compute_forward_irfft
+
+static void ggml_compute_forward_irfft_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    const int32_t * opts = (const int32_t *) dst->op_params;
+    const int n_fft = opts[0];
+    const int N = n_fft / 2 + 1;  // number of complex pairs
+    const int n_frames = src0->ne[1];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // Each thread handles a subset of frames
+    for (int l = ith; l < n_frames; l += nth) {
+        const float * inp = (const float *)((const char *)src0->data + l * src0->nb[1]);
+        float * out = (float *)((char *)dst->data + l * dst->nb[1]);
+
+        for (int k = 0; k < n_fft; k++) {
+            float real_sum = 0.0f;
+            for (int m = 0; m < N; m++) {
+                float angle = 2.0f * M_PI * k * m / n_fft;
+                float twiddle_real = cosf(angle);
+                float twiddle_imag = sinf(angle);
+                real_sum += inp[2*m] * twiddle_real - inp[2*m+1] * twiddle_imag;
+            }
+            out[k] = real_sum / N;
+        }
+    }
+}
+
+void ggml_compute_forward_irfft(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_irfft_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_fold
+
+static void ggml_compute_forward_fold_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    if (params->ith != 0) return; // single-threaded for simplicity
+
+    const ggml_tensor * src0 = dst->src[0];  // frames [n_fft, n_codes]
+    const ggml_tensor * src1 = dst->src[1];  // window [n_fft]
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32);
+
+    const int32_t * opts = (const int32_t *) dst->op_params;
+    const int n_out = opts[0];
+    const int n_hop = opts[1];
+    const int n_pad = opts[2];
+    const int n_fft = src0->ne[0];
+    const int n_codes = src0->ne[1];
+    const int out_len = n_out - 2 * n_pad;
+
+    float * audio = (float *)dst->data;
+    memset(audio, 0, out_len * sizeof(float));
+
+    // Temporary envelope buffer
+    float * env = (float *)calloc(out_len, sizeof(float));
+
+    const float * window = (const float *)src1->data;
+
+    for (int l = 0; l < n_codes; l++) {
+        const float * frame = (const float *)((const char *)src0->data + l * src0->nb[1]);
+        int start = l * n_hop - n_pad;
+        for (int j = 0; j < n_fft; j++) {
+            int pos = start + j;
+            if (pos >= 0 && pos < out_len) {
+                audio[pos] += frame[j];
+                env[pos] += window[j] * window[j];
+            }
+        }
+    }
+
+    for (int i = 0; i < out_len; i++) {
+        if (env[i] > 0.0f) {
+            audio[i] /= env[i];
+        }
+    }
+
+    free(env);
+}
+
+void ggml_compute_forward_fold(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_fold_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_roll
 
 static int64_t ggml_wrap_index(int64_t i, int64_t ne) {

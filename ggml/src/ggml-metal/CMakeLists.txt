@@ -25,6 +25,7 @@ ggml_add_backend_library(ggml-metal
                          ssm/pipeline-ssm.cpp
                          flash-attn/pipeline-flash-attn.cpp
                          spatial/pipeline-spatial.cpp
+                         fft/pipeline-fft.cpp
                          # ops/ — host-side kernel dispatch (encode commands)
                          ops/ggml-metal-ops.cpp
                          unary/ops-elementwise.cpp
@@ -37,6 +38,7 @@ ggml_add_backend_library(ggml-metal
                          rope/ops-rope.cpp
                          conv/ops-conv.cpp
                          spatial/ops-spatial.cpp
+                         fft/ops-fft.cpp
                          copy/ops-copy.cpp
                          misc/ops-misc.cpp
                         )
@@ -75,6 +77,7 @@ set(METAL_KERNEL_SOURCES
     rope/rope.metal
     conv/conv.metal
     spatial/spatial.metal
+    fft/fft.metal
     flash-attn/flash-attn-simdgroup.metal
     flash-attn/flash-attn-scalar.metal
     flash-attn/flash-attn-intel.metal

@@ -136,5 +136,8 @@ poetry.toml
 # IDE
 /*.code-workspace
 /.windsurf/
+# Tasks
+/.tasks/
+
 # emscripten
 a.out.*

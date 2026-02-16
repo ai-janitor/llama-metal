@@ -1009,6 +1009,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "UPSCALE",
     "PAD",
     "PAD_REFLECT_1D",
+    "IRFFT",
+    "FOLD",
     "ROLL",
     "ARANGE",
     "TIMESTEP_EMBEDDING",
@@ -1047,7 +1049,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1118,6 +1120,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "upscale(x)",
     "pad(x)",
     "pad_reflect_1d(x)",
+    "irfft(x)",
+    "fold(x,w)",
     "roll(x)",
     "arange(start, stop, step)",
     "timestep_embedding(timesteps, dim, max_period)",
@@ -1156,7 +1160,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5069,6 +5073,47 @@ struct ggml_tensor * ggml_pad_reflect_1d(
 
     result->op     = GGML_OP_PAD_REFLECT_1D;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_irfft
+
+struct ggml_tensor * ggml_irfft(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   n_fft) {
+    // a is [n_embd, n_codes] where n_embd = (n_fft/2+1)*2 floats (interleaved real/imag)
+    // output is [n_fft, n_codes]
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_fft, a->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, n_fft);
+
+    result->op     = GGML_OP_IRFFT;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_fold
+
+struct ggml_tensor * ggml_fold(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,      // frames [n_fft, n_codes]
+        struct ggml_tensor  * b,      // window [n_fft]
+        int                   n_out,
+        int                   n_hop,
+        int                   n_pad) {
+    // output is [n_out - 2*n_pad]
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_out - 2*n_pad);
+
+    ggml_set_op_params_i32(result, 0, n_out);
+    ggml_set_op_params_i32(result, 1, n_hop);
+    ggml_set_op_params_i32(result, 2, n_pad);
+
+    result->op     = GGML_OP_FOLD;
+    result->src[0] = a;
+    result->src[1] = b;
 
     return result;
 }

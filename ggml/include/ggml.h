@@ -535,6 +535,8 @@ extern "C" {
         GGML_OP_UPSCALE,
         GGML_OP_PAD,
         GGML_OP_PAD_REFLECT_1D,
+        GGML_OP_IRFFT,
+        GGML_OP_FOLD,
         GGML_OP_ROLL,
         GGML_OP_ARANGE,
         GGML_OP_TIMESTEP_EMBEDDING,
@@ -2243,6 +2245,26 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   p0,
             int                   p1);
+
+    // inverse real FFT
+    // src0: complex input [n_embd, n_codes] (interleaved real/imag pairs)
+    // returns: real output [n_fft, n_codes]
+    GGML_API struct ggml_tensor * ggml_irfft(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   n_fft);
+
+    // fold (overlap-add with window normalization)
+    // src0: windowed frames [n_fft, n_codes]
+    // src1: window function [n_fft]
+    // returns: audio output [n_out - 2*n_pad]
+    GGML_API struct ggml_tensor * ggml_fold(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            int                   n_out,
+            int                   n_hop,
+            int                   n_pad);
 
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.

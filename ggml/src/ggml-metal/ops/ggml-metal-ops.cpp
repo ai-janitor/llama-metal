@@ -264,6 +264,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_pad_reflect_1d(ctx, idx);
             } break;
+        case GGML_OP_IRFFT:
+            {
+                n_fuse = ggml_metal_op_irfft(ctx, idx);
+            } break;
+        case GGML_OP_FOLD:
+            {
+                n_fuse = ggml_metal_op_fold(ctx, idx);
+            } break;
         case GGML_OP_ARANGE:
             {
                 n_fuse = ggml_metal_op_arange(ctx, idx);
