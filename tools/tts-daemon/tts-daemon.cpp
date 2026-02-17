@@ -992,6 +992,8 @@ lovely<|t_0.56|><|code_start|><|634|><|596|><|1766|><|1556|><|1306|><|1285|><|14
             for (int i = 0; i < std::min((int)audio.size(), n_sr/4); ++i) {
                 audio[i] = 0.0f;
             }
+            // add 0.3s silence at end so last word doesn't clip
+            audio.resize(audio.size() + n_sr * 3 / 10, 0.0f);
 
             LOG_INF("time total: %.3f ms, playing %d samples (%.2f s)\n",
                 (ggml_time_us() - t_start) / 1000.0f,
