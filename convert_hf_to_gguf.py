@@ -20,10 +20,13 @@ from transformers import AutoConfig
 
 import math
 import numpy as np
-import torch
 
-if TYPE_CHECKING:
-    from torch import Tensor
+try:
+    import torch
+except ImportError:
+    import torch_compat as torch  # lightweight numpy-based replacement
+
+Tensor = torch.Tensor
 
 if 'NO_LOCAL_GGUF' not in os.environ:
     sys.path.insert(1, str(Path(__file__).parent / 'gguf-py'))
@@ -4960,14 +4963,14 @@ class PlamoModel(TextModel):
         self.gguf_writer.add_file_type(self.ftype)
 
     def shuffle_attn_q_weight(self, data_torch):
-        assert data_torch.size() == (5120, 5120)
+        assert data_torch.shape == (5120, 5120)
         data_torch = data_torch.reshape(8, 5, 128, 5120)
         data_torch = torch.permute(data_torch, (1, 0, 2, 3))
         data_torch = torch.reshape(data_torch, (5120, 5120))
         return data_torch
 
     def shuffle_attn_output_weight(self, data_torch):
-        assert data_torch.size() == (5120, 5120)
+        assert data_torch.shape == (5120, 5120)
         data_torch = data_torch.reshape(5120, 8, 5, 128)
         data_torch = torch.permute(data_torch, (0, 2, 1, 3))
         data_torch = torch.reshape(data_torch, (5120, 5120))
@@ -6021,7 +6024,7 @@ class XLMRobertaModel(BertModel):
             if name.startswith("pooler.dense"):
                 return
 
-            num_loras = data_torch.size(0)
+            num_loras = data_torch.shape[0]
             assert num_loras == len(self._lora_names)
 
             # Split out each LoRA in their own GGUF
@@ -6241,7 +6244,7 @@ class EmbeddingGemma(Gemma3Model):
                                         self.dense_features_dims[prefix] = (mod_conf["in_features"], mod_conf["out_features"])
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
-        from safetensors.torch import load_file
+        from safetensors.numpy import load_file
         module_paths = list(self.module_paths)
         for i, module_path in enumerate(module_paths):
             tensors_file = self.dir_model / module_path / "model.safetensors"
@@ -6252,7 +6255,7 @@ class EmbeddingGemma(Gemma3Model):
                     continue
                 orig_name = name.replace("linear", tensor_name)
                 name = self.map_tensor_name(orig_name)
-                yield name, local_tensor.clone()
+                yield name, torch.from_numpy(local_tensor.copy())
 
     @staticmethod
     def _get_dense_prefix(module_path) -> str:
@@ -10644,12 +10647,12 @@ class LFM2ColBertModel(LFM2Model):
 
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         # dense tensor is stored in a separate safetensors file
-        from safetensors.torch import load_file
+        from safetensors.numpy import load_file
         tensors_file = self.dir_model / "1_Dense" / "model.safetensors"
         assert tensors_file.is_file()
         tensor = load_file(tensors_file)["linear.weight"]
         self.gguf_writer.add_embedding_length_out(tensor.shape[0])
-        yield f"{self.dense_tensor_name}.weight", tensor.clone()
+        yield f"{self.dense_tensor_name}.weight", torch.from_numpy(tensor.copy())
 
 
 @ModelBase.register("Lfm2MoeForCausalLM")
