@@ -112,8 +112,9 @@ kernel void kernel_flash_attn_ext_blk(
             mask_src += args.nb31/2;
         }
 
-        mmin = simd_min(mmin);
-        mmax = simd_max(mmax);
+        // NOTE: use float cast to avoid simd_min/simd_max(half) bug on AMD RDNA
+        mmin = half(simd_min(float(mmin)));
+        mmax = half(simd_max(float(mmax)));
 
         if (mmax > -MAXHALF) {
             if (mmin == 0.0 && mmax == 0.0) {
@@ -407,7 +408,8 @@ void kernel_flash_attn_ext_impl(
                     smax2 = max(smax2, sm2[j*SH + tiisg]);
                 }
 
-                smax2 = simd_max(smax2);
+                // NOTE: use float cast to avoid simd_max(half2) bug on AMD RDNA
+                smax2 = half2(simd_max(float2(smax2)));
 
                 if (max(smax2[0], smax2[1]) <= -MAXHALF/2) {
                     // this barrier is important
