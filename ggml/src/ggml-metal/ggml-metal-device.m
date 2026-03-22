@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-impl.h"
 #import "ggml-metal-ops.h"
 
 #import "ggml-impl.h"
@@ -174,6 +175,8 @@ struct ggml_metal_library {
     ggml_metal_pipelines_t pipelines; // cache of compiled pipelines
 
     NSLock * lock;
+
+    int simd_width; // actual threadExecutionWidth for this device (set after probe)
 };
 
 ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
@@ -329,6 +332,7 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     res->device_index = ggml_metal_device_get_props(dev)->device;
     res->pipelines    = ggml_metal_pipelines_init();
     res->lock         = [NSLock new];
+    res->simd_width   = 32; // safe default; probed and updated after init by caller
 
     return res;
 }
@@ -397,6 +401,7 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
     res->device_index = ggml_metal_device_get_props(dev)->device;
     res->pipelines    = ggml_metal_pipelines_init();
     res->lock         = [NSLock new];
+    res->simd_width   = 32; // safe default; caller may update after probing
 
     return res;
 }
@@ -464,12 +469,20 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         GGML_LOG_DEBUG("%s: compiling pipeline: base = '%s', name = '%s'\n", __func__, base, name);
 
-        id<MTLFunction> mtl_function;
-        if (!cv) {
-            mtl_function = [lib->obj newFunctionWithName:base_func];
-        } else {
-            mtl_function = [lib->obj newFunctionWithName:base_func constantValues:cv->obj error:&error];
-        }
+        // Inject FC_SIMD_WIDTH into every pipeline compilation.
+        // N_SIMDWIDTH is a function_constant in 00-common.metal; all kernels that reference it
+        // require this value. Kernels that don't reference N_SIMDWIDTH ignore the constant.
+        // We always inject it (lib->simd_width is always set: 32 by default, updated after probe).
+        // We inject into a copy of cv (or a fresh one) to avoid mutating the caller's cv.
+        MTLFunctionConstantValues * cv_with_simd =
+            (cv ? [cv->obj copy] : [[MTLFunctionConstantValues alloc] init]);
+        int16_t sw = (int16_t) lib->simd_width;
+        [cv_with_simd setConstantValue:&sw type:MTLDataTypeShort atIndex:FC_SIMD_WIDTH];
+
+        id<MTLFunction> mtl_function =
+            [lib->obj newFunctionWithName:base_func constantValues:cv_with_simd error:&error];
+
+        [cv_with_simd release];
         if (!mtl_function) {
             [lib->lock unlock];
 
@@ -521,6 +534,10 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
     [lib->lock unlock];
 
     return res;
+}
+
+int ggml_metal_library_get_simd_width(ggml_metal_library_t lib) {
+    return lib ? lib->simd_width : 32;
 }
 
 //
@@ -910,7 +927,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->profile.has_matrix_hw               = dev->props.has_simdgroup_mm;
             dev->profile.has_simd_reduction          = dev->props.has_simdgroup_reduction;
             dev->profile.compute_units               = 0;
-            dev->profile.simd_width                  = 32;
+            dev->profile.simd_width                  = 32; // default; probed below after library init
             dev->profile.max_threads_per_threadgroup = (uint32_t)dev->mtl_device.maxThreadsPerThreadgroup.width;
             dev->profile.shared_mem_size             = (uint32_t)dev->mtl_device.maxThreadgroupMemoryLength;
             dev->profile.max_threadgroups_per_dispatch = (dev->profile.vendor == GGML_GPU_VENDOR_INTEL) ? 512 : 0;
@@ -933,6 +950,27 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->library = ggml_metal_library_init(dev);
             if (!dev->library) {
                 GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
+            }
+
+            // Probe actual SIMD group width from a compiled pipeline.
+            // AMD GCN/Vega reports threadExecutionWidth=64 while Apple Silicon and RDNA report 32.
+            // The hardcoded value of 32 causes wrong results on GCN: simd_sum reduces across 64
+            // threads but shared memory slots only cover 32, and tiisg ranges 0-63 not 0-31.
+            //
+            // We compile a simple kernel (kernel_concat has no function constants) and read
+            // threadExecutionWidth from the resulting pipeline state. All kernels on a given
+            // device share the same SIMD group width, so one probe is sufficient.
+            if (dev->library) {
+                struct ggml_metal_pipeline_with_params probe =
+                    ggml_metal_library_compile_pipeline(dev->library, "kernel_concat", "kernel_concat", NULL);
+                if (probe.pipeline) {
+                    const int tw = ggml_metal_pipeline_thread_execution_width(probe);
+                    if (tw > 0) {
+                        dev->profile.simd_width  = (uint32_t) tw;
+                        dev->library->simd_width = tw;
+                        GGML_LOG_INFO("%s: probed simd_width = %d\n", __func__, tw);
+                    }
+                }
             }
 
             if (dev->props.use_residency_sets) {

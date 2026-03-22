@@ -2,6 +2,7 @@
 #include "../ggml-metal-impl.h"
 #include "../ggml-impl.h"
 
+#include <algorithm>
 #include <cassert>
 #include <memory>
 #include <string>
@@ -56,7 +57,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum_rows(ggml_me
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 32*sizeof(float);
+    const int simd_width = std::max(32, ggml_metal_library_get_simd_width(lib));
+    res.smem = (size_t)simd_width*sizeof(float);
 
     if (is_c4) {
         res.smem *= 4;
