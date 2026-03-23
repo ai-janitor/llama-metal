@@ -128,7 +128,7 @@ kernel void kernel_diag_f32(
         device         char * dst,
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]]) {
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
 
     const int32_t i3 = tgpig.z;
     const int32_t i2 = tgpig.y;

@@ -137,7 +137,7 @@ static inline void helper_mv_reduce_and_write(
         ushort sgitg,
         ushort tidx,
         threadgroup char * shmem) {
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const short nsg = FC_mul_mv_nsg;
 
     if (FC_mul_mv_shmem_reduce) {
@@ -190,7 +190,7 @@ void mul_vec_q_n_f32_impl(
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
 
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 16;
 
     // Logical SIMD grouping: on Intel (th_width=16), hardware sgitg/tiisg don't match
@@ -343,7 +343,7 @@ void kernel_mul_mv_q8_0_f32_impl(
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
 
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
 
     // Logical SIMD grouping for Intel (th_width=16)

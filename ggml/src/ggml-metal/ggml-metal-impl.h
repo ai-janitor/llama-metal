@@ -83,7 +83,6 @@
 #define FC_UNARY                       1200
 #define FC_BIN                         1300
 #define FC_SUM_ROWS                    1400
-#define FC_SIMD_WIDTH                  1500
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8

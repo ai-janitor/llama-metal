@@ -1,5 +1,4 @@
 #import "ggml-metal-device.h"
-#import "ggml-metal-impl.h"
 #import "ggml-metal-ops.h"
 
 #import "ggml-impl.h"
@@ -469,20 +468,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         GGML_LOG_DEBUG("%s: compiling pipeline: base = '%s', name = '%s'\n", __func__, base, name);
 
-        // Inject FC_SIMD_WIDTH into every pipeline compilation.
-        // N_SIMDWIDTH is a function_constant in 00-common.metal; all kernels that reference it
-        // require this value. Kernels that don't reference N_SIMDWIDTH ignore the constant.
-        // We always inject it (lib->simd_width is always set: 32 by default, updated after probe).
-        // We inject into a copy of cv (or a fresh one) to avoid mutating the caller's cv.
-        MTLFunctionConstantValues * cv_with_simd =
-            (cv ? [cv->obj copy] : [[MTLFunctionConstantValues alloc] init]);
-        int16_t sw = (int16_t) lib->simd_width;
-        [cv_with_simd setConstantValue:&sw type:MTLDataTypeShort atIndex:FC_SIMD_WIDTH];
-
-        id<MTLFunction> mtl_function =
-            [lib->obj newFunctionWithName:base_func constantValues:cv_with_simd error:&error];
-
-        [cv_with_simd release];
+        id<MTLFunction> mtl_function = cv ?
+            [lib->obj newFunctionWithName:base_func constantValues:cv->obj error:&error] :
+            [lib->obj newFunctionWithName:base_func constantValues:nil error:&error];
         if (!mtl_function) {
             [lib->lock unlock];
 

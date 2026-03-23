@@ -14,7 +14,7 @@ void kernel_mul_mv_q2_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -141,7 +141,7 @@ void kernel_mul_mv_q3_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -330,7 +330,7 @@ void kernel_mul_mv_q4_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -476,7 +476,7 @@ void kernel_mul_mv_q5_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -629,7 +629,7 @@ void kernel_mul_mv_q6_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -761,7 +761,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -890,7 +890,7 @@ void kernel_mul_mv_iq2_xs_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1030,7 +1030,7 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1163,7 +1163,7 @@ void kernel_mul_mv_iq3_s_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1296,7 +1296,7 @@ void kernel_mul_mv_iq2_s_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1430,7 +1430,7 @@ void kernel_mul_mv_iq1_s_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1551,7 +1551,7 @@ void kernel_mul_mv_iq1_m_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1682,7 +1682,7 @@ void kernel_mul_mv_iq4_nl_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1813,7 +1813,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1944,7 +1944,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    const short NW = N_SIMDWIDTH;
+    constexpr short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 

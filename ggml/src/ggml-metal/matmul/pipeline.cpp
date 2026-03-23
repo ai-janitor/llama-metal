@@ -93,10 +93,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
     const char * suffix = "";
 
-    // Read actual SIMD width for this device (AMD GCN/Vega = 64, Apple/RDNA = 32).
-    // Used to size shared memory buffers that the kernel indexes as shmem[NW * row].
-    const int simd_width = std::max(32, ggml_metal_library_get_simd_width(lib));
-
     // use custom matrix x vector kernel
     switch (tsrc0) {
         case GGML_TYPE_F32:
@@ -112,7 +108,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     nsg = std::min(4, (ne00 + 127) / 128);
                     nr0 = 2;
                     nr1 = 1;
-                    smem = (size_t)simd_width*sizeof(float)*nr0;
+                    smem = (size_t)32*sizeof(float)*nr0;
                     suffix = ne00 % 4 == 0 ? "_4" : "";
                 }
             } break;
@@ -140,13 +136,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_Q8_0;
                 nr0 = N_R0_Q8_0;
-                smem = (size_t)simd_width*sizeof(float)*N_R0_Q8_0;
+                smem = (size_t)32*sizeof(float)*N_R0_Q8_0;
             } break;
         case GGML_TYPE_MXFP4:
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
-                smem = (size_t)simd_width*sizeof(float);
+                smem = (size_t)32*sizeof(float);
             } break;
         case GGML_TYPE_Q2_K:
             {
@@ -216,13 +212,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             {
                 nsg = N_SG_IQ4_NL;
                 nr0 = N_R0_IQ4_NL;
-                smem = (size_t)simd_width*sizeof(float);
+                smem = (size_t)32*sizeof(float);
             } break;
         case GGML_TYPE_IQ4_XS:
             {
                 nsg = N_SG_IQ4_XS;
                 nr0 = N_R0_IQ4_XS;
-                smem = (size_t)simd_width*sizeof(float);
+                smem = (size_t)32*sizeof(float);
             } break;
         default:
             {
@@ -257,7 +253,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     res.nr0  = nr0;
     res.nr1  = nr1;
     res.nsg  = nsg;
-    res.smem = use_shmem_reduce ? std::max(smem, (size_t)(nsg * simd_width * nr0 * sizeof(float))) : smem;
+    res.smem = use_shmem_reduce ? std::max(smem, (size_t)(nsg * 32 * nr0 * sizeof(float))) : smem;
 
     return res;
 }
@@ -329,9 +325,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
     const char * suffix = "";
 
-    // Read actual SIMD width for this device (AMD GCN/Vega = 64, Apple/RDNA = 32).
-    const int simd_width = std::max(32, ggml_metal_library_get_simd_width(lib));
-
         // use custom matrix x vector kernel
     switch (tsrc0) {
         case GGML_TYPE_F32:
@@ -341,7 +334,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 nsg = std::min(4, (ne00 + 127) / 128);
                 nr0 = 2;
                 nr1 = 1;
-                smem = (size_t)simd_width*sizeof(float)*nr0;
+                smem = (size_t)32*sizeof(float)*nr0;
                 suffix = ne00 % 4 == 0 ? "_4" : "";
             } break;
         case GGML_TYPE_Q4_0:
@@ -368,13 +361,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_Q8_0;
                 nr0 = N_R0_Q8_0;
-                smem = (size_t)simd_width*sizeof(float)*N_R0_Q8_0;
+                smem = (size_t)32*sizeof(float)*N_R0_Q8_0;
             } break;
         case GGML_TYPE_MXFP4:
             {
                 nsg = N_SG_MXFP4;
                 nr0 = N_R0_MXFP4;
-                smem = (size_t)simd_width*sizeof(float);
+                smem = (size_t)32*sizeof(float);
             } break;
         case GGML_TYPE_Q2_K:
             {
@@ -444,13 +437,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             {
                 nsg = N_SG_IQ4_NL;
                 nr0 = N_R0_IQ4_NL;
-                smem = (size_t)simd_width*sizeof(float);
+                smem = (size_t)32*sizeof(float);
             } break;
         case GGML_TYPE_IQ4_XS:
             {
                 nsg = N_SG_IQ4_XS;
                 nr0 = N_R0_IQ4_XS;
-                smem = (size_t)simd_width*sizeof(float);
+                smem = (size_t)32*sizeof(float);
             } break;
         default:
             {
@@ -484,7 +477,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     res.nr0  = nr0;
     res.nr1  = nr1;
     res.nsg  = nsg;
-    res.smem = use_shmem_reduce ? std::max(smem, (size_t)(nsg * simd_width * sizeof(float))) : smem;
+    res.smem = use_shmem_reduce ? std::max(smem, (size_t)(nsg * 32 * sizeof(float))) : smem;
 
     return res;
 }
