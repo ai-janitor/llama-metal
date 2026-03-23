@@ -321,9 +321,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
     // SCALAR fallback for GPUs without simdgroup matrix multiply support
     // Route ALL batch sizes through scalar on Intel — vec kernel compiles to
     // th_width=16 on Intel iGPU (register pressure) but assumes th_width=32 (BUG-005)
-    // For AMD (th_width=32), use vec for small batch (ne01 < 20) as designed
+    // Route ALL batch sizes through scalar on AMD GCN/Vega (simd_width=64) — vec kernel
+    // hardcodes NW=32 and breaks on 64-wide SIMD (threads 32-63 get uninitialized data)
+    // For AMD RDNA (simd_width=32), use vec for small batch (ne01 < 20) as designed
     const bool use_scalar = !profile->has_matrix_hw &&
-        (profile->vendor == GGML_GPU_VENDOR_INTEL || !ggml_metal_op_flash_attn_ext_use_vec(op));
+        (profile->vendor == GGML_GPU_VENDOR_INTEL || profile->simd_width != 32 || !ggml_metal_op_flash_attn_ext_use_vec(op));
     if (use_scalar) {
         const int dk = ne00;
         const int dv = ne00;
