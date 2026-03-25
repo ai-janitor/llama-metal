@@ -164,19 +164,16 @@ void kernel_mul_mv_q3_K_f32_impl(
 
     float yl[32];
 
-    //const uint16_t kmask1 = 0x3030;
-    //const uint16_t kmask2 = 0x0f0f;
-
-    const short tid = eff_tiisg/4;
-    const short ix  = eff_tiisg%4;
-    const short ip  = tid/4;          // 0 or 1
-    const short il  = 2*((tid%4)/2);  // 0 or 2
-    const short ir  = tid%2;
-    const short l0  = 8*ir;
+    // At NW=32 each thread covers exactly 1 of the 8 tid positions.
+    // At NW<32 (e.g. NW=8) there are only NW/4 unique tid_base values,
+    // so each thread must iterate over chunks_per_thread = 32/NW tid positions.
+    const short ix             = eff_tiisg % 4;
+    const short tid_base       = eff_tiisg / 4;
+    const short chunks_per_thread = 32 / NW;  // 1 at NW=32, 4 at NW=8
 
     // One would think that the Metal compiler would figure out that ip and il can only have
     // 4 possible states, and optimize accordingly. Well, no. It needs help, and we do it
-    // with these two tales.
+    // with these two tables.
     //
     // Possible masks for the high bit
     const ushort4 mm[4] = {{0x0001, 0x0100, 0x0002, 0x0200},  // ip = 0, il = 0
@@ -187,92 +184,102 @@ void kernel_mul_mv_q3_K_f32_impl(
     // Possible masks for the low 2 bits
     const int4 qm[2] = {{0x0003, 0x0300, 0x000c, 0x0c00}, {0x0030, 0x3000, 0x00c0, 0xc000}};
 
-    const ushort4 hm = mm[2*ip + il/2];
-
-    const short shift = 2*il;
-
-    const float v1 = il == 0 ? 4.f : 64.f;
-    const float v2 = 4.f * v1;
-
-    const uint16_t s_shift1 = 4*ip;
-    const uint16_t s_shift2 = s_shift1 + il;
-
-    const short q_offset = 32*ip + l0;
-    const short y_offset = 128*ip + 32*il + l0;
-
-    device const float * y1 = yy + ix*QK_K + y_offset;
-
     uint32_t scales32, aux32;
     thread uint16_t * scales16 = (thread uint16_t *)&scales32;
     thread const int8_t * scales = (thread const int8_t *)&scales32;
 
-    float sumf1[nr0] = {0.f};
-    float sumf2[nr0] = {0.f};
+    float sumf[nr0] = {0.f};
 
-    for (int i = ix; i < nb; i += 4) {
-        for (short l = 0; l < 8; ++l) {
-            yl[l+ 0] = y1[l+ 0];
-            yl[l+ 8] = y1[l+16];
-            yl[l+16] = y1[l+32];
-            yl[l+24] = y1[l+48];
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        const short tid = tid_base + c * (NW / 4);
+        const short ip  = tid / 4;          // 0 or 1
+        const short il  = 2*((tid%4)/2);    // 0 or 2
+        const short ir  = tid % 2;
+        const short l0  = 8 * ir;
+
+        const ushort4 hm = mm[2*ip + il/2];
+
+        const short shift = 2*il;
+
+        const float v1 = il == 0 ? 4.f : 64.f;
+        const float v2 = 4.f * v1;
+
+        const uint16_t s_shift1 = 4*ip;
+        const uint16_t s_shift2 = s_shift1 + il;
+
+        const short q_offset = 32*ip + l0;
+        const short y_offset = 128*ip + 32*il + l0;
+
+        device const float * y1 = yy + ix*QK_K + y_offset;
+
+        float sumf1[nr0] = {0.f};
+        float sumf2[nr0] = {0.f};
+
+        for (int i = ix; i < nb; i += 4) {
+            for (short l = 0; l < 8; ++l) {
+                yl[l+ 0] = y1[l+ 0];
+                yl[l+ 8] = y1[l+16];
+                yl[l+16] = y1[l+32];
+                yl[l+24] = y1[l+48];
+            }
+
+            device const uint16_t * q = (device const uint16_t *)(x[i].qs + q_offset);
+            device const uint16_t * h = (device const uint16_t *)(x[i].hmask + l0);
+            device const uint16_t * a = (device const uint16_t *)(x[i].scales);
+            device const half * dh = &x[i].d;
+
+            for (short row = 0; row < nr0; ++row) {
+                const float d_all = (float)dh[0];
+
+                scales16[0] = a[4];
+                scales16[1] = a[5];
+                aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030;
+                scales16[0] = a[il+0];
+                scales16[1] = a[il+1];
+                scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0f) | aux32;
+
+                float s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
+                for (short l = 0; l < 8; l += 2) {
+                    const int32_t qs = q[l/2];
+                    s1 += yl[l+0] * (qs & qm[il/2][0]);
+                    s2 += yl[l+1] * (qs & qm[il/2][1]);
+                    s3 += ((h[l/2] & hm[0]) ? 0.f : yl[l+0]) + ((h[l/2] & hm[1]) ? 0.f : yl[l+1]);
+                    s4 += yl[l+16] * (qs & qm[il/2][2]);
+                    s5 += yl[l+17] * (qs & qm[il/2][3]);
+                    s6 += ((h[l/2] & hm[2]) ? 0.f : yl[l+16]) + ((h[l/2] & hm[3]) ? 0.f : yl[l+17]);
+                }
+                float d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
+                float d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
+                sumf1[row] += d1 * (scales[0] - 32);
+                sumf2[row] += d2 * (scales[2] - 32);
+
+                s1 = s2 = s3 = s4 = s5 = s6 = 0;
+                for (short l = 0; l < 8; l += 2) {
+                    const int32_t qs = q[l/2+8];
+                    s1 += yl[l+8] * (qs & qm[il/2][0]);
+                    s2 += yl[l+9] * (qs & qm[il/2][1]);
+                    s3 += ((h[l/2+8] & hm[0]) ? 0.f : yl[l+8]) + ((h[l/2+8] & hm[1]) ? 0.f : yl[l+9]);
+                    s4 += yl[l+24] * (qs & qm[il/2][2]);
+                    s5 += yl[l+25] * (qs & qm[il/2][3]);
+                    s6 += ((h[l/2+8] & hm[2]) ? 0.f : yl[l+24]) + ((h[l/2+8] & hm[3]) ? 0.f : yl[l+25]);
+                }
+                d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
+                d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
+                sumf1[row] += d1 * (scales[1] - 32);
+                sumf2[row] += d2 * (scales[3] - 32);
+
+                q  += args.nb01/2;
+                h  += args.nb01/2;
+                a  += args.nb01/2;
+                dh += args.nb01/2;
+            }
+
+            y1 += 4 * QK_K;
         }
 
-        device const uint16_t * q = (device const uint16_t *)(x[i].qs + q_offset);
-        device const uint16_t * h = (device const uint16_t *)(x[i].hmask + l0);
-        device const uint16_t * a = (device const uint16_t *)(x[i].scales);
-        device const half * dh = &x[i].d;
-
-        for (short row = 0; row < nr0; ++row) {
-            const float d_all = (float)dh[0];
-
-            scales16[0] = a[4];
-            scales16[1] = a[5];
-            aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030;
-            scales16[0] = a[il+0];
-            scales16[1] = a[il+1];
-            scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0f) | aux32;
-
-            float s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
-            for (short l = 0; l < 8; l += 2) {
-                const int32_t qs = q[l/2];
-                s1 += yl[l+0] * (qs & qm[il/2][0]);
-                s2 += yl[l+1] * (qs & qm[il/2][1]);
-                s3 += ((h[l/2] & hm[0]) ? 0.f : yl[l+0]) + ((h[l/2] & hm[1]) ? 0.f : yl[l+1]);
-                s4 += yl[l+16] * (qs & qm[il/2][2]);
-                s5 += yl[l+17] * (qs & qm[il/2][3]);
-                s6 += ((h[l/2] & hm[2]) ? 0.f : yl[l+16]) + ((h[l/2] & hm[3]) ? 0.f : yl[l+17]);
-            }
-            float d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
-            float d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
-            sumf1[row] += d1 * (scales[0] - 32);
-            sumf2[row] += d2 * (scales[2] - 32);
-
-            s1 = s2 = s3 = s4 = s5 = s6 = 0;
-            for (short l = 0; l < 8; l += 2) {
-                const int32_t qs = q[l/2+8];
-                s1 += yl[l+8] * (qs & qm[il/2][0]);
-                s2 += yl[l+9] * (qs & qm[il/2][1]);
-                s3 += ((h[l/2+8] & hm[0]) ? 0.f : yl[l+8]) + ((h[l/2+8] & hm[1]) ? 0.f : yl[l+9]);
-                s4 += yl[l+24] * (qs & qm[il/2][2]);
-                s5 += yl[l+25] * (qs & qm[il/2][3]);
-                s6 += ((h[l/2+8] & hm[2]) ? 0.f : yl[l+24]) + ((h[l/2+8] & hm[3]) ? 0.f : yl[l+25]);
-            }
-            d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
-            d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
-            sumf1[row] += d1 * (scales[1] - 32);
-            sumf2[row] += d2 * (scales[3] - 32);
-
-            q  += args.nb01/2;
-            h  += args.nb01/2;
-            a  += args.nb01/2;
-            dh += args.nb01/2;
+        for (int row = 0; row < nr0; ++row) {
+            sumf[row] += (sumf1[row] + 0.25f * sumf2[row]) / (1 << shift);
         }
-
-        y1 += 4 * QK_K;
-    }
-
-    for (int row = 0; row < nr0; ++row) {
-        sumf1[row] = (sumf1[row] + 0.25f * sumf2[row]) / (1 << shift);
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -282,7 +289,7 @@ void kernel_mul_mv_q3_K_f32_impl(
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
         for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-            buf[NW * row + ltid] = sumf1[row];
+            buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
             if (ltid == 0) {
                 float tot = 0.0f;
@@ -293,11 +300,11 @@ void kernel_mul_mv_q3_K_f32_impl(
         }
     } else {
         for (int row = 0; row < nr0; ++row) {
-            sumf1[row] = simd_sum(sumf1[row]);
+            sumf[row] = simd_sum(sumf[row]);
         }
         if (tiisg == 0) {
             for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-                dst_f32[first_row + row] = sumf1[row];
+                dst_f32[first_row + row] = sumf[row];
             }
         }
     }
