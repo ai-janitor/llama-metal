@@ -1979,7 +1979,8 @@ void kernel_mul_mv_mxfp4_f32_impl(
     const int nb   = args.ne00/QK_MXFP4;
     const int ns01 = args.nb01/args.nb00; // this can be larger than nb for permuted src0 tensors
 
-    const short ix = eff_tiisg/2;  // 0...15
+    const short n_pairs = NW/2;    // number of (ix,it) pairs: 16 for NW=32, 8 for NW=16
+    const short ix = eff_tiisg/2;  // 0...n_pairs-1
     const short it = eff_tiisg%2;  // 0 or 1
 
     shmem_f32[eff_tiisg] = kvalues_mxfp4_f[eff_tiisg%16];
@@ -1992,7 +1993,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
 
     // note: just the check `ib < nb` is enough, but adding the redundant `&& ib < ns01` check makes the kernel a bit faster
     //       no idea why that is - needs some deeper investigation [TAG_MUL_MV_WEIRD]
-    for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
+    for (int ib = ix; ib < nb && ib < ns01; ib += n_pairs) {
         device const float4 * y4 = (device const float4 *) yb;
 
         yl[0] = y4[0];
@@ -2014,7 +2015,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
             sumf[row] += e8m0_to_fp32(xb.e) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
         }
 
-        yb += 16 * QK_MXFP4;
+        yb += n_pairs * QK_MXFP4;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -2023,10 +2024,13 @@ void kernel_mul_mv_mxfp4_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * NR0;
-        for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
+        // Loop always runs NR0 iterations so all threads hit the same number of
+        // barriers — required for deadlock-free operation when ne0 is not a
+        // multiple of NSG*NR0 (some simdgroups may have out-of-bounds first_row).
+        for (int row = 0; row < NR0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;

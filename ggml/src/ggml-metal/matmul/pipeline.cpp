@@ -270,6 +270,36 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 smem = (size_t)pw * sizeof(float) * nr0;
                 break;
             case GGML_TYPE_MXFP4:
+                if (!use_shmem_reduce && pw < 32) {
+                    // At NW<32 (Intel iGPU), simd_sum and simd_shuffle_down are
+                    // unreliable. Recompile mxfp4 with shmem_reduce=true so the
+                    // kernel uses the barrier-based reduction path that is known to
+                    // work on Intel (the same path used by the ext kernel at nxpsg=16).
+                    // This gives a fresh pipeline with name _sr=1 and correct smem.
+                    char sr1_name[256];
+                    snprintf(sr1_name, 256, "%s_nsg=%d_sr=1", base, nsg);
+                    ggml_metal_pipeline_with_params sr1 = ggml_metal_library_get_pipeline(lib, sr1_name);
+                    if (!sr1.pipeline) {
+                        ggml_metal_cv_t cv2 = ggml_metal_cv_init();
+                        ggml_metal_cv_set_int16(cv2, nsg, FC_MUL_MV + 0);
+                        ggml_metal_cv_set_bool  (cv2, true, FC_MUL_MV + 2); // sr=1
+                        sr1 = ggml_metal_library_compile_pipeline(lib, base, sr1_name, cv2);
+                        if (sr1.pipeline) {
+                            ggml_metal_pipeline_set_verified_vendors(sr1.pipeline,
+                                GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD | GGML_METAL_VERIFIED_INTEL);
+                        }
+                        ggml_metal_cv_free(cv2);
+                    }
+                    if (sr1.pipeline) {
+                        res = sr1;
+                        smem = (size_t)pw * sizeof(float); // lookup table base
+                        // shmem_reduce needs nsg*pw*nr0 floats; enforce at line 285
+                        use_shmem_reduce = true;
+                        break;
+                    }
+                }
+                smem = (size_t)pw * sizeof(float);
+                break;
             case GGML_TYPE_IQ4_NL:
             case GGML_TYPE_IQ4_XS:
                 smem = (size_t)pw * sizeof(float);
