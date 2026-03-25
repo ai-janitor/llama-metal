@@ -128,7 +128,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 r1ptg = 4; break;
         };
 
-        const bool use_shmem_reduce_ext = false;
+        // Intel's simd_shuffle_down produces wrong results at NW<32.
+        // The ext kernel uses shuffle_down for reduction; enable shmem path on Intel.
+        // (The scalar mul_mv path uses simd_sum which works correctly at NW=16.)
+        const bool use_shmem_reduce_ext = (profile->vendor == GGML_GPU_VENDOR_INTEL);
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op->src[0]->type, op->src[1]->type, nsg, nxpsg, r1ptg, use_shmem_reduce_ext);
 
         // Compute nypsg and r0ptg AFTER pipeline compilation using the actual SIMD width.
@@ -179,7 +182,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
         if (use_shmem_reduce_ext) {
-            const size_t smem = nsg * 32 * sizeof(float);
+            const size_t smem = nsg * ext_simd_w * sizeof(float);
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         }
 
