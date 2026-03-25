@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-impl.h"
 #import "ggml-metal-ops.h"
 
 #import "ggml-impl.h"
@@ -468,9 +469,13 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         GGML_LOG_DEBUG("%s: compiling pipeline: base = '%s', name = '%s'\n", __func__, base, name);
 
-        id<MTLFunction> mtl_function = cv ?
-            [lib->obj newFunctionWithName:base_func constantValues:cv->obj error:&error] :
-            [lib->obj newFunctionWithName:base_func constantValues:nil error:&error];
+        // inject FC_SIMD_WIDTH from the probed simd_width
+        MTLFunctionConstantValues * fcv = cv ? [cv->obj copy] : [[MTLFunctionConstantValues alloc] init];
+        short simd_w = (short) lib->simd_width;
+        [fcv setConstantValue:&simd_w type:MTLDataTypeShort atIndex:FC_SIMD_WIDTH];
+
+        id<MTLFunction> mtl_function = [lib->obj newFunctionWithName:base_func constantValues:fcv error:&error];
+        [fcv release];
         if (!mtl_function) {
             [lib->lock unlock];
 
