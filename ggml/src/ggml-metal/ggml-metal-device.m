@@ -515,6 +515,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
             if (actual_width != simd_w && attempt == 0) {
                 // Pipeline compiled to a different SIMD width than expected.
                 // Recompile with the actual value so NW matches the hardware.
+                // Upward (Vega 64>32) or downward (Intel 16<32) — kernel inner
+                // loops handle variable NW via chunks_per_thread iteration.
                 GGML_LOG_DEBUG("%s: %-40s simd mismatch: expected %d, got %d — recompiling\n",
                         __func__, name, (int)simd_w, actual_width);
                 [obj release];

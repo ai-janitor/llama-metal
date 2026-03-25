@@ -26,7 +26,7 @@ void kernel_mul_mv_ext_q4_f32_impl(
     const short chpt = 4; // chunks per thread
 
   //const short nxpsg = (32);
-    const short nypsg = (32/nxpsg);
+    const short nypsg = (NW/nxpsg);
 
     const short tx = eff_tiisg%nxpsg;
     const short ty = eff_tiisg/nxpsg;
@@ -153,7 +153,7 @@ void kernel_mul_mv_ext_q4x4_f32_impl(
     const short chpt = 1;
 
   //const short nxpsg = (32);
-    const short nypsg = (32/nxpsg);
+    const short nypsg = (NW/nxpsg);
 
     const short tx = eff_tiisg%nxpsg;
     const short ty = eff_tiisg/nxpsg;
@@ -401,32 +401,39 @@ void kernel_mul_mv_t_t_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = eff_tiisg/(NW/NF);
-    const short il = eff_tiisg%(NW/NF);
+    // Each thread processes NB/NW chunks of NF elements per block iteration.
+    // At NW=32: 1 chunk (il has 4 values, 4 threads per block)
+    // At NW=16: 2 chunks (il has 2 values, 2 threads per block)
+    // At NW=8:  4 chunks (il has 1 value, 1 thread per block)
+    const short chunks_per_thread = NB / NW;  // = 32/NW
+    const short threads_per_blk   = NW / NF;  // threads sharing one block
+    const short ix = eff_tiisg / threads_per_blk;
 
     const int ib0 = eff_sgitg*NF + ix;
 
     T1 yl[NF];
 
-    device const T1 * yb = y + (ib0*NB + il*NF);
-
     for (int ib = ib0; ib < nb; ib += NSG*NF) {
-        for (short i = 0; i < NF; ++i) {
-            yl[i] = yb[i];
-        }
+        for (short c = 0; c < chunks_per_thread; c++) {
+            const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
 
-        for (short row = 0; row < NR0; row++) {
-            device const T0 * xb = ax[row] + (ib*NB + il*NF);
+            device const T1 * yb = y + (ib*NB + il*NF);
 
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NF; ++i) {
-                sumq += xb[i] * yl[i];
+            for (short i = 0; i < NF; ++i) {
+                yl[i] = yb[i];
             }
 
-            sumf[row] += sumq;
-        }
+            for (short row = 0; row < NR0; row++) {
+                device const T0 * xb = ax[row] + (ib*NB + il*NF);
 
-        yb += NSG*NF*NW;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF; ++i) {
+                    sumq += xb[i] * yl[i];
+                }
+
+                sumf[row] += sumq;
+            }
+        }
     }
 
     for (int i = nb*NB + eff_sgitg*NW + eff_tiisg; i < args.ne00; i += NW*NSG) {
@@ -532,32 +539,35 @@ void kernel_mul_mv_t_t_4_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = eff_tiisg/(NW/NF);
-    const short il = eff_tiisg%(NW/NF);
+    const short chunks_per_thread = NB / NW;
+    const short threads_per_blk   = NW / NF;
+    const short ix = eff_tiisg / threads_per_blk;
 
     const int ib0 = eff_sgitg*NF + ix;
 
     T14 yl4[NF4];
 
-    device const T14 * yb4 = y4 + (ib0*NB + il*NF)/4;
-
     for (int ib = ib0; ib < nb; ib += NSG*NF) {
-        for (short i = 0; i < NF4; ++i) {
-            yl4[i] = yb4[i];
-        }
+        for (short c = 0; c < chunks_per_thread; c++) {
+            const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
 
-        for (short row = 0; row < NR0; row++) {
-            device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
+            device const T14 * yb4 = y4 + (ib*NB + il*NF)/4;
 
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NF4; ++i) {
-                sumq += dot(float4(xb4[i]), float4(yl4[i]));
+            for (short i = 0; i < NF4; ++i) {
+                yl4[i] = yb4[i];
             }
 
-            sumf[row] += sumq;
-        }
+            for (short row = 0; row < NR0; row++) {
+                device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
 
-        yb4 += NSG*NF*NW/4;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                    sumq += dot(float4(xb4[i]), float4(yl4[i]));
+                }
+
+                sumf[row] += sumq;
+            }
+        }
     }
 
     for (int i = nb*NB + eff_sgitg*NW + eff_tiisg; i < args.ne00; i += NW*NSG) {

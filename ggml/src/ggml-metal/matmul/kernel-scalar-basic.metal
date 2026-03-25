@@ -224,38 +224,40 @@ void mul_vec_q_n_f32_impl(
 
     float sumf[NR0] = {0.f};
 
-    const short ix = (eff_tiisg/(NW/NQ));
-    const short il = (eff_tiisg%(NW/NQ))*8;
-
-    //const int ib0 = sgitg*NQ + ix;
+    // Each thread processes one or more half-blocks per iteration.
+    // At NW=32: halves_per_thread=1, each thread does 1 half (il=0 or il=8)
+    // At NW=16: halves_per_thread=2, each thread does both halves (il=0 and il=8)
+    // At NW=8:  halves_per_thread=4, each thread does 4 halves
+    // This ensures all block halves are covered regardless of SIMD width.
+    const short halves_per_thread = (NW >= 2*NQ) ? 1 : (2*NQ + NW - 1) / NW;
+    const short threads_per_block = (NW >= 2*NQ) ? (NW/NQ) : 1;
+    const short ix = eff_tiisg / threads_per_block;
     const int ib0 = ix;
 
     float yl[16]; // src1 vector cache
 
-    //device const float * yb = y + ix*QK4_0 + il;
-    device const float * yb = y + ib0*QK4_0 + il;
-
-    // each thread in a SIMD group deals with half a block.
-    //for (int ib = ib0; ib < nb; ib += NSG*NQ) {
     for (int ib = ib0; ib < nb; ib += NQ) {
-        float sumy[2] = { 0.f, 0.f };
+        for (short h = 0; h < halves_per_thread; h++) {
+            const short il = (eff_tiisg % threads_per_block * halves_per_thread + h) * 8;
 
-        FOR_UNROLL (short i = 0; i < 8; i += 2) {
-            sumy[0]  += yb[i +  0] + yb[i +  1];
-            yl[i + 0] = yb[i +  0];
-            yl[i + 1] = yb[i +  1]/256.f;
+            device const float * yb = y + ib*QK4_0 + il;
 
-            sumy[1]  += yb[i + 16] + yb[i + 17];
-            yl[i + 8] = yb[i + 16]/16.f;
-            yl[i + 9] = yb[i + 17]/4096.f;
+            float sumy[2] = { 0.f, 0.f };
+
+            FOR_UNROLL (short i = 0; i < 8; i += 2) {
+                sumy[0]  += yb[i +  0] + yb[i +  1];
+                yl[i + 0] = yb[i +  0];
+                yl[i + 1] = yb[i +  1]/256.f;
+
+                sumy[1]  += yb[i + 16] + yb[i + 17];
+                yl[i + 8] = yb[i + 16]/16.f;
+                yl[i + 9] = yb[i + 17]/4096.f;
+            }
+
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
+            }
         }
-
-        FOR_UNROLL (short row = 0; row < NR0; row++) {
-            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
-        }
-
-        yb += QK4_0 * 16;
-        //yb += NSG*NQ*QK4_0;
     }
 
     device float * dst_f32 = (device float *) dst + im*args.ne0*args.ne1 + r1*args.ne0;
@@ -375,33 +377,35 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = eff_tiisg/(NW/NQ);
-    const short il = eff_tiisg%(NW/NQ);
+    const short chunks_per_thread = (NW >= 2*NQ) ? 1 : (2*NQ + NW - 1) / NW;
+    const short threads_per_blk   = (NW >= 2*NQ) ? (NW/NQ) : 1;
+    const short ix = eff_tiisg / threads_per_blk;
 
     const int ib0 = eff_sgitg*NQ + ix;
 
     float yl[NQ];
 
-    device const float * yb = y + ib0*QK8_0 + il*NQ;
-
-    // each thread in a SIMD group deals with NQ quants at a time
     for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-        for (short i = 0; i < NQ; ++i) {
-            yl[i] = yb[i];
-        }
+        for (short c = 0; c < chunks_per_thread; c++) {
+            const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
 
-        for (short row = 0; row < NR0; row++) {
-            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            device const float * yb = y + ib*QK8_0 + il*NQ;
 
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                sumq += qs[i] * yl[i];
+            for (short i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
             }
 
-            sumf[row] += sumq*ax[row][ib].d;
-        }
+            for (short row = 0; row < NR0; row++) {
+                device const int8_t * qs = ax[row][ib].qs + il*NQ;
 
-        yb += NSG*NQ*QK8_0;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qs[i] * yl[i];
+                }
+
+                sumf[row] += sumq*ax[row][ib].d;
+            }
+        }
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
