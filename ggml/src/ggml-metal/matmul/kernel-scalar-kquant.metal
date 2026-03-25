@@ -858,6 +858,13 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
 
     const int nb32 = nb * (QK_K / 32);
 
+    // Load shared-memory lookup tables for iq2_xxs dequantization.
+    // The tables need 256 uint64_t entries (svalues) and 128 uint8_t entries (ssigns).
+    // On GPUs with NW < 32 (e.g., Intel iGPU with NW=16), the total thread count per
+    // threadgroup may differ from the assumed 64 (2 simdgroups * 32 threads). We use
+    // tidx (flat thread index within the threadgroup) to ensure all entries are loaded
+    // regardless of NW. Total threads = NSG_dispatch * 32 (dispatch always uses 32
+    // threads per simdgroup slot), so tidx covers 0..(NSG_dispatch*32-1).
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
@@ -875,9 +882,23 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
 
     const int ix = eff_tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    // Inner loop fix for variable SIMD width (NW).
+    //
+    // The original loop used a stride of 32, assuming NW=32 (one thread per ib32
+    // position per stride). On Intel iGPU with NW=16, only positions 0..15 are
+    // visited per stride, leaving positions 16..31 unprocessed. For k=1024,
+    // nb32 = 32, so half the data is skipped, causing ~50% error.
+    //
+    // Fix: stride by NW instead of 32. Each thread handles ib32 positions
+    // ix, ix+NW, ix+2*NW, ... covering all nb32 positions. The y pointer is
+    // re-derived per ib32 position (y + 32*ib32) instead of using incremental
+    // advancement, which was tied to the old stride of 32.
+    for (int ib32 = ix; ib32 < nb32; ib32 += NW) {
 
-    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        // Re-derive y pointer for this ib32 position.
+        // Each ib32 corresponds to a 32-float chunk of the input vector.
+        device const float * y4 = y + 32 * ib32;
+
         for (short i = 0; i < 32; ++i) {
             yl[i] = y4[i];
         }
@@ -908,8 +929,6 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
             dh += args.nb01/2;
             q2 += args.nb01/2;
         }
-
-        y4 += 32 * 32;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
