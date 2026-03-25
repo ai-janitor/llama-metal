@@ -110,12 +110,13 @@ static inline void helper_mv_reduce_and_write_shmem(
         ushort local_tid,
         short  group_size,
         threadgroup float * buf) {
-    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+    // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+    for (short row = 0; row < NR0; ++row) {
         buf[group_size * row + local_tid] = sumf[row];
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (local_tid == 0) {
+        if (local_tid == 0 && r0 + row < ne01) {
             float tot = 0.0f;
             for (short i = 0; i < group_size; i++) {
                 tot += buf[group_size * row + i];
@@ -168,10 +169,11 @@ static inline void helper_mv_reduce_and_write(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+    // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+    for (short row = 0; row < NR0; ++row) {
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
-        if (tiisg == 0 && sgitg == 0) {
+        if (tiisg == 0 && sgitg == 0 && r0 + row < ne01) {
             dst_f32[r0 + row] = tot;
         }
     }
@@ -270,6 +272,7 @@ void mul_vec_q_n_f32_impl(
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * NR0;
         helper_mv_reduce_and_write_shmem<NR0>(dst_f32, sumf, r0, args.ne01, ltid, NW, buf);
     } else {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
         for (int row = 0; row < NR0; ++row) {
             const float tot = simd_sum(sumf[row]);
 

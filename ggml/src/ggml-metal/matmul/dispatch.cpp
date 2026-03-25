@@ -128,9 +128,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 r1ptg = 4; break;
         };
 
-        // Intel's simd_shuffle_down produces wrong results at NW<32.
-        // The ext kernel uses shuffle_down for reduction; enable shmem path on Intel.
-        // (The scalar mul_mv path uses simd_sum which works correctly at NW=16.)
+        // Intel's simd_shuffle_down and simd_sum produce wrong results at NW<32.
+        // Enable shmem-based reduction on Intel for both ext and scalar kernels.
         const bool use_shmem_reduce_ext = (profile->vendor == GGML_GPU_VENDOR_INTEL);
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op->src[0]->type, op->src[1]->type, nsg, nxpsg, r1ptg, use_shmem_reduce_ext);
 
@@ -385,7 +384,12 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     }
 
     if (!dispatched) {
-        const bool use_shmem_reduce = false;
+        // Intel's simd_sum and simd_shuffle_down are broken at NW>=16.
+        // Many scalar mul_mv kernels compile to NW=16 on Intel UHD 630,
+        // producing wrong results with simd_sum in the sr=0 path.
+        // Enable shmem_reduce (sr=1) for ALL scalar mul_mv kernels on Intel
+        // so the barrier-based reduction path is used instead.
+        const bool use_shmem_reduce = (profile->vendor == GGML_GPU_VENDOR_INTEL);
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce);
 
         // mul_mv is the last resort — if it's not verified for this vendor, crash
