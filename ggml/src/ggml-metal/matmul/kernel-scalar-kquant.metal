@@ -790,12 +790,15 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
-        int nval = 4;
-        int pos  = (NW*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (NW*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        const int total_threads = NW * NSG;
+        const int nval = 4;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval; pos < 256; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xxs_grid[pos + i];
+        }
+        const int nval2 = 2;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval2; pos < 128; pos += total_threads*nval2) {
+            for (int i = 0; i < nval2; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -919,12 +922,15 @@ void kernel_mul_mv_iq2_xs_f32_impl(
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 512);
     {
-        int nval = 8;
-        int pos  = (NW*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xs_grid[pos + i];
-        nval = 2;
-        pos  = (NW*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        const int total_threads = NW * NSG;
+        const int nval = 8;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval; pos < 512; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xs_grid[pos + i];
+        }
+        const int nval2 = 2;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval2; pos < 128; pos += total_threads*nval2) {
+            for (int i = 0; i < nval2; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -1059,12 +1065,15 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
     threadgroup uint32_t * svalues = (threadgroup uint32_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
-        int nval = 4;
-        int pos  = (NW*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3xxs_grid[pos + i];
-        nval = 2;
-        pos  = (NW*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        const int total_threads = NW * NSG;
+        const int nval = 4;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval; pos < 256; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3xxs_grid[pos + i];
+        }
+        const int nval2 = 2;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval2; pos < 128; pos += total_threads*nval2) {
+            for (int i = 0; i < nval2; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -1191,9 +1200,11 @@ void kernel_mul_mv_iq3_s_f32_impl(
 
     threadgroup uint32_t * svalues = (threadgroup uint32_t *) shmem;
     {
-        int nval = 8;
-        int pos  = (NW*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3s_grid[pos + i];
+        const int total_threads = NW * NSG;
+        const int nval = 8;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval; pos < 512; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3s_grid[pos + i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
