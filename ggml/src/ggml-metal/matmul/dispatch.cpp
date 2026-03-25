@@ -131,7 +131,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
                 r1ptg = 4; break;
         };
 
-        const bool use_shmem_reduce_ext = (profile->vendor == GGML_GPU_VENDOR_INTEL);
+        const bool use_shmem_reduce_ext = false; // adaptive per-pipeline FC_SIMD_WIDTH eliminates need
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op->src[0]->type, op->src[1]->type, nsg, nxpsg, r1ptg, use_shmem_reduce_ext);
 
         // Vendor verification — fall back to mul_mv if unverified
@@ -378,7 +378,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     }
 
     if (!dispatched) {
-        const bool use_shmem_reduce = (profile->vendor == GGML_GPU_VENDOR_INTEL);
+        const bool use_shmem_reduce = false; // adaptive per-pipeline FC_SIMD_WIDTH eliminates need
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce);
 
         // mul_mv is the last resort — if it's not verified for this vendor, crash
@@ -623,7 +623,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
         }
     } else {
-        const bool use_shmem_reduce_id = (profile->vendor == GGML_GPU_VENDOR_INTEL);
+        const bool use_shmem_reduce_id = false; // adaptive per-pipeline FC_SIMD_WIDTH eliminates need
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op, use_shmem_reduce_id);
 
         const int nr0 = pipeline.nr0;

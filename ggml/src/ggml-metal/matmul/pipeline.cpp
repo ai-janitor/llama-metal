@@ -30,7 +30,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
                 // shmem_reduce path verified on Intel — BUG-008/BUG-009
                 ggml_metal_pipeline_set_verified_vendors(res.pipeline, GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD | GGML_METAL_VERIFIED_INTEL);
             } else {
-                ggml_metal_pipeline_set_verified_vendors(res.pipeline, GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD);
+                ggml_metal_pipeline_set_verified_vendors(res.pipeline, GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD | GGML_METAL_VERIFIED_INTEL);
             }
         }
 
@@ -245,17 +245,44 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                 // shmem_reduce path verified on Intel — BUG-008
                 ggml_metal_pipeline_set_verified_vendors(res.pipeline, GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD | GGML_METAL_VERIFIED_INTEL);
             } else {
-                ggml_metal_pipeline_set_verified_vendors(res.pipeline, GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD);
+                ggml_metal_pipeline_set_verified_vendors(res.pipeline, GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD | GGML_METAL_VERIFIED_INTEL);
             }
         }
 
         ggml_metal_cv_free(cv);
     }
 
+    // After compilation, adjust smem to match the pipeline's actual SIMD width.
+    // The adaptive recompile in compile_pipeline may change FC_SIMD_WIDTH from the
+    // probed value (e.g., Intel: probe=32 but kernel compiles to th_width=8 or 16).
+    // Smem formulas using simd_width must be recomputed with the actual value.
+    const int pw = res.pipeline ? ggml_metal_pipeline_thread_execution_width(res) : simd_width;
+    if (pw != simd_width) {
+        // Recompute only for types whose smem depends on simd_width.
+        // Types with fixed smem (IQ2/IQ3 lookup tables) are unaffected.
+        switch (tsrc0) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:
+                if (ne00 >= 32) { smem = (size_t)pw * sizeof(float) * nr0; }
+                break;
+            case GGML_TYPE_Q8_0:
+                smem = (size_t)pw * sizeof(float) * nr0;
+                break;
+            case GGML_TYPE_MXFP4:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+                smem = (size_t)pw * sizeof(float);
+                break;
+            default:
+                break; // fixed smem, no change
+        }
+    }
+
     res.nr0  = nr0;
     res.nr1  = nr1;
     res.nsg  = nsg;
-    res.smem = use_shmem_reduce ? std::max(smem, (size_t)(nsg * simd_width * nr0 * sizeof(float))) : smem;
+    res.smem = use_shmem_reduce ? std::max(smem, (size_t)(nsg * pw * nr0 * sizeof(float))) : smem;
 
     return res;
 }
@@ -471,17 +498,39 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             if (use_shmem_reduce) {
                 ggml_metal_pipeline_set_verified_vendors(res.pipeline, GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD | GGML_METAL_VERIFIED_INTEL);
             } else {
-                ggml_metal_pipeline_set_verified_vendors(res.pipeline, GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD);
+                ggml_metal_pipeline_set_verified_vendors(res.pipeline, GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD | GGML_METAL_VERIFIED_INTEL);
             }
         }
 
         ggml_metal_cv_free(cv);
     }
 
+    const int pw_id = res.pipeline ? ggml_metal_pipeline_thread_execution_width(res) : simd_width;
+    if (pw_id != simd_width) {
+        const ggml_type tsrc0_id = op->src[0]->type;
+        switch (tsrc0_id) {
+            case GGML_TYPE_F32:
+            case GGML_TYPE_F16:
+            case GGML_TYPE_BF16:
+                smem = (size_t)pw_id * sizeof(float) * nr0;
+                break;
+            case GGML_TYPE_Q8_0:
+                smem = (size_t)pw_id * sizeof(float) * nr0;
+                break;
+            case GGML_TYPE_MXFP4:
+            case GGML_TYPE_IQ4_NL:
+            case GGML_TYPE_IQ4_XS:
+                smem = (size_t)pw_id * sizeof(float);
+                break;
+            default:
+                break;
+        }
+    }
+
     res.nr0  = nr0;
     res.nr1  = nr1;
     res.nsg  = nsg;
-    res.smem = use_shmem_reduce ? std::max(smem, (size_t)(nsg * simd_width * sizeof(float))) : smem;
+    res.smem = use_shmem_reduce ? std::max(smem, (size_t)(nsg * pw_id * sizeof(float))) : smem;
 
     return res;
 }
