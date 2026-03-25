@@ -226,24 +226,27 @@ void mul_vec_q_n_f32_impl(
 
     float sumf[NR0] = {0.f};
 
-    // Each thread processes one or more half-blocks per iteration.
-    // At NW=32: halves_per_thread=1, each thread does 1 half (il=0 or il=8)
-    // At NW=16: halves_per_thread=2, each thread does both halves (il=0 and il=8)
-    // At NW=8:  halves_per_thread=4, each thread does 4 halves
-    // This ensures all block halves are covered regardless of SIMD width.
-    const short halves_per_thread = (NW >= 2*NQ) ? 1 : (2*NQ + NW - 1) / NW;
-    const short threads_per_block = (NW >= 2*NQ) ? (NW/NQ) : 1;
-    const short ix = eff_tiisg / threads_per_block;
-    const int ib0 = ix;
+    // Variable NW support for Intel iGPU (compiles to NW=16):
+    // The 32-thread space maps to NQ=16 block positions x 2 half-block offsets:
+    //   ix = flat_pos / 2  → block index (0..15)
+    //   il = (flat_pos % 2) * 8  → element offset within block (0 or 8)
+    // At NW=16, only flat_pos 0..15 are covered — il=8 half is missed.
+    // Fix: chunks_per_thread = 32/NW outer loop covers all positions.
+    // At NW=32 this is 1 iteration (no-op).
+    const short chunks_per_thread = 32 / NW;  // 1 at NW=32, 2 at NW=16
 
     float yl[16]; // src1 vector cache
 
-    for (int ib = ib0; ib < nb; ib += NQ) {
-        for (short h = 0; h < halves_per_thread; h++) {
-            const short il = (eff_tiisg % threads_per_block * halves_per_thread + h) * 8;
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        const short flat_pos = eff_tiisg + c * NW;
+        const short ix = flat_pos / 2;
+        const short il = (flat_pos % 2) * 8;
 
-            device const float * yb = y + ib*QK4_0 + il;
+        const int ib0 = ix;
 
+        device const float * yb = y + ib0*QK4_0 + il;
+
+        for (int ib = ib0; ib < nb; ib += NQ) {
             float sumy[2] = { 0.f, 0.f };
 
             FOR_UNROLL (short i = 0; i < 8; i += 2) {
@@ -259,6 +262,8 @@ void mul_vec_q_n_f32_impl(
             FOR_UNROLL (short row = 0; row < NR0; row++) {
                 sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
             }
+
+            yb += QK4_0 * NQ;
         }
     }
 
@@ -380,20 +385,24 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short chunks_per_thread = (NW >= 2*NQ) ? 1 : (2*NQ + NW - 1) / NW;
-    const short threads_per_blk   = (NW >= 2*NQ) ? (NW/NQ) : 1;
-    const short ix = eff_tiisg / threads_per_blk;
-
-    const int ib0 = eff_sgitg*NQ + ix;
+    // Variable NW support for q8_0 (Intel iGPU NW=16):
+    // 32-thread space = NQ=8 block positions x 4 element offsets.
+    // At NW=16, il only covers 0..1, missing offsets 2..3.
+    // Fix: flatten to virtual 32-thread index, iterate chunks_per_thread times.
+    const short chunks_per_thread = 32 / NW;  // 1 at NW=32, 2 at NW=16
 
     float yl[NQ];
 
-    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-        for (short c = 0; c < chunks_per_thread; c++) {
-            const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        const short flat_pos = eff_tiisg + c * NW;
+        const short ix = flat_pos / 4;
+        const short il = flat_pos % 4;
 
-            device const float * yb = y + ib*QK8_0 + il*NQ;
+        const int ib0 = eff_sgitg*NQ + ix;
 
+        device const float * yb = y + ib0*QK8_0 + il*NQ;
+
+        for (int ib = ib0; ib < nb; ib += NSG*NQ) {
             for (short i = 0; i < NQ; ++i) {
                 yl[i] = yb[i];
             }
@@ -408,6 +417,8 @@ void kernel_mul_mv_q8_0_f32_impl(
 
                 sumf[row] += sumq*ax[row][ib].d;
             }
+
+            yb += NSG*NQ*QK8_0;
         }
     }
 
