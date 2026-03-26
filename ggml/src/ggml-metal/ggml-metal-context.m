@@ -40,7 +40,8 @@ struct ggml_metal {
     bool use_fusion;
     bool use_concurrency;
     bool use_graph_optimize;
-    int profile;  // GGML_METAL_PROFILE: 0=off, 1=per-graph GPU timing, 2=per-op GPU timing
+    int profile;        // GGML_METAL_PROFILE: 0=off, 1=per-graph GPU timing, 2=per-op GPU timing
+    int profile_n;      // number of graph computes left to profile at level 2 (then auto-drops to 1)
 
     int debug_graph;
     int debug_fusion;
@@ -155,9 +156,11 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     // GGML_METAL_PROFILE: 0=off (default), 1=per-graph GPU wall time, 2=per-op GPU timing breakdown
     // Setting the env var without a value (or empty) defaults to 1 for backward compatibility
+    // Profile=2 runs for 2 graph computes (prompt + first decode), then drops to level 1
     {
         const char * val = getenv("GGML_METAL_PROFILE");
-        res->profile = val ? (val[0] ? atoi(val) : 1) : 0;
+        res->profile   = val ? (val[0] ? atoi(val) : 1) : 0;
+        res->profile_n = (res->profile >= 2) ? 2 : 0;
     }
 
     if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
@@ -502,8 +505,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
         // GGML_METAL_PROFILE=2: per-op GPU timing breakdown
         // Encodes and completes one command buffer per op, measuring GPU time for each.
-        // This serializes all GPU work and is slow — intended for profiling only.
-        if (ctx->profile >= 2) {
+        // This serializes all GPU work — runs for profile_n graph computes, then drops to level 1.
+        if (ctx->profile >= 2 && ctx->profile_n > 0) {
+            ctx->profile_n--;
             id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
             // per-op-type accumulators indexed by ggml_op enum
