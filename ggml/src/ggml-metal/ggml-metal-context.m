@@ -40,6 +40,7 @@ struct ggml_metal {
     bool use_fusion;
     bool use_concurrency;
     bool use_graph_optimize;
+    bool profile;  // GGML_METAL_PROFILE=1: print per-graph GPU timing
 
     int debug_graph;
     int debug_fusion;
@@ -151,6 +152,7 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 
     res->use_graph_optimize = true;
+    res->profile = (getenv("GGML_METAL_PROFILE") != NULL);
 
     if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
         res->use_graph_optimize = false;
@@ -237,6 +239,38 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
+
+        // GGML_METAL_PROFILE: read GPU timestamps immediately after completion,
+        // before cmd_buf_last is cleared. GPUStartTime/GPUEndTime are only
+        // valid after the command buffer has completed.
+        if (ctx->profile) {
+            const int n_cb = ctx->n_cb;
+            double gpu_min_start = 1e30, gpu_max_end = 0;
+            double gpu_total = 0;
+            int n_active = 0;
+
+            for (int cb_idx = 0; cb_idx <= n_cb; ++cb_idx) {
+                id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+                if (!cmd_buf) continue;
+
+                double start = [cmd_buf GPUStartTime];
+                double end   = [cmd_buf GPUEndTime];
+                if (start == 0 && end == 0) continue; // not yet scheduled
+                double dt = (end - start) * 1000.0;
+
+                if (start < gpu_min_start) gpu_min_start = start;
+                if (end   > gpu_max_end)   gpu_max_end   = end;
+                gpu_total += dt;
+                n_active++;
+            }
+
+            if (n_active > 0) {
+                double wall_ms = (gpu_max_end - gpu_min_start) * 1000.0;
+                fprintf(stderr, "[METAL_PROFILE] graph: %d cmd_bufs, GPU wall=%.2f ms, sum=%.2f ms\n",
+                    n_active, wall_ms, gpu_total);
+            }
+        }
+
         ctx->cmd_buf_last = nil;
     }
 
