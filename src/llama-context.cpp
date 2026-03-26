@@ -1212,6 +1212,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // DEBUG: read persistent state BEFORE graph compute to detect corruption between graphs
+    if (getenv("GGML_METAL_DUMP_TENSORS")) {
+        static ggml_tensor * pre_tracked = nullptr;
+        // Find state_predelta-0 tensor in current graph
+        ggml_cgraph * gf_pre = res->get_gf();
+        for (int i = 0; i < ggml_graph_n_nodes(gf_pre); i++) {
+            ggml_tensor * t = ggml_graph_node(gf_pre, i);
+            if (strstr(t->name, "state_predelta-0") && t->ne[1] == 4096) {
+                pre_tracked = t;
+                break;
+            }
+        }
+        if (pre_tracked) {
+            // Read the view_src (the persistent ssm_states_all) if available
+            ggml_tensor * persistent = pre_tracked->view_src ? pre_tracked->view_src : pre_tracked;
+            if (persistent->view_src) persistent = persistent->view_src; // one more level
+            float buf[4] = {};
+            ggml_backend_tensor_get(persistent, buf, 0, 4 * sizeof(float));
+            fprintf(stderr, "[PRE-COMPUTE tok=%d] ssm_states_all[0:3]: %.6f %.6f %.6f %.6f  ptr=%p\n",
+                    (int)ubatch.n_tokens, buf[0], buf[1], buf[2], buf[3], persistent->data);
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1257,18 +1280,46 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             fprintf(stderr, "] max_rounds=%d\n", dump_max);
         }
 
-        // One-shot: dump ALL node names for first decode graph
-        static bool decode_graph_dumped = false;
-        if (dump_env && !decode_graph_dumped && ubatch.n_tokens == 1) {
-            decode_graph_dumped = true;
+        // Track state buffer: find state_predelta-0 (or new_state-0) and print after every compute
+        if (dump_env) {
+            static void * tracked_state_data = nullptr;
+            static ggml_tensor * tracked_tensor = nullptr;
+
+            // Find the state tensor in this graph (only need to find once per graph type)
             ggml_cgraph * gf = res->get_gf();
-            fprintf(stderr, "[DUMP] decode graph has %d nodes. Searching for patterns...\n", ggml_graph_n_nodes(gf));
             for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
                 ggml_tensor * t = ggml_graph_node(gf, i);
-                if (strstr(t->name, "state_predelta-0") || (strstr(t->name, "s_copy") && t->ne[0] <= 4)) {
-                    fprintf(stderr, "  [%3d] %-40s op=%-16s ne=[%lld,%lld,%lld,%lld] data=%p\n",
-                            i, t->name, ggml_op_name(t->op), t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->data);
+                // Track new_state-0 (the CPY source) or state_predelta-0 (the read)
+                if (strstr(t->name, "new_state-0") && t->op != GGML_OP_RESHAPE) {
+                    // Find the CPY destination — the persistent cache view
+                    // The CPY node has new_state as src[0] and cache_view as the node itself
+                    // Actually, the CPY writes to a view of ssm_states_all
+                    // Let's just track new_state-0 itself for the WRITE value
+                    float buf[4] = {};
+                    ggml_backend_tensor_get(t, buf, 0, 4 * sizeof(float));
+                    fprintf(stderr, "[STATE_TRACK tok=%d] new_state-0 (written): %.6f %.6f %.6f %.6f\n",
+                            (int)ubatch.n_tokens, buf[0], buf[1], buf[2], buf[3]);
+                    break;
                 }
+                if (strstr(t->name, "state_predelta-0") && t->ne[1] == 4096) {
+                    float buf[4] = {};
+                    ggml_backend_tensor_get(t, buf, 0, 4 * sizeof(float));
+                    fprintf(stderr, "[STATE_TRACK tok=%d] state_predelta-0 (read): %.6f %.6f %.6f %.6f  data=%p\n",
+                            (int)ubatch.n_tokens, buf[0], buf[1], buf[2], buf[3], t->data);
+                    if (!tracked_state_data) {
+                        tracked_state_data = t->data;
+                        tracked_tensor = t;
+                    }
+                    break;
+                }
+            }
+
+            // Also read from the tracked pointer if we have one (catches changes between graphs)
+            if (tracked_tensor) {
+                float buf[4] = {};
+                ggml_backend_tensor_get(tracked_tensor, buf, 0, 4 * sizeof(float));
+                fprintf(stderr, "[STATE_TRACK tok=%d] persistent@%p: %.6f %.6f %.6f %.6f\n",
+                        (int)ubatch.n_tokens, tracked_state_data, buf[0], buf[1], buf[2], buf[3]);
             }
         }
         if (dump_env && dump_round < dump_max) {
