@@ -123,7 +123,10 @@ add_library(llama
             models/qwen3vl-moe.cpp
             models/qwen3moe.cpp
             models/qwen3next.cpp
-            models/qwen35.cpp
+            models/qwen35/qwen35.cpp
+            models/qwen35/delta-net-chunking.cpp
+            models/qwen35/delta-net-fused.cpp
+            models/qwen35/delta-net-unfused.cpp
             models/qwen35moe.cpp
             models/refact.cpp
             models/rnd1.cpp

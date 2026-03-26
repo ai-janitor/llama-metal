@@ -580,6 +580,28 @@ private:
                 ggml_tensor * state,
                 int           il);
 
+    // Fused decode path — Metal kernel, single-sequence only (n_seqs == 1).
+    // Inputs must be preprocessed (l2-normed, scaled, sigmoided, state reshaped).
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_fused(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * beta,
+                ggml_tensor * state,
+                int           il);
+
+    // Unfused decode path — elementwise ops, multi-sequence fallback (n_seqs > 1).
+    // Inputs must be preprocessed (l2-normed, scaled, sigmoided, state reshaped).
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_unfused(
+                ggml_tensor * q,
+                ggml_tensor * k,
+                ggml_tensor * v,
+                ggml_tensor * g,
+                ggml_tensor * beta,
+                ggml_tensor * state,
+                int           il);
+
     ggml_tensor * build_norm_gated(
                 ggml_tensor * input,
                 ggml_tensor * weights,
