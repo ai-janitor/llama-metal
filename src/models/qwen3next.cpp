@@ -409,8 +409,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen3next::build_delta_net_aut
     ggml_tensor * new_state;
 
     if (n_seqs == 1) {
-        ggml_tensor * g_t    = ggml_cont(ctx0, ggml_reshape_4d(ctx0, g, 1, 1, H_k, n_seqs));
-        ggml_tensor * beta_t = ggml_cont(ctx0, ggml_reshape_4d(ctx0, beta, 1, 1, H_k, n_seqs));
+        // g and beta are contiguous (from ggml_mul and ggml_sigmoid respectively).
+        // Reshape is sufficient — no need to materialize with cont.
+        ggml_tensor * g_t    = ggml_reshape_4d(ctx0, g, 1, 1, H_k, n_seqs);
+        ggml_tensor * beta_t = ggml_reshape_4d(ctx0, beta, 1, 1, H_k, n_seqs);
 
         ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, S_k, H_k, n_tokens);
         ggml_tensor * k3 = ggml_reshape_3d(ctx0, k, S_k, H_k, n_tokens);
@@ -763,10 +765,18 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
                      2 * head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
     cb(v_conv, "v_conv", il);
 
-    // Unsqueeze them
-    q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
-    k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
-    v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    // Reshape conv output slices to 4D.
+    // For decode (n_seq_tokens==1), single-row view is contiguous — reshape suffices.
+    // For prompt (n_seq_tokens>1), interleaved QKV stride requires cont.
+    if (n_seq_tokens == 1) {
+        q_conv = ggml_reshape_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+        k_conv = ggml_reshape_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+        v_conv = ggml_reshape_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    } else {
+        q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+        k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+        v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
+    }
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state               = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim * num_v_heads, 1, n_seqs);
@@ -834,8 +844,8 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
     cur = build_lora_mm(model.layers[il].ssm_out, final_output);
     cb(cur, "linear_attn_out", il);
 
-    // Reshape back to original dimensions
-    cur = ggml_cont_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
+    // build_norm_gated output is contiguous — reshape is sufficient.
+    cur = ggml_reshape_2d(ctx0, cur, n_embd, n_seq_tokens * n_seqs);
     return cur;
 }
 
