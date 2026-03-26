@@ -228,7 +228,9 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     if (!dispatched &&
         !ggml_is_transposed(op->src[0]) &&
-        !ggml_is_transposed(op->src[1]) &&
+        // src1 transposition is handled natively via ks1 stride in the kernel's B-loading
+        // section — no ggml_cont(ggml_transpose(...)) needed in the compute graph.
+        // This eliminates ~150 GPU memcpy dispatches per decode step on SSM models (Qwen3.5).
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
         profile->has_matrix_hw && ne00 >= 64 && ne11 > ne11_mm_min) {
@@ -278,7 +280,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     if (!dispatched &&
         !ggml_is_transposed(op->src[0]) &&
-        !ggml_is_transposed(op->src[1]) &&
+        // src1 transposition handled natively via stride in B-loading (same as kernel_mul_mm)
         !profile->has_matrix_hw &&
         ne01 >= 64 &&  // need at least one full BM=64 tile — tiny M wastes tile compute and risks timeout
         ne11 > ne11_mm_min &&

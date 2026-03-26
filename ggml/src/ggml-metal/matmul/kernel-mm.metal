@@ -58,6 +58,14 @@ kernel void kernel_mul_mm(
 
     const short iy = 8*(tiitg % NL1);
 
+    // ks1: K-stride in elements for src1. When src1 is contiguous along K, ks1=1.
+    // When src1 is transposed (e.g., delta-net SSM producing [N,K] layout), ks1=N
+    // and consecutive K elements are ks1 apart. This eliminates the need for
+    // ggml_cont(ggml_transpose(...)) in the compute graph — the kernel reads the
+    // transposed layout directly, avoiding 150+ GPU memcpy dispatches per decode step.
+    // (Profile=2 showed CONT at 28% of decode GPU time on Qwen3.5-4B, AMD 5500M)
+    const short ks1 = args.nb10 / sizeof(T1);
+
     device const T1 * y = (device const T1 *)(src1
         + args.nb13*i13
         + args.nb12*i12
@@ -140,19 +148,28 @@ kernel void kernel_mul_mm(
 
                 const short ib = 4*sx + sy;
 
-                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *(y + i*ks1) : 0;
+            }
+        } else if (ks1 > 1) {
+            // transposed src1: scalar gather with ks1 stride into shmem.
+            // Eliminates ggml_cont(ggml_transpose(...)) GPU memcpy dispatches.
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+          //const short dx = sx;
+          //const short dy = sy;
+            const short ly = (tiitg/NL1)%8;
+            const short ib = 4*sx + sy;
+            for (short i = 0; i < 8; ++i) {
+                *(sb + 64*ib + 8*ly + i) = (S1) *(y + i*ks1);
             }
         } else {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
-
           //const short dx = sx;
           //const short dy = sy;
-
             const short ly = (tiitg/NL1)%8;
-
             const short ib = 4*sx + sy;
-
+            // contiguous fast path: vec8 bulk load
             *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
         }
 #else
@@ -201,17 +218,28 @@ kernel void kernel_mul_mm(
                 //const short lx = (tiitg/NL1)%8;
                 //const short ly = i;
 
-                *(sb + NK*(8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                *(sb + NK*(8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) *(y + i*ks1) : 0;
             }
-        } else {
+        } else if (ks1 > 1) {
+            // transposed src1: scalar gather with ks1 stride into shmem.
+            // Eliminates ggml_cont(ggml_transpose(...)) GPU memcpy dispatches.
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
-
             //const short lx = i;
             const short ly = (tiitg/NL1)%8;
             //const short lx = (tiitg/NL1)%8;
             //const short ly = i;
-
+            for (short i = 0; i < 8; ++i) {
+                *(sb + NK*(8*sy + ly) + 8*sx + i) = (S1) *(y + i*ks1);
+            }
+        } else {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            //const short lx = i;
+            const short ly = (tiitg/NL1)%8;
+            //const short lx = (tiitg/NL1)%8;
+            //const short ly = i;
+            // contiguous fast path: vec8 bulk load
             *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4)(*((device T1_2x4 *) y));
         }
 #endif
@@ -219,7 +247,8 @@ kernel void kernel_mul_mm(
         il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
 
-        y += NK;
+        // advance by NK elements along K dimension, respecting src1 stride
+        y += NK*ks1;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -446,6 +475,9 @@ kernel void kernel_mul_mm_id(
 
     const short iy = 8*(tiitg % NL1);
 
+    // ks1: K-stride in elements (see kernel_mul_mm for full explanation)
+    const short ks1 = args.nb10 / sizeof(T1);
+
     device const T1 * y = (device const T1 *)(src1
         + args.nb13*i13
         + args.nb12*i12
@@ -528,19 +560,28 @@ kernel void kernel_mul_mm_id(
 
                 const short ib = 4*sx + sy;
 
-                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                *(sb + 64*ib + 8*ly + lx) = loop_k + iy + i < args.ne00 ? (S1) *(y + i*ks1) : 0;
+            }
+        } else if (ks1 > 1) {
+            // transposed src1: scalar gather with ks1 stride into shmem.
+            // Eliminates ggml_cont(ggml_transpose(...)) GPU memcpy dispatches.
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+          //const short dx = sx;
+          //const short dy = sy;
+            const short ly = (tiitg/NL1)%8;
+            const short ib = 4*sx + sy;
+            for (short i = 0; i < 8; ++i) {
+                *(sb + 64*ib + 8*ly + i) = (S1) *(y + i*ks1);
             }
         } else {
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
-
           //const short dx = sx;
           //const short dy = sy;
-
             const short ly = (tiitg/NL1)%8;
-
             const short ib = 4*sx + sy;
-
+            // contiguous fast path: vec8 bulk load
             *(threadgroup S1_2x4 *)(sb + 64*ib + 8*ly) = (S1_2x4)(*((device T1_2x4 *) y));
         }
 #else
@@ -589,17 +630,28 @@ kernel void kernel_mul_mm_id(
                 //const short lx = (tiitg/NL1)%8;
                 //const short ly = i;
 
-                *(sb + NK*(8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) *((device T1 *) y + i) : 0;
+                *(sb + NK*(8*sy + ly) + 8*sx + lx) = loop_k + iy + i < args.ne00 ? (S1) *(y + i*ks1) : 0;
             }
-        } else {
+        } else if (ks1 > 1) {
+            // transposed src1: scalar gather with ks1 stride into shmem.
+            // Eliminates ggml_cont(ggml_transpose(...)) GPU memcpy dispatches.
             const short sx = (tiitg%NL1);
             const short sy = (tiitg/NL1)/8;
-
             //const short lx = i;
             const short ly = (tiitg/NL1)%8;
             //const short lx = (tiitg/NL1)%8;
             //const short ly = i;
-
+            for (short i = 0; i < 8; ++i) {
+                *(sb + NK*(8*sy + ly) + 8*sx + i) = (S1) *(y + i*ks1);
+            }
+        } else {
+            const short sx = (tiitg%NL1);
+            const short sy = (tiitg/NL1)/8;
+            //const short lx = i;
+            const short ly = (tiitg/NL1)%8;
+            //const short lx = (tiitg/NL1)%8;
+            //const short ly = i;
+            // contiguous fast path: vec8 bulk load
             *(threadgroup S1_2x4 *)(sb + NK*(8*sy + ly) + 8*sx) = (S1_2x4)(*((device T1_2x4 *) y));
         }
 #endif
@@ -607,7 +659,8 @@ kernel void kernel_mul_mm_id(
         il = (il + 2 < nl) ? il + 2 : il % 2;
         x  = (il < 2) ? x + (2 + nl - 1)/nl : x;
 
-        y += NK;
+        // advance by NK elements along K dimension, respecting src1 stride
+        y += NK*ks1;
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
