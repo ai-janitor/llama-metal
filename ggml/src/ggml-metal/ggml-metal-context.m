@@ -1,5 +1,7 @@
 #import "ggml-metal-context.h"
 
+#import <mach/mach_time.h>
+
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
 
@@ -42,6 +44,7 @@ struct ggml_metal {
     bool use_graph_optimize;
     int profile;        // GGML_METAL_PROFILE: 0=off, 1=per-graph GPU timing, 2=per-op GPU timing
     int profile_n;      // number of graph computes left to profile at level 2 (then auto-drops to 1)
+    uint64_t profile_cpu_start; // mach_absolute_time at graph_compute start (for CPU vs GPU comparison)
 
     int debug_graph;
     int debug_fusion;
@@ -280,8 +283,17 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
 
             if (n_active > 0) {
                 double wall_ms = (gpu_max_end - gpu_min_start) * 1000.0;
-                fprintf(stderr, "[METAL_PROFILE] graph: %d cmd_bufs, GPU wall=%.2f ms, sum=%.2f ms\n",
-                    n_active, wall_ms, gpu_total);
+
+                // CPU wall time: from graph_compute start to synchronize completion.
+                // The gap between CPU wall and GPU wall reveals dispatch overhead —
+                // time the CPU spends encoding ops before the GPU starts, plus
+                // time waiting for the GPU to finish after the last encode.
+                mach_timebase_info_data_t tb;
+                mach_timebase_info(&tb);
+                double cpu_ms = (double)(mach_absolute_time() - ctx->profile_cpu_start) * tb.numer / tb.denom / 1e6;
+
+                fprintf(stderr, "[METAL_PROFILE] graph: %d cmd_bufs, GPU wall=%.2f ms, CPU wall=%.2f ms, gap=%.2f ms (%d nodes)\n",
+                    n_active, wall_ms, cpu_ms, cpu_ms - wall_ms, ctx->gf->n_nodes);
             }
         }
 
@@ -502,6 +514,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     @autoreleasepool {
         ctx->gf = gf;
+
+        // stamp CPU start time for profile=1 CPU vs GPU comparison
+        if (ctx->profile >= 1) {
+            ctx->profile_cpu_start = mach_absolute_time();
+        }
 
         // GGML_METAL_PROFILE=2: per-op GPU timing breakdown
         // Encodes and completes one command buffer per op, measuring GPU time for each.
