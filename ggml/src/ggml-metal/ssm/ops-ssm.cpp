@@ -268,3 +268,50 @@ int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
 
     return 1;
 }
+
+// Fused gated delta-net recurrence — replaces 16 elementwise ops per SSM layer.
+// src0=k, src1=v, src2=q, src3=gate, src4=beta, src5=state → dst (output + new_state packed)
+int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    // k[S, H, T], v[S, H, T], q[S, H, T]
+    const int32_t S = op->src[0]->ne[0];
+    const int32_t H = op->src[0]->ne[1];
+    const int32_t T = op->src[0]->ne[2];
+    const int32_t n_seqs = op->src[5]->ne[3];
+
+    // GQA: key heads may differ from value heads
+    // For now assume symmetric (H_k = H). Can be extended via op_params.
+    const int32_t H_k = H;
+
+    const float scale = ggml_get_op_params_f32(op, 0);
+
+    ggml_metal_kargs_gated_delta_net args = {
+        /*.S        =*/ S,
+        /*.H        =*/ H,
+        /*.n_tokens =*/ T,
+        /*.n_seqs   =*/ n_seqs,
+        /*.H_k      =*/ H_k,
+        /*.scale    =*/ scale,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // k
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // v
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3); // q
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4); // gate
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 5); // beta
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), 6); // state
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         7); // dst
+
+    // Grid: S rows × H heads, TG = 32 threads (1 simdgroup)
+    ggml_metal_encoder_dispatch_threadgroups(enc, S, H, 1, 32, 1, 1);
+
+    return 1;
+}
