@@ -44,9 +44,9 @@ void kernel_mul_mv_ext_q4_f32_impl(
     device const q_t * xq = (i01 < args.ne01) ? (device const q_t *) (src0 + offset0) + tx/chpb : (device const q_t *) src0;
 
     // ks1: K-stride in elements for src1. 1 when contiguous, >1 when transposed.
-    // When src1 is transposed (e.g., delta-net SSM), consecutive K elements are ks1 apart.
-    // This eliminates ggml_cont(ggml_transpose(...)) GPU memcpy dispatches in the graph.
-    const int ks1 = args.nb10 / sizeof(float);
+    // FC_mul_mv_src1_trans is a compile-time function constant — the compiler dead-code-eliminates
+    // the unused path, so the contiguous fast path has ZERO overhead from transposed support.
+    const int ks1 = FC_mul_mv_src1_trans ? (args.nb10 / sizeof(float)) : 1;
 
     // When src1 is contiguous (ks1==1), use float4* bulk addressing.
     // When transposed (ks1>1), use scalar base pointer with strided gather.
@@ -417,7 +417,7 @@ void kernel_mul_mv_t_t_impl(
     device const T1 * y = (device const T1 *) (src1 + offset1);
 
     // ks1: K-stride in elements for src1 (1=contiguous, >1=transposed)
-    const int ks1 = args.nb10 / sizeof(T1);
+    const int ks1 = FC_mul_mv_src1_trans ? (args.nb10 / sizeof(T1)) : 1;
 
     // pointers to src0 rows
     device const T0 * ax [NR0];
@@ -558,7 +558,7 @@ void kernel_mul_mv_t_t_4_impl(
     device const T14 * y4 = (device const T14 *) (src1 + offset1);
 
     // ks1: K-stride in elements (1=contiguous, >1=transposed)
-    const int ks1 = args.nb10 / sizeof(T1);
+    const int ks1 = FC_mul_mv_src1_trans ? (args.nb10 / sizeof(T1)) : 1;
 
     // pointers to src0 rows
     device const T0  * ax [NR0];
@@ -696,7 +696,7 @@ void kernel_mul_mv_t_t_short_impl(
     device const T1 * y = (device const T1 *) (src1 + offset1);
 
     // ks1: K-stride in elements (1=contiguous, >1=transposed)
-    const int ks1 = args.nb10 / sizeof(T1);
+    const int ks1 = FC_mul_mv_src1_trans ? (args.nb10 / sizeof(T1)) : 1;
 
     float res = 0.0f;
 

@@ -8,12 +8,12 @@
 #include <memory>
 #include <string>
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_metal_library_t lib, ggml_type tsrc0, ggml_type tsrc1, int nsg, int nxpsg, int r1ptg, bool use_shmem_reduce) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_metal_library_t lib, ggml_type tsrc0, ggml_type tsrc1, int nsg, int nxpsg, int r1ptg, bool use_shmem_reduce, bool src1_trans) {
     char base[256];
     char name[256];
 
     snprintf(base, 256, "kernel_mul_mv_ext_%s_%s_r1_%d", ggml_type_name(tsrc0), ggml_type_name(tsrc1), r1ptg);
-    snprintf(name, 256, "%s_nsg=%d_nxpsg=%d_sr=%d", base, nsg, nxpsg, use_shmem_reduce ? 1 : 0);
+    snprintf(name, 256, "%s_nsg=%d_nxpsg=%d_sr=%d_st=%d", base, nsg, nxpsg, use_shmem_reduce ? 1 : 0, src1_trans ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -22,6 +22,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
         ggml_metal_cv_set_int16(cv, nsg,   FC_MUL_MV + 0);
         ggml_metal_cv_set_int16(cv, nxpsg, FC_MUL_MV + 1);
         ggml_metal_cv_set_bool(cv, use_shmem_reduce, FC_MUL_MV + 2);
+        // src1_trans: compile-time specialization for transposed src1.
+        // When false (normal path), the compiler dead-code-eliminates all strided
+        // access code — zero overhead. When true, enables ks1-strided B-loading.
+        ggml_metal_cv_set_bool(cv, src1_trans, FC_MUL_MV + 3);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
         if (res.pipeline) {
@@ -75,7 +79,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool use_shmem_reduce) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool use_shmem_reduce, bool src1_trans) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
@@ -230,7 +234,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     };
 
     snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
-    snprintf(name, 256, "%s_nsg=%d_sr=%d", base, nsg, use_shmem_reduce ? 1 : 0);
+    snprintf(name, 256, "%s_nsg=%d_sr=%d_st=%d", base, nsg, use_shmem_reduce ? 1 : 0, src1_trans ? 1 : 0);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -238,6 +242,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
         ggml_metal_cv_set_int16(cv, nsg, FC_MUL_MV + 0);
         ggml_metal_cv_set_bool(cv, use_shmem_reduce, FC_MUL_MV + 2);
+        ggml_metal_cv_set_bool(cv, src1_trans, FC_MUL_MV + 3);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
         if (res.pipeline) {

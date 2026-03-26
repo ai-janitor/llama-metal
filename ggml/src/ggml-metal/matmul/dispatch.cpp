@@ -131,7 +131,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // Intel's simd_shuffle_down and simd_sum produce wrong results at NW<32.
         // Enable shmem-based reduction on Intel for both ext and scalar kernels.
         const bool use_shmem_reduce_ext = (profile->vendor == GGML_GPU_VENDOR_INTEL);
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op->src[0]->type, op->src[1]->type, nsg, nxpsg, r1ptg, use_shmem_reduce_ext);
+        const bool src1_trans = ggml_is_transposed(op->src[1]);
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op->src[0]->type, op->src[1]->type, nsg, nxpsg, r1ptg, use_shmem_reduce_ext, src1_trans);
 
         // Compute nypsg and r0ptg AFTER pipeline compilation using the actual SIMD width.
         // The adaptive recompile may change FC_SIMD_WIDTH (e.g., Intel: 32→16 or 32→8).
@@ -228,9 +229,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     if (!dispatched &&
         !ggml_is_transposed(op->src[0]) &&
-        // src1 transposition is handled natively via ks1 stride in the kernel's B-loading
-        // section — no ggml_cont(ggml_transpose(...)) needed in the compute graph.
-        // This eliminates ~150 GPU memcpy dispatches per decode step on SSM models (Qwen3.5).
+        !ggml_is_transposed(op->src[1]) &&
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
         profile->has_matrix_hw && ne00 >= 64 && ne11 > ne11_mm_min) {
@@ -280,7 +279,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 
     if (!dispatched &&
         !ggml_is_transposed(op->src[0]) &&
-        // src1 transposition handled natively via stride in B-loading (same as kernel_mul_mm)
+        !ggml_is_transposed(op->src[1]) &&
         !profile->has_matrix_hw &&
         ne01 >= 64 &&  // need at least one full BM=64 tile — tiny M wastes tile compute and risks timeout
         ne11 > ne11_mm_min &&
@@ -392,7 +391,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         // Enable shmem_reduce (sr=1) for ALL scalar mul_mv kernels on Intel
         // so the barrier-based reduction path is used instead.
         const bool use_shmem_reduce = (profile->vendor == GGML_GPU_VENDOR_INTEL);
-        auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce);
+        const bool src1_trans_mv = ggml_is_transposed(op->src[1]);
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, src1_trans_mv);
 
         // mul_mv is the last resort — if it's not verified for this vendor, crash
         // rather than silently producing wrong results

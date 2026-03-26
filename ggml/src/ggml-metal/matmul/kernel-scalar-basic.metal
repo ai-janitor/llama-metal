@@ -94,6 +94,9 @@ constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 // When true, use shared memory reduction instead of simd_sum (for Intel iGPU)
 constant bool  FC_mul_mv_shmem_reduce [[function_constant(FC_MUL_MV + 2)]];
+// When true, src1 is transposed: K elements are nb10/sizeof(T1) apart, not contiguous.
+// Compile-time dispatch avoids runtime branching in the hot loop — zero overhead when false.
+constant bool  FC_mul_mv_src1_trans [[function_constant(FC_MUL_MV + 3)]];
 
 // Shared memory reduction for GPUs where simd_sum() produces wrong results or where
 // actual SIMD width differs from N_SIMDWIDTH (Intel UHD 630: th_width=16, not 32).

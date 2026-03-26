@@ -137,9 +137,6 @@ inline void load_a_mxfp4_to_shmem(
 
 // Cooperative load: B tile (BN rows × BK cols) into shared memory
 // B is f32 (src1 type). idx_n checked against ne11 (N dimension)
-// stride_elem: element stride along K dimension. 1 when src1 is contiguous along K,
-// >1 when src1 is transposed (e.g., delta-net SSM). This allows the kernel to read
-// transposed src1 directly, eliminating ggml_cont(ggml_transpose(...)) GPU dispatches.
 inline void load_b_to_shmem(
     device const float * data_b,
     threadgroup float2 * buf_b,
@@ -150,18 +147,15 @@ inline void load_b_to_shmem(
     uint ne_b_rows,
     uint block,
     uint end_k,
-    uint stride_b,
-    uint stride_elem
+    uint stride_b
 ) {
-    // pos_b is in K-element units; scale by stride_elem for byte-correct indexing
-    const uint idx_base = pos_b * stride_elem + loadc * stride_b + loadr * LOAD_VEC_B * stride_elem;
+    const uint idx = pos_b + loadc * stride_b + loadr * LOAD_VEC_B;
     const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
 
     if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B + 1 < end_k) {
-        // two consecutive K elements, stride_elem apart in device memory
-        buf_b[buf_idx] = float2(data_b[idx_base], data_b[idx_base + stride_elem]);
+        buf_b[buf_idx] = float2(data_b[idx], data_b[idx + 1]);
     } else if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B < end_k) {
-        buf_b[buf_idx] = float2(data_b[idx_base], 0.0f);
+        buf_b[buf_idx] = float2(data_b[idx], 0.0f);
     } else {
         buf_b[buf_idx] = float2(0.0f);
     }
@@ -272,9 +266,6 @@ kernel void kernel_mul_mat_tiled_impl(
     // B matrix setup (shared across all types — B is always f32)
     device const float * data_b = (device const float *)(src1 + args.nb13*i13 + args.nb12*i12 + args.nb11*(ic*BN));
     const uint stride_b = args.nb11 / sizeof(float);  // B row stride in elements
-    // stride_elem: K-element stride. 1 when contiguous, >1 when src1 is transposed.
-    // Passed to load_b_to_shmem so the tiled kernel can read transposed src1 directly.
-    const uint stride_elem = args.nb10 / sizeof(float);
 
     const uint end_k = args.ne00;  // K dimension
 
@@ -306,8 +297,7 @@ kernel void kernel_mul_mat_tiled_impl(
                 ne11,
                 block,
                 end_k,
-                stride_b,
-                stride_elem
+                stride_b
             );
         }
 
