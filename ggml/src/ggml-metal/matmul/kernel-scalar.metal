@@ -19,14 +19,14 @@ void kernel_mul_mv_ext_q4_f32_impl(
     const short NSG   = FC_mul_mv_nsg;
     const short nxpsg = FC_mul_mv_nxpsg;
 
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
     const short chpt = 4; // chunks per thread
 
   //const short nxpsg = (32);
-    const short nypsg = (32/nxpsg);
+    const short nypsg = (NW/nxpsg);
 
     const short tx = eff_tiisg%nxpsg;
     const short ty = eff_tiisg/nxpsg;
@@ -43,10 +43,23 @@ void kernel_mul_mv_ext_q4_f32_impl(
 
     device const q_t * xq = (i01 < args.ne01) ? (device const q_t *) (src0 + offset0) + tx/chpb : (device const q_t *) src0;
 
+    // ks1: K-stride in elements for src1. 1 when contiguous, >1 when transposed.
+    // FC_mul_mv_src1_trans is a compile-time function constant — the compiler dead-code-eliminates
+    // the unused path, so the contiguous fast path has ZERO overhead from transposed support.
+    const int ks1 = FC_mul_mv_src1_trans ? (args.nb10 / sizeof(float)) : 1;
+
+    // When src1 is contiguous (ks1==1), use float4* bulk addressing.
+    // When transposed (ks1>1), use scalar base pointer with strided gather.
     device const float4 * y4[r1ptg];
+    device const float  * yf[r1ptg]; // scalar pointer for transposed path
 
     for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
-        y4[ir1] = (i11 + ir1 < args.ne11) ? (device const float4 *) (src1 + offset1 + ir1*args.nb11) + tx : (device const float4 *) src1;
+        if (ks1 == 1) {
+            y4[ir1] = (i11 + ir1 < args.ne11) ? (device const float4 *) (src1 + offset1 + ir1*args.nb11) + tx : (device const float4 *) src1;
+        } else {
+            // transposed: base pointer + element offset, will gather with ks1 stride
+            yf[ir1] = (i11 + ir1 < args.ne11) ? (device const float *) (src1 + offset1 + ir1*args.nb11) + tx*4*ks1 : (device const float *) src1;
+        }
     }
 
     float sumf[r1ptg] = { [ 0 ... r1ptg - 1 ] = 0.0f };
@@ -71,19 +84,32 @@ void kernel_mul_mv_ext_q4_f32_impl(
         for (short ch = 0; ch < chpt; ++ch) {
 #pragma unroll(r1ptg)
             for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-                sumf[ir1] += dot(lx[ch], y4[ir1][ch*nxpsg]);
+                if (ks1 == 1) {
+                    sumf[ir1] += dot(lx[ch], y4[ir1][ch*nxpsg]);
+                } else {
+                    // transposed src1: gather 4 elements with ks1 stride into float4 for dot product.
+                    // Cannot use float4* cast because K elements are ks1 apart in device memory.
+                    const int base = ch*nxpsg*4*ks1;
+                    float4 yv = float4(yf[ir1][base], yf[ir1][base + ks1], yf[ir1][base + 2*ks1], yf[ir1][base + 3*ks1]);
+                    sumf[ir1] += dot(lx[ch], yv);
+                }
             }
         }
 
 #pragma unroll(r1ptg)
         for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-            y4[ir1] += chpt*nxpsg;
+            if (ks1 == 1) {
+                y4[ir1] += chpt*nxpsg;
+            } else {
+                yf[ir1] += chpt*nxpsg*4*ks1;
+            }
         }
     }
 
     if (FC_mul_mv_shmem_reduce) {
         // Intel iGPU: threadgroup memory reduction (SIMD-width-independent)
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW;
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
         for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
             buf[eff_tiisg] = sumf[ir1];
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -120,10 +146,9 @@ void kernel_mul_mv_ext_q4_f32_impl(
         }
 
         if (tx == 0) {
-            for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
-                device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
-
-                if (i01 < args.ne01) {
+            for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                if (i11 + ir1 < args.ne11 && i01 < args.ne01) {
+                    device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
                     dst_f32[i01] = sumf[ir1];
                 }
             }
@@ -146,14 +171,14 @@ void kernel_mul_mv_ext_q4x4_f32_impl(
     const short NSG   = FC_mul_mv_nsg;
     const short nxpsg = FC_mul_mv_nxpsg;
 
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
     const short chpt = 1;
 
   //const short nxpsg = (32);
-    const short nypsg = (32/nxpsg);
+    const short nypsg = (NW/nxpsg);
 
     const short tx = eff_tiisg%nxpsg;
     const short ty = eff_tiisg/nxpsg;
@@ -216,6 +241,7 @@ void kernel_mul_mv_ext_q4x4_f32_impl(
     if (FC_mul_mv_shmem_reduce) {
         // Intel iGPU: threadgroup memory reduction (SIMD-width-independent)
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW;
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
         for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
             buf[eff_tiisg] = sumf[ir1];
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -251,10 +277,9 @@ void kernel_mul_mv_ext_q4x4_f32_impl(
         }
 
         if (tx == 0) {
-            for (short ir1 = 0; ir1 < r1ptg && i11 + ir1 < args.ne11; ++ir1) {
-                device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
-
-                if (i01 < args.ne01) {
+            for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                if (i11 + ir1 < args.ne11 && i01 < args.ne01) {
+                    device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
                     dst_f32[i01] = sumf[ir1];
                 }
             }
@@ -368,7 +393,7 @@ void kernel_mul_mv_t_t_impl(
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
 
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     constexpr short NB = 32;
     constexpr short NF = 8;
 
@@ -391,6 +416,9 @@ void kernel_mul_mv_t_t_impl(
   //device const T0 * x = (device const T0 *) (src0 + offset0);
     device const T1 * y = (device const T1 *) (src1 + offset1);
 
+    // ks1: K-stride in elements for src1 (1=contiguous, >1=transposed)
+    const int ks1 = FC_mul_mv_src1_trans ? (args.nb10 / sizeof(T1)) : 1;
+
     // pointers to src0 rows
     device const T0 * ax [NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
@@ -401,37 +429,46 @@ void kernel_mul_mv_t_t_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = eff_tiisg/(NW/NF);
-    const short il = eff_tiisg%(NW/NF);
+    // Each thread processes NB/NW chunks of NF elements per block iteration.
+    // At NW=32: 1 chunk (il has 4 values, 4 threads per block)
+    // At NW=16: 2 chunks (il has 2 values, 2 threads per block)
+    // At NW=8:  4 chunks (il has 1 value, 1 thread per block)
+    const short chunks_per_thread = NB / NW;  // = 32/NW
+    const short threads_per_blk   = NW / NF;  // threads sharing one block
+    const short ix = eff_tiisg / threads_per_blk;
 
     const int ib0 = eff_sgitg*NF + ix;
 
     T1 yl[NF];
 
-    device const T1 * yb = y + (ib0*NB + il*NF);
-
     for (int ib = ib0; ib < nb; ib += NSG*NF) {
-        for (short i = 0; i < NF; ++i) {
-            yl[i] = yb[i];
-        }
+        for (short c = 0; c < chunks_per_thread; c++) {
+            const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
 
-        for (short row = 0; row < NR0; row++) {
-            device const T0 * xb = ax[row] + (ib*NB + il*NF);
+            // ks1-strided: when src1 is transposed, K elements are ks1 apart
+            const int y_offset = (ib*NB + il*NF) * ks1;
 
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NF; ++i) {
-                sumq += xb[i] * yl[i];
+            for (short i = 0; i < NF; ++i) {
+                yl[i] = y[y_offset + i*ks1];
             }
 
-            sumf[row] += sumq;
-        }
+            for (short row = 0; row < NR0; row++) {
+                device const T0 * xb = ax[row] + (ib*NB + il*NF);
 
-        yb += NSG*NF*NW;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF; ++i) {
+                    sumq += xb[i] * yl[i];
+                }
+
+                sumf[row] += sumq;
+            }
+        }
     }
 
+    // remainder elements (when ne00 is not a multiple of NB)
     for (int i = nb*NB + eff_sgitg*NW + eff_tiisg; i < args.ne00; i += NW*NSG) {
         for (short row = 0; row < NR0; row++) {
-            sumf[row] += ax[row][i] * y[i];
+            sumf[row] += ax[row][i] * y[i*ks1];
         }
     }
 
@@ -496,7 +533,7 @@ void kernel_mul_mv_t_t_4_impl(
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
 
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     constexpr short NB  = 32;
     constexpr short NF  = 16;
     constexpr short NF4 = NF/4;
@@ -520,6 +557,9 @@ void kernel_mul_mv_t_t_4_impl(
     device const T1  * y  = (device const T1  *) (src1 + offset1);
     device const T14 * y4 = (device const T14 *) (src1 + offset1);
 
+    // ks1: K-stride in elements (1=contiguous, >1=transposed)
+    const int ks1 = FC_mul_mv_src1_trans ? (args.nb10 / sizeof(T1)) : 1;
+
     // pointers to src0 rows
     device const T0  * ax [NR0];
     device const T04 * ax4[NR0];
@@ -532,37 +572,49 @@ void kernel_mul_mv_t_t_4_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = eff_tiisg/(NW/NF);
-    const short il = eff_tiisg%(NW/NF);
+    const short chunks_per_thread = NB / NW;
+    const short threads_per_blk   = NW / NF;
+    const short ix = eff_tiisg / threads_per_blk;
 
     const int ib0 = eff_sgitg*NF + ix;
 
     T14 yl4[NF4];
 
-    device const T14 * yb4 = y4 + (ib0*NB + il*NF)/4;
-
     for (int ib = ib0; ib < nb; ib += NSG*NF) {
-        for (short i = 0; i < NF4; ++i) {
-            yl4[i] = yb4[i];
-        }
+        for (short c = 0; c < chunks_per_thread; c++) {
+            const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
 
-        for (short row = 0; row < NR0; row++) {
-            device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
-
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NF4; ++i) {
-                sumq += dot(float4(xb4[i]), float4(yl4[i]));
+            if (ks1 == 1) {
+                // contiguous fast path: vec4 bulk load
+                device const T14 * yb4 = y4 + (ib*NB + il*NF)/4;
+                for (short i = 0; i < NF4; ++i) {
+                    yl4[i] = yb4[i];
+                }
+            } else {
+                // transposed src1: gather individual elements with ks1 stride into vec4
+                const int y_base = (ib*NB + il*NF) * ks1;
+                for (short i = 0; i < NF4; ++i) {
+                    const int off = y_base + i*4*ks1;
+                    yl4[i] = T14(y[off], y[off + ks1], y[off + 2*ks1], y[off + 3*ks1]);
+                }
             }
 
-            sumf[row] += sumq;
-        }
+            for (short row = 0; row < NR0; row++) {
+                device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
 
-        yb4 += NSG*NF*NW/4;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NF4; ++i) {
+                    sumq += dot(float4(xb4[i]), float4(yl4[i]));
+                }
+
+                sumf[row] += sumq;
+            }
+        }
     }
 
     for (int i = nb*NB + eff_sgitg*NW + eff_tiisg; i < args.ne00; i += NW*NSG) {
         for (short row = 0; row < NR0; row++) {
-            sumf[row] += ax[row][i] * y[i];
+            sumf[row] += ax[row][i] * y[i*ks1];
         }
     }
 
@@ -643,10 +695,13 @@ void kernel_mul_mv_t_t_short_impl(
 
     device const T1 * y = (device const T1 *) (src1 + offset1);
 
+    // ks1: K-stride in elements (1=contiguous, >1=transposed)
+    const int ks1 = FC_mul_mv_src1_trans ? (args.nb10 / sizeof(T1)) : 1;
+
     float res = 0.0f;
 
     for (int i = 0; i < args.ne00; ++i) {
-        res += (float) x[i] * (float) y[i];
+        res += (float) x[i] * (float) y[i*ks1];
     }
 
     dst_f32[(uint64_t)r1*args.ne0 + r0] = res;

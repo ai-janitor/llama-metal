@@ -550,6 +550,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
+        GGML_OP_GATED_DELTA_NET,
         GGML_OP_WIN_PART,
         GGML_OP_WIN_UNPART,
         GGML_OP_GET_REL_POS,
@@ -2454,6 +2455,21 @@ extern "C" {
             struct ggml_tensor  * v,
             struct ggml_tensor  * q,
             struct ggml_tensor  * g,
+            struct ggml_tensor  * state,
+            float scale);
+
+    // Fused gated delta-net recurrence for SSM linear attention (Qwen3.5, Qwen3Next).
+    // Single kernel replaces 16 elementwise dispatches per layer in the autoregressive path.
+    // State stays in GPU registers — no intermediate device memory traffic.
+    // Inputs: q[S,H,T], k[S,H,T], v[S,H,T], gate[H,T] (log decay), beta[H,T], state[S,S,H,B]
+    // Output: packed [S*H, T + S*B] — first T rows are output, remaining are new_state.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             float scale);
 

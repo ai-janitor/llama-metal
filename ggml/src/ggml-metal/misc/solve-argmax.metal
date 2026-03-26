@@ -14,7 +14,7 @@ kernel void kernel_solve_tri_f32(
         ushort  sgitg[[simdgroup_index_in_threadgroup]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
 
     const short NSG = FC_solve_tri_nsg;
     const short N   = FC_solve_tri_n;

@@ -25,7 +25,7 @@ using namespace metal;
 
 #define FOR_UNROLL(x) _Pragma("clang loop unroll(full)") for (x)
 
-#define N_SIMDWIDTH 32
+constant short N_SIMDWIDTH [[function_constant(FC_SIMD_WIDTH)]];
 
 // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
 //

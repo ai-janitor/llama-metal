@@ -660,7 +660,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_kimi_linear::build_kda_chunkin
         ggml_tensor * key_gkdiff = ggml_mul(ctx0, k_chunk, gk_diff_exp);
 
         // rearrange((g_i[:,:,-1:] - g_i).exp()*k_i, 'b h c k -> b h k c') @ (U_[t] - W_[t] @ S)
-        ggml_tensor * kgdmulvnew = ggml_mul_mat(ctx0, v_new_t, ggml_cont(ctx0, ggml_transpose(ctx0, key_gkdiff)));
+        // cont removed: key_gkdiff as src1 — Metal handles transposed src1 natively via nb10 stride
+        ggml_tensor * kgdmulvnew = ggml_mul_mat(ctx0, v_new_t, ggml_transpose(ctx0, key_gkdiff));
 
         new_state = ggml_add(ctx0,
             ggml_mul(ctx0, new_state, ggml_reshape_4d(ctx0, gkexp_last, gkexp_last->ne[0], gkexp_last->ne[1], H_v, n_seqs)),
@@ -761,7 +762,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_kimi_linear::build_kda_autoreg
 
     // S = S + torch.einsum('b h k, b h v -> b h k v', b_i[..., None] * k_i, v_i - (k_i[..., None] * S).sum(-2))
     // v_diff_t [1,S_v,H,B] k_beta_t [1,S_k,H,B] state [S_v,S_k,H,B]
-    state = ggml_add(ctx0, state, ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, v_diff)), ggml_cont(ctx0, ggml_transpose(ctx0, k_beta))));
+    // Inner cont(transpose(k_beta)) removed: src1 transposed layout handled natively by Metal kernels.
+    // Outer cont(transpose(v_diff)) kept: src0 must not be transposed (ggml assert).
+    state = ggml_add(ctx0, state, ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, v_diff)), ggml_transpose(ctx0, k_beta)));
 
     q = ggml_reshape_4d(ctx0, q, S_k, 1, H_k, n_seqs);
     state_t = ggml_cont(ctx0, ggml_transpose(ctx0, state));

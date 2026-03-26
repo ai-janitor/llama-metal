@@ -137,6 +137,7 @@ inline void load_a_mxfp4_to_shmem(
 
 // Cooperative load: B tile (BN rows × BK cols) into shared memory
 // B is f32 (src1 type). idx_n checked against ne11 (N dimension)
+// Contiguous path: K elements are adjacent (stride_b is row stride only).
 inline void load_b_to_shmem(
     device const float * data_b,
     threadgroup float2 * buf_b,
@@ -156,6 +157,35 @@ inline void load_b_to_shmem(
         buf_b[buf_idx] = float2(data_b[idx], data_b[idx + 1]);
     } else if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B < end_k) {
         buf_b[buf_idx] = float2(data_b[idx], 0.0f);
+    } else {
+        buf_b[buf_idx] = float2(0.0f);
+    }
+}
+
+// Strided B-loading for transposed src1: K elements are ks1 apart in device memory.
+// Separate function to avoid any overhead on the contiguous path — only called when
+// src1 is transposed (delta-net SSM), eliminating ggml_cont(ggml_transpose(...)) dispatches.
+inline void load_b_to_shmem_strided(
+    device const float * data_b,
+    threadgroup float2 * buf_b,
+    uint pos_b,
+    uint loadr,
+    uint loadc,
+    uint idx_n,
+    uint ne_b_rows,
+    uint block,
+    uint end_k,
+    uint stride_b,
+    uint ks1
+) {
+    // pos_b is in K-element units; scale by ks1 for correct strided indexing
+    const uint idx_base = pos_b * ks1 + loadc * stride_b + loadr * LOAD_VEC_B * ks1;
+    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+    if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B + 1 < end_k) {
+        buf_b[buf_idx] = float2(data_b[idx_base], data_b[idx_base + ks1]);
+    } else if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B < end_k) {
+        buf_b[buf_idx] = float2(data_b[idx_base], 0.0f);
     } else {
         buf_b[buf_idx] = float2(0.0f);
     }
@@ -266,6 +296,8 @@ kernel void kernel_mul_mat_tiled_impl(
     // B matrix setup (shared across all types — B is always f32)
     device const float * data_b = (device const float *)(src1 + args.nb13*i13 + args.nb12*i12 + args.nb11*(ic*BN));
     const uint stride_b = args.nb11 / sizeof(float);  // B row stride in elements
+    // ks1: K-element stride (1=contiguous, >1=transposed src1)
+    const uint ks1 = args.nb10 / sizeof(float);
 
     const uint end_k = args.ne00;  // K dimension
 
@@ -285,20 +317,17 @@ kernel void kernel_mul_mat_tiled_impl(
             loader.load(buf_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, ne01, block, end_k);
         }
 
-        // Load B tile (shared — B is always f32)
-        for (uint l = 0; l < BN; l += loadstride_b) {
-            load_b_to_shmem(
-                data_b,
-                buf_b,
-                pos_b,
-                loadr_b,
-                loadc_b + l,
-                ic * BN + loadc_b + l,
-                ne11,
-                block,
-                end_k,
-                stride_b
-            );
+        // Load B tile — branch once on ks1 to avoid per-element overhead on contiguous path
+        if (ks1 > 1) {
+            for (uint l = 0; l < BN; l += loadstride_b) {
+                load_b_to_shmem_strided(data_b, buf_b, pos_b, loadr_b, loadc_b + l,
+                    ic * BN + loadc_b + l, ne11, block, end_k, stride_b, ks1);
+            }
+        } else {
+            for (uint l = 0; l < BN; l += loadstride_b) {
+                load_b_to_shmem(data_b, buf_b, pos_b, loadr_b, loadc_b + l,
+                    ic * BN + loadc_b + l, ne11, block, end_k, stride_b);
+            }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);

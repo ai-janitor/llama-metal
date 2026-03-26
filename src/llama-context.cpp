@@ -1212,11 +1212,172 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // DEBUG: read the PERSISTENT state cache (cache_s_l0) before graph compute
+    if (getenv("GGML_METAL_DUMP_TENSORS")) {
+        static ggml_tensor * cache_tensor = nullptr;
+        // Find the persistent cache tensor by tracing from state_predelta-0
+        // state_predelta-0 is reshape(get_rows(reshape(cache_s_l0), s_copy))
+        // So: state_predelta-0 → src[0] = get_rows → src[0] = reshape → src[0] = cache_s_l0
+        if (!cache_tensor) {
+            ggml_cgraph * gf_pre = res->get_gf();
+            for (int i = 0; i < ggml_graph_n_nodes(gf_pre); i++) {
+                ggml_tensor * t = ggml_graph_node(gf_pre, i);
+                if (strstr(t->name, "state_predelta-0") && t->ne[1] == 4096) {
+                    // Walk up: reshape → get_rows → reshape → cache_s_l0
+                    ggml_tensor * cur = t;
+                    while (cur && cur->src[0]) {
+                        fprintf(stderr, "[TRACE] %s op=%s data=%p view_src=%p\n",
+                                cur->name, ggml_op_name(cur->op), cur->data,
+                                cur->view_src ? cur->view_src->data : nullptr);
+                        cur = cur->src[0];
+                        if (strstr(cur->name, "cache_s_l")) {
+                            cache_tensor = cur;
+                            // Also find the ultimate source (non-view)
+                            ggml_tensor * root = cur;
+                            while (root->view_src) root = root->view_src;
+                            fprintf(stderr, "[CACHE_FOUND] %s ne=[%lld,%lld] data=%p root=%s@%p\n",
+                                    cur->name, cur->ne[0], cur->ne[1], cur->data,
+                                    root->name, root->data);
+                            cache_tensor = root; // use the ROOT persistent tensor
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        // Also read AFTER compute to see if ggml_cpy wrote anything
+        if (cache_tensor && ubatch.n_tokens > 1) {
+            float buf_post[4] = {};
+            ggml_backend_tensor_get(cache_tensor, buf_post, 0, 4 * sizeof(float));
+            fprintf(stderr, "[POST-COMPUTE tok=%d] %s@%p [0:3]: %.6f %.6f %.6f %.6f\n",
+                    (int)ubatch.n_tokens, cache_tensor->name, cache_tensor->data,
+                    buf_post[0], buf_post[1], buf_post[2], buf_post[3]);
+        }
+        if (cache_tensor) {
+            // Read from multiple offsets to find where the state actually lives
+            float buf0[4] = {}, buf1[4] = {};
+            size_t total = ggml_nbytes(cache_tensor);
+            ggml_backend_tensor_get(cache_tensor, buf0, 0, 4 * sizeof(float));
+            // Also try reading from midpoint
+            size_t mid = total / 2;
+            if (mid + 16 <= total)
+                ggml_backend_tensor_get(cache_tensor, buf1, mid, 4 * sizeof(float));
+            fprintf(stderr, "[PRE-COMPUTE tok=%d] %s@%p total=%zuB [0:3]: %.6f %.6f %.6f %.6f  [mid]: %.6f %.6f %.6f %.6f\n",
+                    (int)ubatch.n_tokens, cache_tensor->name, cache_tensor->data, total,
+                    buf0[0], buf0[1], buf0[2], buf0[3],
+                    buf1[0], buf1[1], buf1[2], buf1[3]);
+        }
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // GGML_METAL_DUMP_TENSORS: post-compute tensor value inspection.
+    // Set env var to a comma-separated list of tensor name substrings.
+    // Example: GGML_METAL_DUMP_TENSORS="delta_net_result-0,output_tokens-0"
+    // Optional: append ":N" to limit to first N decode rounds (default 3).
+    // Prints first 16 float values of matching tensors after each graph compute.
+    // Works for any kernel — just set the env var to match your tensor names.
+    {
+        static const char * dump_env = getenv("GGML_METAL_DUMP_TENSORS");
+        static int dump_round = 0;
+        static int dump_max = 3;
+        static std::vector<std::string> dump_patterns;
+        static bool dump_init = false;
+
+        if (dump_env && !dump_init) {
+            dump_init = true;
+            std::string env_str(dump_env);
+            // Check for ":N" max round suffix
+            auto colon = env_str.rfind(':');
+            if (colon != std::string::npos) {
+                dump_max = std::atoi(env_str.c_str() + colon + 1);
+                env_str = env_str.substr(0, colon);
+            }
+            // Split by comma
+            size_t pos = 0;
+            while ((pos = env_str.find(',')) != std::string::npos) {
+                dump_patterns.push_back(env_str.substr(0, pos));
+                env_str.erase(0, pos + 1);
+            }
+            if (!env_str.empty()) {
+                dump_patterns.push_back(env_str);
+            }
+            fprintf(stderr, "[DUMP_TENSORS] patterns=[");
+            for (size_t i = 0; i < dump_patterns.size(); i++) {
+                fprintf(stderr, "%s%s", dump_patterns[i].c_str(), i+1 < dump_patterns.size() ? "," : "");
+            }
+            fprintf(stderr, "] max_rounds=%d\n", dump_max);
+        }
+
+        // Track state buffer: find state_predelta-0 (or new_state-0) and print after every compute
+        if (dump_env) {
+            static void * tracked_state_data = nullptr;
+            static ggml_tensor * tracked_tensor = nullptr;
+
+            // Find the state tensor in this graph (only need to find once per graph type)
+            ggml_cgraph * gf = res->get_gf();
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                // Track new_state-0 (the CPY source) or state_predelta-0 (the read)
+                if (strstr(t->name, "new_state-0") && t->op != GGML_OP_RESHAPE) {
+                    // Find the CPY destination — the persistent cache view
+                    // The CPY node has new_state as src[0] and cache_view as the node itself
+                    // Actually, the CPY writes to a view of ssm_states_all
+                    // Let's just track new_state-0 itself for the WRITE value
+                    float buf[4] = {};
+                    ggml_backend_tensor_get(t, buf, 0, 4 * sizeof(float));
+                    fprintf(stderr, "[STATE_TRACK tok=%d] new_state-0 (written): %.6f %.6f %.6f %.6f\n",
+                            (int)ubatch.n_tokens, buf[0], buf[1], buf[2], buf[3]);
+                    break;
+                }
+                if (strstr(t->name, "state_predelta-0") && t->ne[1] == 4096) {
+                    float buf[4] = {};
+                    ggml_backend_tensor_get(t, buf, 0, 4 * sizeof(float));
+                    fprintf(stderr, "[STATE_TRACK tok=%d] state_predelta-0 (read): %.6f %.6f %.6f %.6f  data=%p\n",
+                            (int)ubatch.n_tokens, buf[0], buf[1], buf[2], buf[3], t->data);
+                    if (!tracked_state_data) {
+                        tracked_state_data = t->data;
+                        tracked_tensor = t;
+                    }
+                    break;
+                }
+            }
+
+            // Also read from the tracked pointer if we have one (catches changes between graphs)
+            if (tracked_tensor) {
+                float buf[4] = {};
+                ggml_backend_tensor_get(tracked_tensor, buf, 0, 4 * sizeof(float));
+                fprintf(stderr, "[STATE_TRACK tok=%d] persistent@%p: %.6f %.6f %.6f %.6f\n",
+                        (int)ubatch.n_tokens, tracked_state_data, buf[0], buf[1], buf[2], buf[3]);
+            }
+        }
+        if (dump_env && dump_round < dump_max) {
+            ggml_cgraph * gf = res->get_gf();
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                for (const auto & pat : dump_patterns) {
+                    if (strstr(t->name, pat.c_str())) {
+                        const int n_vals = std::min((int64_t)16, ggml_nelements(t));
+                        float buf[16] = {};
+                        ggml_backend_tensor_get(t, buf, 0, n_vals * sizeof(float));
+                        fprintf(stderr, "\n[DUMP #%d tok=%d] %s op=%s ne=[%lld,%lld,%lld,%lld]\n  ",
+                                dump_round, (int)ubatch.n_tokens, t->name, ggml_op_name(t->op),
+                                t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+                        for (int j = 0; j < n_vals; j++) fprintf(stderr, "%.6f ", buf[j]);
+                        fprintf(stderr, "\n");
+                        dump_round++;
+                        break; // one match per pattern per round
+                    }
+                }
+                if (dump_round >= dump_max) break;
+            }
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2174,7 +2335,10 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+    // DEBUG: force synchronize after every graph compute to test for race conditions
+    if (getenv("GGML_METAL_SYNC_GRAPHS")) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
 
     return status;
 }

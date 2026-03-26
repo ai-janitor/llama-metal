@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-impl.h"
 #import "ggml-metal-ops.h"
 
 #import "ggml-impl.h"
@@ -468,33 +469,63 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         GGML_LOG_DEBUG("%s: compiling pipeline: base = '%s', name = '%s'\n", __func__, base, name);
 
-        id<MTLFunction> mtl_function = cv ?
-            [lib->obj newFunctionWithName:base_func constantValues:cv->obj error:&error] :
-            [lib->obj newFunctionWithName:base_func constantValues:nil error:&error];
-        if (!mtl_function) {
-            [lib->lock unlock];
+        // Compile pipeline with adaptive FC_SIMD_WIDTH.
+        // First pass: inject the device's probed simd_width.
+        // After compilation, check the pipeline's actual threadExecutionWidth.
+        // If it differs (e.g., Intel compiles heavy kernels to th_width=8 or 16
+        // due to register pressure), recompile with the correct value.
+        // This eliminates all hardcoded SIMD width assumptions.
+        short simd_w = (short) lib->simd_width;
+        id<MTLComputePipelineState> obj = nil;
 
-            GGML_LOG_ERROR("%s: failed to compile pipeline: base = '%s', name = '%s'\n", __func__, base, name);
-            if (error) {
-                GGML_LOG_ERROR("%s: %s\n", __func__, [[error description] UTF8String]);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            MTLFunctionConstantValues * fcv = cv ? [cv->obj copy] : [[MTLFunctionConstantValues alloc] init];
+            [fcv setConstantValue:&simd_w type:MTLDataTypeShort atIndex:FC_SIMD_WIDTH];
+
+            id<MTLFunction> mtl_function = [lib->obj newFunctionWithName:base_func constantValues:fcv error:&error];
+            [fcv release];
+            if (!mtl_function) {
+                [lib->lock unlock];
+
+                GGML_LOG_ERROR("%s: failed to compile pipeline: base = '%s', name = '%s'\n", __func__, base, name);
+                if (error) {
+                    GGML_LOG_ERROR("%s: %s\n", __func__, [[error description] UTF8String]);
+                }
+
+                return res;
             }
 
-            return res;
-        }
+            obj = [lib->device newComputePipelineStateWithFunction:mtl_function error:&error];
 
-        id<MTLComputePipelineState> obj = [lib->device newComputePipelineStateWithFunction:mtl_function error:&error];
+            [mtl_function release];
 
-        [mtl_function release];
+            if (!obj) {
+                [lib->lock unlock];
 
-        if (!obj) {
-            [lib->lock unlock];
+                GGML_LOG_ERROR("%s: failed to create pipeline state: base = '%s', name = '%s'\n", __func__, base, name);
+                if (error) {
+                    GGML_LOG_ERROR("%s: %s\n", __func__, [[error description] UTF8String]);
+                }
 
-            GGML_LOG_ERROR("%s: failed to create pipeline state: base = '%s', name = '%s'\n", __func__, base, name);
-            if (error) {
-                GGML_LOG_ERROR("%s: %s\n", __func__, [[error description] UTF8String]);
+                return res;
             }
 
-            return res;
+            const int actual_width = (int) obj.threadExecutionWidth;
+
+            if (actual_width != simd_w && attempt == 0) {
+                // Pipeline compiled to a different SIMD width than expected.
+                // Recompile with the actual value so NW matches the hardware.
+                // Upward (Vega 64>32) or downward (Intel 16<32) — kernel inner
+                // loops handle variable NW via chunks_per_thread iteration.
+                GGML_LOG_DEBUG("%s: %-40s simd mismatch: expected %d, got %d — recompiling\n",
+                        __func__, name, (int)simd_w, actual_width);
+                [obj release];
+                obj = nil;
+                simd_w = (short) actual_width;
+                continue;
+            }
+
+            break;
         }
 
         GGML_LOG_DEBUG("%s: loaded %-40s %16p | th_max = %4d | th_width = %4d\n", __func__, name,
@@ -1279,6 +1310,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_TRI:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_SUM_ROWS:
+            // SUM_ROWS now handles non-contiguous (transposed) src0 via nb00 stride.
+            // This eliminates ggml_cont(ggml_transpose(...)) before sum_rows in SSM
+            // delta-net autoregressive path — the "sum_cols" workaround pattern.
+            return has_simdgroup_reduction;
         case GGML_OP_CUMSUM:
         case GGML_OP_MEAN:
         case GGML_OP_SOFT_MAX:
@@ -1383,6 +1418,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return false;
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_GATED_DELTA_NET:
             return has_simdgroup_reduction;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:

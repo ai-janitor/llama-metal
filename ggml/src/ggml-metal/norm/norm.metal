@@ -30,6 +30,15 @@ kernel void kernel_norm_fuse_impl(
     device const T * f0 = (device const T *) (src1_0 + (i03%args.nef3[1])*args.nbf3[1] + (i02%args.nef2[1])*args.nbf2[1] + (i01%args.nef1[1])*args.nbf1[1]);
     device const T * f1 = (device const T *) (src1_1 + (i03%args.nef3[2])*args.nbf3[2] + (i02%args.nef2[2])*args.nbf2[2] + (i01%args.nef1[2])*args.nbf1[2]);
 
+    // Barrier-based reduction instead of simd_sum — simd_sum is broken
+    // at NW=16 on Intel iGPU. Use shmem tree reduction for all platforms.
+    // n_threads may not be power-of-2 (e.g. ne00=511).
+    const ushort tid = tpitg.x;
+    const ushort n_threads = ntg.x;
+
+    ushort np2 = 1;
+    while (np2 < n_threads) np2 <<= 1;
+
     T sumft(0.0f);
 
     float sumf = 0.0f;
@@ -38,23 +47,15 @@ kernel void kernel_norm_fuse_impl(
         sumft += x[i00];
     }
     sumf = dot(sumft, T(1.0f));
-    sumf = simd_sum(sumf);
 
+    shmem_f32[tid] = sumf;
+    if (tid == 0) { for (ushort i = n_threads; i < np2; i++) shmem_f32[i] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tiisg == 0) {
-        shmem_f32[sgitg] = sumf;
+    for (ushort s = np2 / 2; s > 0; s >>= 1) {
+        if (tid < s) { shmem_f32[tid] += shmem_f32[tid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const ushort nsg = (ntg.x + simd_width - 1) / simd_width;
-
-    sumf = 0.0f;
-    for (ushort i = tiisg; i < nsg; i += simd_width) {
-        sumf += shmem_f32[i];
-    }
-    sumf = simd_sum(sumf);
+    sumf = shmem_f32[0];
 
     const float mean = sumf/args.ne00;
 
@@ -65,21 +66,15 @@ kernel void kernel_norm_fuse_impl(
         y[i00] = x[i00] - mean;
         sumf += dot(y[i00], y[i00]);
     }
-    sumf = simd_sum(sumf);
 
+    shmem_f32[tid] = sumf;
+    if (tid == 0) { for (ushort i = n_threads; i < np2; i++) shmem_f32[i] = 0.0f; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tiisg == 0) {
-        shmem_f32[sgitg] = sumf;
+    for (ushort s = np2 / 2; s > 0; s >>= 1) {
+        if (tid < s) { shmem_f32[tid] += shmem_f32[tid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    sumf = 0.0f;
-    for (ushort i = tiisg; i < nsg; i += simd_width) {
-        sumf += shmem_f32[i];
-    }
-    sumf = simd_sum(sumf);
+    sumf = shmem_f32[0];
 
     const float variance = sumf/args.ne00;
 
@@ -143,23 +138,35 @@ kernel void kernel_rms_norm_fuse_impl(
     for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
         sumf += dot(x[i00], x[i00]);
     }
-    sumf = simd_sum(sumf);
 
+    // Reduce across all threads using shared memory.
+    // simd_sum is broken at NW=16 on Intel iGPU, so use barrier-based
+    // reduction via shmem for correctness on all SIMD widths.
+    // n_threads may not be power-of-2 (e.g. ne00=511), so we first
+    // round up to next power-of-2 for the tree reduction, padding with 0.
+    const ushort tid = tpitg.x;
+    const ushort n_threads = ntg.x;
+
+    shmem_f32[tid] = sumf;
+    // Pad entries beyond n_threads to 0 for non-power-of-2 sizes.
+    // Thread 0 handles padding since only a few extra slots are needed.
+    if (tid == 0) {
+        ushort np2 = 1;
+        while (np2 < n_threads) np2 <<= 1;
+        for (ushort i = n_threads; i < np2; i++) shmem_f32[i] = 0.0f;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tiisg == 0) {
-        shmem_f32[sgitg] = sumf;
+    // Tree reduction — round up to next power-of-2
+    ushort np2 = 1;
+    while (np2 < n_threads) np2 <<= 1;
+    for (ushort s = np2 / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shmem_f32[tid] += shmem_f32[tid + s];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const ushort nsg = (ntg.x + simd_width - 1) / simd_width;
-
-    sumf = 0.0f;
-    for (ushort i = tiisg; i < nsg; i += simd_width) {
-        sumf += shmem_f32[i];
-    }
-    sumf = simd_sum(sumf);
+    sumf = shmem_f32[0];
 
     const float mean  = sumf/args.ne00;
     const float scale = 1.0f/sqrt(mean + args.eps);

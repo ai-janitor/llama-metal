@@ -463,3 +463,111 @@ kernel void kernel_rwkv_wkv7_f32(
             + tid * head_size + i] = state[i];
     }
 }
+
+// Fused gated delta-net recurrence kernel.
+// Replaces 16 elementwise graph ops per SSM layer with one GPU dispatch.
+// State stays in registers — no intermediate device memory traffic between steps.
+//
+// Architecture (from arc-b60 kernel_gated_delta_net):
+//   1 threadgroup per (state_row, head) — each TG owns one row of the S×S state matrix.
+//   32 threads (1 simdgroup) collaborate on the S_v-wide dot products via simd_sum.
+//   Per-token loop: decay → dot(state,k) → delta → state update → dot(state,q)
+//
+// Buffer layout:
+//   src0 = k  [S, H, T]       (contiguous f32)
+//   src1 = v  [S, H, T]       (contiguous f32)
+//   src2 = q  [S, H, T]       (contiguous f32)
+//   src3 = gate [1, 1, H, B]  (log decay per head, contiguous f32)
+//   src4 = beta [1, 1, H, B]  (gating scalar per head, contiguous f32)
+//   src5 = state [S, S, H, B] (contiguous f32, mutated in-place via output packing)
+//   dst  = packed [S*H, T + S*B] (output rows then new_state rows)
+kernel void kernel_gated_delta_net(
+        constant ggml_metal_kargs_gated_delta_net & args,
+        device const float * src0, // k
+        device const float * src1, // v
+        device const float * src2, // q
+        device const float * src3, // gate (log decay)
+        device const float * src4, // beta
+        device const float * src5, // state (input)
+        device       float * dst,  // packed output + new_state
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        uint   tx   [[thread_index_in_threadgroup]]) {
+
+    const int S = args.S;           // state dimension
+    const int H = args.H;           // value heads
+    const int T = args.n_tokens;    // tokens in batch
+    const int H_k = args.H_k;      // key heads (GQA)
+    const int group_ratio = H / H_k;
+
+    const int row  = (int)tgpig.x;  // which row of the S×S state matrix this TG owns
+    const int head = (int)tgpig.y;  // which head
+
+    if (head >= H || row >= S) return;
+
+    // Elements per thread — each thread handles NSG consecutive state columns.
+    // With TG=32 and NSG=4: 32*4=128 elements max. S_v for Qwen3.5 is 128.
+    constexpr int NSG = 4;
+
+    // Load this state row into registers.
+    // State layout: [S_v, S_v, H_v, n_seqs] — row `row` of head `head`:
+    //   state_base = (seq * H + head) * S * S + row * S
+    // For single-seq (n_seqs=1): (head * S + row) * S
+    const int state_row_base = (head * S + row) * S;
+    float ls[NSG];
+    for (int j = 0; j < NSG; j++) {
+        const int col = (int)tx * NSG + j;
+        ls[j] = (col < S) ? src5[state_row_base + col] : 0.0f;
+    }
+
+    // INCREMENTAL TEST: full computation but NO state update (ls[j] += k*d is skipped)
+    for (int t = 0; t < T; t++) {
+        const int gh_idx = t * H + head;
+        const int k_head = head / group_ratio;
+        const int qk_off = (t * H_k + k_head) * S;
+
+        // Step 1: decay
+        const float decay = exp(src3[gh_idx]);
+
+        // Step 2: dot(state, k)
+        float dot_state_k = 0.0f;
+        for (int j = 0; j < NSG; j++) {
+            const int col = (int)tx * NSG + j;
+            if (col < S) {
+                ls[j] *= decay;
+                dot_state_k += ls[j] * src0[qk_off + col];
+            }
+        }
+        dot_state_k = simd_sum(dot_state_k);
+
+        // Step 3: delta = (v - dot(state,k)) * beta
+        const float v_val = src1[gh_idx * S + row];
+        const float beta_val = src4[gh_idx];
+        const float delta = (v_val - dot_state_k) * beta_val;
+
+        // Step 4+5: state update + output (FUSED in one loop, like original)
+        float dot_state_q = 0.0f;
+        for (int j = 0; j < NSG; j++) {
+            const int col = (int)tx * NSG + j;
+            if (col < S) {
+                ls[j] += src0[qk_off + col] * delta;
+                dot_state_q += ls[j] * src2[qk_off + col];
+            }
+        }
+        dot_state_q = simd_sum(dot_state_q);
+
+        if (tx == 0) {
+            dst[(int64_t)t * S * H + head * S + row] = dot_state_q * args.scale;
+        }
+    }
+
+    // Write state row back to the new_state portion of dst (after all T output rows).
+    // new_state layout: dst[T * S * H + (seq * H + head) * S * S + row * S + col]
+    // For single-seq: dst[T * S * H + state_row_base + col]
+    const int64_t state_dst_base = (int64_t)T * S * H + state_row_base;
+    for (int j = 0; j < NSG; j++) {
+        const int col = (int)tx * NSG + j;
+        if (col < S) {
+            dst[state_dst_base + col] = ls[j];
+        }
+    }
+}

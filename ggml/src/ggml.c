@@ -1024,6 +1024,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
+    "GATED_DELTA_NET",
     "WIN_PART",
     "WIN_UNPART",
     "GET_REL_POS",
@@ -1049,7 +1050,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1160,7 +1161,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5735,6 +5736,57 @@ struct ggml_tensor * ggml_gated_linear_attn(
     result->src[2] = q;
     result->src[3] = g;
     result->src[4] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net
+// Fused gated delta-net recurrence: replaces 16-op autoregressive chain with one dispatch.
+// Per-token: state *= exp(gate); kv = dot(state, k); delta = (v - kv) * beta; state += k * delta; out = dot(state, q)
+// State stays in GPU registers — no intermediate device memory writes.
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        float scale) {
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(v));
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(gate));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    const int64_t S = k->ne[0];       // state dimension (S_v = S_k for delta-net)
+    const int64_t H = k->ne[1];       // number of heads
+    const int64_t n_tokens = k->ne[2];
+    const int64_t n_seqs = state->ne[3];
+    {
+        GGML_ASSERT(v->ne[0] == S && v->ne[1] == H && v->ne[2] == n_tokens);
+        GGML_ASSERT(q->ne[0] == S && q->ne[1] == H && q->ne[2] == n_tokens);
+        GGML_ASSERT(gate->ne[0] == 1 && gate->ne[1] == 1 && gate->ne[2] == H);
+        GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == 1 && beta->ne[2] == H);
+        GGML_ASSERT(state->ne[0] == S && state->ne[1] == S && state->ne[2] == H);
+    }
+
+    // output layout: concat output [S*H, n_tokens] and new_state [S*H, S*n_seqs]
+    // same pattern as ggml_gated_linear_attn
+    const int64_t ne[4] = { S * H, n_tokens + S * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = k;
+    result->src[1] = v;
+    result->src[2] = q;
+    result->src[3] = gate;
+    result->src[4] = beta;
+    result->src[5] = state;
 
     return result;
 }

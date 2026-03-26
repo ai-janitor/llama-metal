@@ -94,6 +94,9 @@ constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
 // When true, use shared memory reduction instead of simd_sum (for Intel iGPU)
 constant bool  FC_mul_mv_shmem_reduce [[function_constant(FC_MUL_MV + 2)]];
+// When true, src1 is transposed: K elements are nb10/sizeof(T1) apart, not contiguous.
+// Compile-time dispatch avoids runtime branching in the hot loop — zero overhead when false.
+constant bool  FC_mul_mv_src1_trans [[function_constant(FC_MUL_MV + 3)]];
 
 // Shared memory reduction for GPUs where simd_sum() produces wrong results or where
 // actual SIMD width differs from N_SIMDWIDTH (Intel UHD 630: th_width=16, not 32).
@@ -110,12 +113,13 @@ static inline void helper_mv_reduce_and_write_shmem(
         ushort local_tid,
         short  group_size,
         threadgroup float * buf) {
-    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+    // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+    for (short row = 0; row < NR0; ++row) {
         buf[group_size * row + local_tid] = sumf[row];
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (local_tid == 0) {
+        if (local_tid == 0 && r0 + row < ne01) {
             float tot = 0.0f;
             for (short i = 0; i < group_size; i++) {
                 tot += buf[group_size * row + i];
@@ -137,7 +141,7 @@ static inline void helper_mv_reduce_and_write(
         ushort sgitg,
         ushort tidx,
         threadgroup char * shmem) {
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const short nsg = FC_mul_mv_nsg;
 
     if (FC_mul_mv_shmem_reduce) {
@@ -168,10 +172,11 @@ static inline void helper_mv_reduce_and_write(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
+    // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+    for (short row = 0; row < NR0; ++row) {
         float tot = simd_sum(shmem_f32[row][tiisg]);
 
-        if (tiisg == 0 && sgitg == 0) {
+        if (tiisg == 0 && sgitg == 0 && r0 + row < ne01) {
             dst_f32[r0 + row] = tot;
         }
     }
@@ -190,7 +195,7 @@ void mul_vec_q_n_f32_impl(
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
 
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     constexpr short NQ = 16;
 
     // Logical SIMD grouping: on Intel (th_width=16), hardware sgitg/tiisg don't match
@@ -224,38 +229,45 @@ void mul_vec_q_n_f32_impl(
 
     float sumf[NR0] = {0.f};
 
-    const short ix = (eff_tiisg/(NW/NQ));
-    const short il = (eff_tiisg%(NW/NQ))*8;
-
-    //const int ib0 = sgitg*NQ + ix;
-    const int ib0 = ix;
+    // Variable NW support for Intel iGPU (compiles to NW=16):
+    // The 32-thread space maps to NQ=16 block positions x 2 half-block offsets:
+    //   ix = flat_pos / 2  → block index (0..15)
+    //   il = (flat_pos % 2) * 8  → element offset within block (0 or 8)
+    // At NW=16, only flat_pos 0..15 are covered — il=8 half is missed.
+    // Fix: chunks_per_thread = 32/NW outer loop covers all positions.
+    // At NW=32 this is 1 iteration (no-op).
+    const short chunks_per_thread = 32 / NW;  // 1 at NW=32, 2 at NW=16
 
     float yl[16]; // src1 vector cache
 
-    //device const float * yb = y + ix*QK4_0 + il;
-    device const float * yb = y + ib0*QK4_0 + il;
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        const short flat_pos = eff_tiisg + c * NW;
+        const short ix = flat_pos / 2;
+        const short il = (flat_pos % 2) * 8;
 
-    // each thread in a SIMD group deals with half a block.
-    //for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-    for (int ib = ib0; ib < nb; ib += NQ) {
-        float sumy[2] = { 0.f, 0.f };
+        const int ib0 = ix;
 
-        FOR_UNROLL (short i = 0; i < 8; i += 2) {
-            sumy[0]  += yb[i +  0] + yb[i +  1];
-            yl[i + 0] = yb[i +  0];
-            yl[i + 1] = yb[i +  1]/256.f;
+        device const float * yb = y + ib0*QK4_0 + il;
 
-            sumy[1]  += yb[i + 16] + yb[i + 17];
-            yl[i + 8] = yb[i + 16]/16.f;
-            yl[i + 9] = yb[i + 17]/4096.f;
+        for (int ib = ib0; ib < nb; ib += NQ) {
+            float sumy[2] = { 0.f, 0.f };
+
+            FOR_UNROLL (short i = 0; i < 8; i += 2) {
+                sumy[0]  += yb[i +  0] + yb[i +  1];
+                yl[i + 0] = yb[i +  0];
+                yl[i + 1] = yb[i +  1]/256.f;
+
+                sumy[1]  += yb[i + 16] + yb[i + 17];
+                yl[i + 8] = yb[i + 16]/16.f;
+                yl[i + 9] = yb[i + 17]/4096.f;
+            }
+
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
+            }
+
+            yb += QK4_0 * NQ;
         }
-
-        FOR_UNROLL (short row = 0; row < NR0; row++) {
-            sumf[row] += block_q_n_dot_y(ax[row] + ib, sumy[0] + sumy[1], yl, il);
-        }
-
-        yb += QK4_0 * 16;
-        //yb += NSG*NQ*QK4_0;
     }
 
     device float * dst_f32 = (device float *) dst + im*args.ne0*args.ne1 + r1*args.ne0;
@@ -268,6 +280,7 @@ void mul_vec_q_n_f32_impl(
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * NR0;
         helper_mv_reduce_and_write_shmem<NR0>(dst_f32, sumf, r0, args.ne01, ltid, NW, buf);
     } else {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
         for (int row = 0; row < NR0; ++row) {
             const float tot = simd_sum(sumf[row]);
 
@@ -343,7 +356,7 @@ void kernel_mul_mv_q8_0_f32_impl(
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
 
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     constexpr short NQ = 8;
 
     // Logical SIMD grouping for Intel (th_width=16)
@@ -375,33 +388,41 @@ void kernel_mul_mv_q8_0_f32_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short ix = eff_tiisg/(NW/NQ);
-    const short il = eff_tiisg%(NW/NQ);
-
-    const int ib0 = eff_sgitg*NQ + ix;
+    // Variable NW support for q8_0 (Intel iGPU NW=16):
+    // 32-thread space = NQ=8 block positions x 4 element offsets.
+    // At NW=16, il only covers 0..1, missing offsets 2..3.
+    // Fix: flatten to virtual 32-thread index, iterate chunks_per_thread times.
+    const short chunks_per_thread = 32 / NW;  // 1 at NW=32, 2 at NW=16
 
     float yl[NQ];
 
-    device const float * yb = y + ib0*QK8_0 + il*NQ;
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        const short flat_pos = eff_tiisg + c * NW;
+        const short ix = flat_pos / 4;
+        const short il = flat_pos % 4;
 
-    // each thread in a SIMD group deals with NQ quants at a time
-    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
-        for (short i = 0; i < NQ; ++i) {
-            yl[i] = yb[i];
-        }
+        const int ib0 = eff_sgitg*NQ + ix;
 
-        for (short row = 0; row < NR0; row++) {
-            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+        device const float * yb = y + ib0*QK8_0 + il*NQ;
 
-            float sumq = 0.f;
-            FOR_UNROLL (short i = 0; i < NQ; ++i) {
-                sumq += qs[i] * yl[i];
+        for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+            for (short i = 0; i < NQ; ++i) {
+                yl[i] = yb[i];
             }
 
-            sumf[row] += sumq*ax[row][ib].d;
-        }
+            for (short row = 0; row < NR0; row++) {
+                device const int8_t * qs = ax[row][ib].qs + il*NQ;
 
-        yb += NSG*NQ*QK8_0;
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qs[i] * yl[i];
+                }
+
+                sumf[row] += sumq*ax[row][ib].d;
+            }
+
+            yb += NSG*NQ*QK8_0;
+        }
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;

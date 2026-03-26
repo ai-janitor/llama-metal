@@ -268,3 +268,80 @@ int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
 
     return 1;
 }
+
+// Fused gated delta-net recurrence — replaces 16 elementwise ops per SSM layer.
+// src0=k, src1=v, src2=q, src3=gate, src4=beta, src5=state → dst (output + new_state packed)
+int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    // k[S, H, T], v[S, H, T], q[S, H, T]
+    const int32_t S = op->src[0]->ne[0];
+    const int32_t H = op->src[0]->ne[1];
+    const int32_t T = op->src[0]->ne[2];
+    const int32_t n_seqs = op->src[5]->ne[3];
+
+    // GQA: key heads may differ from value heads
+    // For now assume symmetric (H_k = H). Can be extended via op_params.
+    const int32_t H_k = H;
+
+    const float scale = ggml_get_op_params_f32(op, 0);
+
+    ggml_metal_kargs_gated_delta_net args = {
+        /*.S        =*/ S,
+        /*.H        =*/ H,
+        /*.n_tokens =*/ T,
+        /*.n_seqs   =*/ n_seqs,
+        /*.H_k      =*/ H_k,
+        /*.scale    =*/ scale,
+    };
+
+    // GGML_METAL_DEBUG_DISPATCH: print tensor shapes/strides at kernel dispatch time.
+    // Set env var to max number of dispatches to log (e.g. GGML_METAL_DEBUG_DISPATCH=2).
+    // Works for any Metal kernel — add the same block to other dispatch functions.
+    {
+        static int dispatch_count = 0;
+        static int dispatch_max = -1;
+        static bool dispatch_init = false;
+        if (!dispatch_init) {
+            dispatch_init = true;
+            const char * env = getenv("GGML_METAL_DEBUG_DISPATCH");
+            dispatch_max = env ? atoi(env) : -1;
+        }
+        if (dispatch_max >= 0 && dispatch_count < dispatch_max) {
+            fprintf(stderr, "\n[DISPATCH gated_delta_net #%d] S=%d H=%d T=%d n_seqs=%d H_k=%d scale=%.4f\n",
+                    dispatch_count, S, H, T, n_seqs, H_k, scale);
+            for (int i = 0; i < 6; i++) {
+                const ggml_tensor * src = op->src[i];
+                if (!src) continue;
+                fprintf(stderr, "  src[%d] %-24s ne=[%4lld,%4lld,%4lld,%4lld] nb=[%4zu,%6zu,%8zu,%10zu] cont=%d data=%p\n",
+                        i, src->name, src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                        src->nb[0], src->nb[1], src->nb[2], src->nb[3],
+                        ggml_is_contiguous(src), src->data);
+            }
+            fprintf(stderr, "  dst    %-24s ne=[%4lld,%4lld,%4lld,%4lld] nb=[%4zu,%6zu,%8zu,%10zu] data=%p\n",
+                    op->name, op->ne[0], op->ne[1], op->ne[2], op->ne[3],
+                    op->nb[0], op->nb[1], op->nb[2], op->nb[3], op->data);
+            dispatch_count++;
+        }
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1); // k
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2); // v
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3); // q
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4); // gate
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 5); // beta
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), 6); // state
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         7); // dst
+
+    // Grid: S rows × H heads, TG = 32 threads (1 simdgroup)
+    ggml_metal_encoder_dispatch_threadgroups(enc, S, H, 1, 32, 1, 1);
+
+    return 1;
+}

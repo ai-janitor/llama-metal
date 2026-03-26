@@ -1987,6 +1987,12 @@ enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
     GGML_ASSERT(tensor->view_src->buffer != NULL);
     GGML_ASSERT(tensor->view_src->data != NULL);
 
+    // DEBUG: catch views of persistent cache being reinitialized
+    if (strstr(tensor->view_src->name, "cache_s_l0") && tensor->buffer != NULL) {
+        fprintf(stderr, "[VIEW_INIT TRAP] view of cache_s_l0 reinit! view='%s' old_buf=%p new_src_buf=%p\n",
+                tensor->name, (void*)tensor->buffer, (void*)tensor->view_src->buffer);
+    }
+
     tensor->buffer = tensor->view_src->buffer;
     tensor->data = (char *)tensor->view_src->data + tensor->view_offs;
     return ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
@@ -1994,6 +2000,11 @@ enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
 
 enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr) {
     GGML_ASSERT(tensor);
+    // DEBUG: catch persistent tensor reallocation
+    if (tensor->data != NULL && strstr(tensor->name, "cache_s_l0")) {
+        fprintf(stderr, "[REALLOC TRAP] cache_s_l0 being reallocated! old_data=%p old_buf=%p new_addr=%p new_buf=%p\n",
+                tensor->data, (void*)tensor->buffer, addr, (void*)buffer);
+    }
     GGML_ASSERT(tensor->buffer == NULL);
     GGML_ASSERT(tensor->data == NULL);
     GGML_ASSERT(tensor->view_src == NULL);

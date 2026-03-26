@@ -83,6 +83,7 @@
 #define FC_UNARY                       1200
 #define FC_BIN                         1300
 #define FC_SUM_ROWS                    1400
+#define FC_SIMD_WIDTH                  1500
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -796,6 +797,18 @@ typedef struct {
     uint64_t nb53;
     uint64_t nb0;
 } ggml_metal_kargs_ssm_scan;
+
+// Fused gated delta-net recurrence kernel args.
+// Replaces 16 elementwise dispatches per SSM layer with one fused kernel.
+// State stays in GPU registers — no intermediate device memory traffic.
+typedef struct {
+    int32_t  S;          // state dimension (S_v = S_k for delta-net)
+    int32_t  H;          // number of value heads
+    int32_t  n_tokens;   // number of tokens in this batch (1 for decode)
+    int32_t  n_seqs;     // number of sequences
+    int32_t  H_k;        // number of key heads (for GQA, H_k <= H)
+    float    scale;      // 1/sqrt(S)
+} ggml_metal_kargs_gated_delta_net;
 
 typedef struct {
     int32_t  ne00;

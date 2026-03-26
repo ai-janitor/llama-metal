@@ -232,8 +232,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen3next::build_delta_net_chu
     ggml_tensor * kbeta_gexp = ggml_mul(ctx0, k_beta, gexp);
     cb(kbeta_gexp, "kbeta_gexp", il); // shape: (S_k, chunk_size, n_chunks, H_v * n_seqs)
 
+    // Inner cont(transpose(kbeta_gexp)) removed: Metal matmul kernels handle transposed src1
+    // natively via nb10 stride. Eliminates a GPU memcpy dispatch per layer.
     ggml_tensor * k_cumdecay =
-        ggml_cont(ctx0, ggml_transpose(ctx0, ggml_mul_mat(ctx0, attn, ggml_cont(ctx0, ggml_transpose(ctx0, kbeta_gexp)))));
+        ggml_cont(ctx0, ggml_transpose(ctx0, ggml_mul_mat(ctx0, attn, ggml_transpose(ctx0, kbeta_gexp))));
     cb(k_cumdecay, "k_cumdecay", il); // shape: (chunk_size, chunk_size, n_chunks, H_v * n_seqs)
 
     ggml_tensor * attn_kq = ggml_mul_mat(ctx0, k, q);
@@ -271,7 +273,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen3next::build_delta_net_chu
     ggml_tensor * key_gdiff = ggml_mul(ctx0, k, g_diff_exp_t);
     cb(key_gdiff, "key_gdiff", il); // shape: (S_k, chunk_size, n_chunks, H_v * n_seqs)
 
-    ggml_tensor * key_gdiff_t = ggml_cont(ctx0, ggml_transpose(ctx0, key_gdiff));
+    // cont removed: key_gdiff_t used as src1 in mul_mat — Metal handles transposed src1 natively
+    ggml_tensor * key_gdiff_t = ggml_transpose(ctx0, key_gdiff);
     cb(key_gdiff_t, "key_gdiff_t", il); // shape: (chunk_size, S_k, n_chunks, H_v * n_seqs)
 
 
@@ -399,47 +402,61 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen3next::build_delta_net_aut
     cb(beta, "beta_in", il);
     cb(g, "g_in", il);
 
+    // Fused gated delta-net kernel — same as qwen35.cpp, see comments there.
     state = ggml_reshape_4d(ctx0, state, S_v, S_v, H_v, n_seqs);
 
-    ggml_tensor * g_t    = ggml_reshape_4d(ctx0, ggml_transpose(ctx0, g), 1, 1, H_k, n_seqs);
-    ggml_tensor * beta_t = ggml_reshape_4d(ctx0, ggml_transpose(ctx0, beta), 1, 1, H_k, n_seqs);
+    ggml_tensor * core_attn_out;
+    ggml_tensor * new_state;
 
-    // Apply exponential to g_t
-    g_t = ggml_exp(ctx0, g_t);
+    if (n_seqs == 1) {
+        ggml_tensor * g_t    = ggml_cont(ctx0, ggml_reshape_4d(ctx0, g, 1, 1, H_k, n_seqs));
+        ggml_tensor * beta_t = ggml_cont(ctx0, ggml_reshape_4d(ctx0, beta, 1, 1, H_k, n_seqs));
 
-    // Apply the gated delta rule for the single timestep
-    // last_recurrent_state = last_recurrent_state * g_t
-    state = ggml_mul(ctx0, state, g_t);
+        ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, S_k, H_k, n_tokens);
+        ggml_tensor * k3 = ggml_reshape_3d(ctx0, k, S_k, H_k, n_tokens);
+        ggml_tensor * v3 = ggml_reshape_3d(ctx0, v, S_v, H_v, n_tokens);
 
-    // kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
-    ggml_tensor * k_t_unsqueezed = ggml_reshape_4d(ctx0, k, 1, S_v, H_v, n_seqs);
-    ggml_tensor * kv_mem         = ggml_mul(ctx0, state, k_t_unsqueezed);
-    // we need to sum over dim=-2, so we transpose, sum, then transpose again
-    kv_mem = ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, kv_mem))));
+        ggml_tensor * result = ggml_gated_delta_net(ctx0, k3, v3, q3, g_t, beta_t, state, 1.0f);
+        cb(result, "delta_net_result", il);
 
-    // v_t = v.unsqueeze(2) (we insert the singleton dimension after n_seqs and H_v)
-    ggml_tensor * v_t    = ggml_reshape_4d(ctx0, v, S_v, 1, H_v, n_seqs);
-    // delta = (v_t - kv_mem) * beta_t
-    ggml_tensor * v_diff = ggml_sub(ctx0, v_t, kv_mem);  // both should be [S_v, 1, H_v, n_seqs]
-    ggml_tensor * delta  = ggml_mul(ctx0, v_diff, beta_t);
+        const int64_t n_embd = S_v * H_v;
+        core_attn_out = ggml_view_4d(ctx0, result,
+            S_v, 1, H_v, n_seqs,
+            result->nb[0] * S_v, result->nb[0] * S_v, result->nb[0] * S_v * H_v, 0);
 
-    // last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta
-    ggml_tensor * k_t_delta = ggml_mul(ctx0, ggml_repeat_4d(ctx0, k_t_unsqueezed, S_v, S_v, H_v, n_seqs), delta);
-    state                   = ggml_add(ctx0, state, k_t_delta);
+        new_state = ggml_view_1d(ctx0, result,
+            n_embd * S_v * n_seqs,
+            n_embd * n_tokens * sizeof(float));
+        new_state = ggml_reshape_4d(ctx0, new_state, S_v, S_v, H_v, n_seqs);
+    } else {
+        // Fallback for multi-seq — same as qwen35.cpp
+        ggml_tensor * g_t    = ggml_reshape_4d(ctx0, ggml_transpose(ctx0, g), 1, 1, H_k, n_seqs);
+        ggml_tensor * beta_t = ggml_reshape_4d(ctx0, ggml_transpose(ctx0, beta), 1, 1, H_k, n_seqs);
 
-    // Compute the attention output
-    // core_attn_out = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
-    ggml_tensor * q_t_unsqueezed = ggml_reshape_4d(ctx0, q, 1, S_v, H_v, n_seqs);  // unsqueeze q_t
-    ggml_tensor * state_q        = ggml_mul(ctx0, state, q_t_unsqueezed);
-    // again, since it's over dim = -2, transpose, sum, transpose back
-    ggml_tensor * core_attn_out =
-        ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, state_q))));
+        g_t = ggml_exp(ctx0, g_t);
+        state = ggml_mul(ctx0, state, g_t);
 
-    // core_attn_out should be [S_v, 1, H_v, n_seqs] after this
+        ggml_tensor * k_t_unsqueezed = ggml_reshape_4d(ctx0, k, 1, S_v, H_v, n_seqs);
+        ggml_tensor * kv_mem         = ggml_mul(ctx0, state, k_t_unsqueezed);
+        kv_mem = ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_transpose(ctx0, kv_mem)));
+
+        ggml_tensor * v_t    = ggml_reshape_4d(ctx0, v, S_v, 1, H_v, n_seqs);
+        ggml_tensor * v_diff = ggml_sub(ctx0, v_t, kv_mem);
+        ggml_tensor * delta  = ggml_mul(ctx0, v_diff, beta_t);
+
+        ggml_tensor * k_t_delta = ggml_mul(ctx0, ggml_repeat_4d(ctx0, k_t_unsqueezed, S_v, S_v, H_v, n_seqs), delta);
+        state = ggml_add(ctx0, state, k_t_delta);
+
+        ggml_tensor * q_t_unsqueezed = ggml_reshape_4d(ctx0, q, 1, S_v, H_v, n_seqs);
+        ggml_tensor * state_q        = ggml_mul(ctx0, state, q_t_unsqueezed);
+        core_attn_out = ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_transpose(ctx0, state_q)));
+        new_state = state;
+    }
+
     cb(core_attn_out, "output_tokens", il);
-    cb(state, "new_state", il);
+    cb(new_state, "new_state", il);
 
-    return {core_attn_out, state};
+    return {core_attn_out, new_state};
 }
 
 ggml_tensor * llm_build_qwen3next::build_norm_gated(

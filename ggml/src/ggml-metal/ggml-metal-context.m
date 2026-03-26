@@ -1,5 +1,7 @@
 #import "ggml-metal-context.h"
 
+#import <mach/mach_time.h>
+
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
 
@@ -40,6 +42,9 @@ struct ggml_metal {
     bool use_fusion;
     bool use_concurrency;
     bool use_graph_optimize;
+    int profile;        // GGML_METAL_PROFILE: 0=off, 1=per-graph GPU timing, 2=per-op GPU timing
+    int profile_n;      // number of graph computes left to profile at level 2 (then auto-drops to 1)
+    uint64_t profile_cpu_start; // mach_absolute_time at graph_compute start (for CPU vs GPU comparison)
 
     int debug_graph;
     int debug_fusion;
@@ -152,6 +157,15 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->use_graph_optimize = true;
 
+    // GGML_METAL_PROFILE: 0=off (default), 1=per-graph GPU wall time, 2=per-op GPU timing breakdown
+    // Setting the env var without a value (or empty) defaults to 1 for backward compatibility
+    // Profile=2 runs for 2 graph computes (prompt + first decode), then drops to level 1
+    {
+        const char * val = getenv("GGML_METAL_PROFILE");
+        res->profile   = val ? (val[0] ? atoi(val) : 1) : 0;
+        res->profile_n = (res->profile >= 2) ? 2 : 0;
+    }
+
     if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
         res->use_graph_optimize = false;
     }
@@ -229,6 +243,10 @@ void ggml_metal_free(ggml_metal_t ctx) {
     free(ctx);
 }
 
+int ggml_metal_get_profile(ggml_metal_t ctx) {
+    return ctx->profile;
+}
+
 const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
@@ -237,6 +255,48 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
+
+        // GGML_METAL_PROFILE=1: read GPU timestamps immediately after completion,
+        // before cmd_buf_last is cleared. GPUStartTime/GPUEndTime are only
+        // valid after the command buffer has completed.
+        // Note: profile>=2 does per-op timing inline in graph_compute, so skip here.
+        if (ctx->profile == 1) {
+            const int n_cb = ctx->n_cb;
+            double gpu_min_start = 1e30, gpu_max_end = 0;
+            double gpu_total = 0;
+            int n_active = 0;
+
+            for (int cb_idx = 0; cb_idx <= n_cb; ++cb_idx) {
+                id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+                if (!cmd_buf) continue;
+
+                double start = [cmd_buf GPUStartTime];
+                double end   = [cmd_buf GPUEndTime];
+                if (start == 0 && end == 0) continue; // not yet scheduled
+                double dt = (end - start) * 1000.0;
+
+                if (start < gpu_min_start) gpu_min_start = start;
+                if (end   > gpu_max_end)   gpu_max_end   = end;
+                gpu_total += dt;
+                n_active++;
+            }
+
+            if (n_active > 0) {
+                double wall_ms = (gpu_max_end - gpu_min_start) * 1000.0;
+
+                // CPU wall time: from graph_compute start to synchronize completion.
+                // The gap between CPU wall and GPU wall reveals dispatch overhead —
+                // time the CPU spends encoding ops before the GPU starts, plus
+                // time waiting for the GPU to finish after the last encode.
+                mach_timebase_info_data_t tb;
+                mach_timebase_info(&tb);
+                double cpu_ms = (double)(mach_absolute_time() - ctx->profile_cpu_start) * tb.numer / tb.denom / 1e6;
+
+                fprintf(stderr, "[METAL_PROFILE] graph: %d cmd_bufs, GPU wall=%.2f ms, CPU wall=%.2f ms, gap=%.2f ms (%d nodes)\n",
+                    n_active, wall_ms, cpu_ms, cpu_ms - wall_ms, ctx->gf->n_nodes);
+            }
+        }
+
         ctx->cmd_buf_last = nil;
     }
 
@@ -455,6 +515,134 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     @autoreleasepool {
         ctx->gf = gf;
 
+        // stamp CPU start time for profile=1 CPU vs GPU comparison
+        if (ctx->profile >= 1) {
+            ctx->profile_cpu_start = mach_absolute_time();
+        }
+
+        // GGML_METAL_PROFILE=2: per-op GPU timing breakdown
+        // Encodes and completes one command buffer per op, measuring GPU time for each.
+        // This serializes all GPU work — runs for profile_n graph computes, then drops to level 1.
+        if (ctx->profile >= 2 && ctx->profile_n > 0) {
+            ctx->profile_n--;
+            id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+            // per-op-type accumulators indexed by ggml_op enum
+            double   op_time_ms[GGML_OP_COUNT];  // total GPU time per op type
+            uint32_t op_count  [GGML_OP_COUNT];   // number of dispatches per op type
+            memset(op_time_ms, 0, sizeof(op_time_ms));
+            memset(op_count,   0, sizeof(op_count));
+
+            double total_gpu_ms = 0;
+            int    n_profiled   = 0;
+
+            for (int i = 0; i < gf->n_nodes; ++i) {
+                struct ggml_tensor * node = gf->nodes[i];
+
+                // skip noop ops (same set as ggml_metal_op_encode_impl)
+                if (node->op == GGML_OP_NONE      ||
+                    node->op == GGML_OP_RESHAPE    ||
+                    node->op == GGML_OP_VIEW       ||
+                    node->op == GGML_OP_TRANSPOSE  ||
+                    node->op == GGML_OP_PERMUTE) {
+                    continue;
+                }
+
+                // skip nodes that don't need compute
+                if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+                    continue;
+                }
+
+                // create a fresh command buffer for this single op
+                id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+
+                // encode this single node: idx_start=i, idx_end=i+1, no fusion, no concurrency
+                ggml_metal_op_t ctx_op = ggml_metal_op_init(
+                    ctx->dev,
+                    cmd_buf,
+                    gf,
+                    i, i + 1,
+                    /*use_fusion=*/false,
+                    /*use_concurrency=*/false,
+                    /*use_capture=*/false,
+                    ctx->debug_graph,
+                    ctx->debug_fusion);
+
+                for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+                    const int res = ggml_metal_op_encode(ctx_op, idx);
+                    if (res == 0) {
+                        break;
+                    }
+                    idx += res - 1;
+                }
+
+                ggml_metal_op_free(ctx_op);
+
+                // commit and wait synchronously to get accurate per-op GPU timing
+                [cmd_buf commit];
+                [cmd_buf waitUntilCompleted];
+
+                // check for errors
+                if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+                    GGML_LOG_ERROR("%s: profile: command buffer failed for node %d (%s) with status %d\n",
+                        __func__, i, ggml_op_name(node->op), (int)[cmd_buf status]);
+                    if ([cmd_buf status] == MTLCommandBufferStatusError) {
+                        GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
+                    }
+                    return GGML_STATUS_FAILED;
+                }
+
+                // read GPU timestamps and accumulate per-op-type timing
+                double start = [cmd_buf GPUStartTime];
+                double end   = [cmd_buf GPUEndTime];
+                double dt_ms = (end - start) * 1000.0;
+
+                op_time_ms[node->op] += dt_ms;
+                op_count  [node->op] += 1;
+                total_gpu_ms += dt_ms;
+                n_profiled++;
+            }
+
+            // print per-op-type summary, sorted by total time descending
+            if (n_profiled > 0) {
+                // build sorted index of active op types
+                int active_ops[GGML_OP_COUNT];
+                int n_active = 0;
+                for (int i = 0; i < GGML_OP_COUNT; ++i) {
+                    if (op_count[i] > 0) {
+                        active_ops[n_active++] = i;
+                    }
+                }
+
+                // simple insertion sort by total time descending
+                for (int i = 1; i < n_active; ++i) {
+                    int key = active_ops[i];
+                    int j = i - 1;
+                    while (j >= 0 && op_time_ms[active_ops[j]] < op_time_ms[key]) {
+                        active_ops[j + 1] = active_ops[j];
+                        j--;
+                    }
+                    active_ops[j + 1] = key;
+                }
+
+                fprintf(stderr, "[METAL_PROFILE] per-op breakdown (%.2f ms total, %d nodes):\n",
+                    total_gpu_ms, n_profiled);
+                for (int i = 0; i < n_active; ++i) {
+                    int op = active_ops[i];
+                    double pct = (total_gpu_ms > 0) ? (op_time_ms[op] / total_gpu_ms * 100.0) : 0;
+                    double avg = op_time_ms[op] / op_count[op];
+                    fprintf(stderr, "  %-24s %8.2f ms (%5.1f%%) x%-5u avg=%.3f ms\n",
+                        ggml_op_name((enum ggml_op) op),
+                        op_time_ms[op], pct, op_count[op], avg);
+                }
+            }
+
+            // all ops completed synchronously — nothing for synchronize() to wait on
+            ctx->cmd_buf_last = nil;
+
+            return GGML_STATUS_SUCCESS;
+        }
+
         ctx->n_nodes_0 = MIN(n_main, gf->n_nodes);
         ctx->n_nodes_1 = gf->n_nodes - ctx->n_nodes_0;
 
@@ -602,7 +790,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     //const int64_t t_start = ggml_time_us();
 
-    if (ctx->use_graph_optimize) {
+    // skip graph optimization when profiling per-op (profile>=2) — fusion would merge
+    // nodes and prevent individual op timing measurement
+    if (ctx->use_graph_optimize && ctx->profile < 2) {
         ggml_graph_optimize(gf);
     }
 

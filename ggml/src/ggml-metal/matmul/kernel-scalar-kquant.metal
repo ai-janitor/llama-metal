@@ -14,7 +14,7 @@ void kernel_mul_mv_q2_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -94,10 +94,11 @@ void kernel_mul_mv_q2_K_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;
@@ -105,9 +106,10 @@ void kernel_mul_mv_q2_K_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
+            if (tiisg == 0 && first_row + row < args.ne0) {
                 dst_f32[first_row + row] = sum_all;
             }
         }
@@ -141,7 +143,7 @@ void kernel_mul_mv_q3_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -164,19 +166,16 @@ void kernel_mul_mv_q3_K_f32_impl(
 
     float yl[32];
 
-    //const uint16_t kmask1 = 0x3030;
-    //const uint16_t kmask2 = 0x0f0f;
-
-    const short tid = eff_tiisg/4;
-    const short ix  = eff_tiisg%4;
-    const short ip  = tid/4;          // 0 or 1
-    const short il  = 2*((tid%4)/2);  // 0 or 2
-    const short ir  = tid%2;
-    const short l0  = 8*ir;
+    // At NW=32 each thread covers exactly 1 of the 8 tid positions.
+    // At NW<32 (e.g. NW=8) there are only NW/4 unique tid_base values,
+    // so each thread must iterate over chunks_per_thread = 32/NW tid positions.
+    const short ix             = eff_tiisg % 4;
+    const short tid_base       = eff_tiisg / 4;
+    const short chunks_per_thread = 32 / NW;  // 1 at NW=32, 4 at NW=8
 
     // One would think that the Metal compiler would figure out that ip and il can only have
     // 4 possible states, and optimize accordingly. Well, no. It needs help, and we do it
-    // with these two tales.
+    // with these two tables.
     //
     // Possible masks for the high bit
     const ushort4 mm[4] = {{0x0001, 0x0100, 0x0002, 0x0200},  // ip = 0, il = 0
@@ -187,92 +186,102 @@ void kernel_mul_mv_q3_K_f32_impl(
     // Possible masks for the low 2 bits
     const int4 qm[2] = {{0x0003, 0x0300, 0x000c, 0x0c00}, {0x0030, 0x3000, 0x00c0, 0xc000}};
 
-    const ushort4 hm = mm[2*ip + il/2];
-
-    const short shift = 2*il;
-
-    const float v1 = il == 0 ? 4.f : 64.f;
-    const float v2 = 4.f * v1;
-
-    const uint16_t s_shift1 = 4*ip;
-    const uint16_t s_shift2 = s_shift1 + il;
-
-    const short q_offset = 32*ip + l0;
-    const short y_offset = 128*ip + 32*il + l0;
-
-    device const float * y1 = yy + ix*QK_K + y_offset;
-
     uint32_t scales32, aux32;
     thread uint16_t * scales16 = (thread uint16_t *)&scales32;
     thread const int8_t * scales = (thread const int8_t *)&scales32;
 
-    float sumf1[nr0] = {0.f};
-    float sumf2[nr0] = {0.f};
+    float sumf[nr0] = {0.f};
 
-    for (int i = ix; i < nb; i += 4) {
-        for (short l = 0; l < 8; ++l) {
-            yl[l+ 0] = y1[l+ 0];
-            yl[l+ 8] = y1[l+16];
-            yl[l+16] = y1[l+32];
-            yl[l+24] = y1[l+48];
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        const short tid = tid_base + c * (NW / 4);
+        const short ip  = tid / 4;          // 0 or 1
+        const short il  = 2*((tid%4)/2);    // 0 or 2
+        const short ir  = tid % 2;
+        const short l0  = 8 * ir;
+
+        const ushort4 hm = mm[2*ip + il/2];
+
+        const short shift = 2*il;
+
+        const float v1 = il == 0 ? 4.f : 64.f;
+        const float v2 = 4.f * v1;
+
+        const uint16_t s_shift1 = 4*ip;
+        const uint16_t s_shift2 = s_shift1 + il;
+
+        const short q_offset = 32*ip + l0;
+        const short y_offset = 128*ip + 32*il + l0;
+
+        device const float * y1 = yy + ix*QK_K + y_offset;
+
+        float sumf1[nr0] = {0.f};
+        float sumf2[nr0] = {0.f};
+
+        for (int i = ix; i < nb; i += 4) {
+            for (short l = 0; l < 8; ++l) {
+                yl[l+ 0] = y1[l+ 0];
+                yl[l+ 8] = y1[l+16];
+                yl[l+16] = y1[l+32];
+                yl[l+24] = y1[l+48];
+            }
+
+            device const uint16_t * q = (device const uint16_t *)(x[i].qs + q_offset);
+            device const uint16_t * h = (device const uint16_t *)(x[i].hmask + l0);
+            device const uint16_t * a = (device const uint16_t *)(x[i].scales);
+            device const half * dh = &x[i].d;
+
+            for (short row = 0; row < nr0; ++row) {
+                const float d_all = (float)dh[0];
+
+                scales16[0] = a[4];
+                scales16[1] = a[5];
+                aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030;
+                scales16[0] = a[il+0];
+                scales16[1] = a[il+1];
+                scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0f) | aux32;
+
+                float s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
+                for (short l = 0; l < 8; l += 2) {
+                    const int32_t qs = q[l/2];
+                    s1 += yl[l+0] * (qs & qm[il/2][0]);
+                    s2 += yl[l+1] * (qs & qm[il/2][1]);
+                    s3 += ((h[l/2] & hm[0]) ? 0.f : yl[l+0]) + ((h[l/2] & hm[1]) ? 0.f : yl[l+1]);
+                    s4 += yl[l+16] * (qs & qm[il/2][2]);
+                    s5 += yl[l+17] * (qs & qm[il/2][3]);
+                    s6 += ((h[l/2] & hm[2]) ? 0.f : yl[l+16]) + ((h[l/2] & hm[3]) ? 0.f : yl[l+17]);
+                }
+                float d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
+                float d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
+                sumf1[row] += d1 * (scales[0] - 32);
+                sumf2[row] += d2 * (scales[2] - 32);
+
+                s1 = s2 = s3 = s4 = s5 = s6 = 0;
+                for (short l = 0; l < 8; l += 2) {
+                    const int32_t qs = q[l/2+8];
+                    s1 += yl[l+8] * (qs & qm[il/2][0]);
+                    s2 += yl[l+9] * (qs & qm[il/2][1]);
+                    s3 += ((h[l/2+8] & hm[0]) ? 0.f : yl[l+8]) + ((h[l/2+8] & hm[1]) ? 0.f : yl[l+9]);
+                    s4 += yl[l+24] * (qs & qm[il/2][2]);
+                    s5 += yl[l+25] * (qs & qm[il/2][3]);
+                    s6 += ((h[l/2+8] & hm[2]) ? 0.f : yl[l+24]) + ((h[l/2+8] & hm[3]) ? 0.f : yl[l+25]);
+                }
+                d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
+                d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
+                sumf1[row] += d1 * (scales[1] - 32);
+                sumf2[row] += d2 * (scales[3] - 32);
+
+                q  += args.nb01/2;
+                h  += args.nb01/2;
+                a  += args.nb01/2;
+                dh += args.nb01/2;
+            }
+
+            y1 += 4 * QK_K;
         }
 
-        device const uint16_t * q = (device const uint16_t *)(x[i].qs + q_offset);
-        device const uint16_t * h = (device const uint16_t *)(x[i].hmask + l0);
-        device const uint16_t * a = (device const uint16_t *)(x[i].scales);
-        device const half * dh = &x[i].d;
-
-        for (short row = 0; row < nr0; ++row) {
-            const float d_all = (float)dh[0];
-
-            scales16[0] = a[4];
-            scales16[1] = a[5];
-            aux32 = ((scales32 >> s_shift2) << 4) & 0x30303030;
-            scales16[0] = a[il+0];
-            scales16[1] = a[il+1];
-            scales32 = ((scales32 >> s_shift1) & 0x0f0f0f0f) | aux32;
-
-            float s1 = 0, s2 = 0, s3 = 0, s4 = 0, s5 = 0, s6 = 0;
-            for (short l = 0; l < 8; l += 2) {
-                const int32_t qs = q[l/2];
-                s1 += yl[l+0] * (qs & qm[il/2][0]);
-                s2 += yl[l+1] * (qs & qm[il/2][1]);
-                s3 += ((h[l/2] & hm[0]) ? 0.f : yl[l+0]) + ((h[l/2] & hm[1]) ? 0.f : yl[l+1]);
-                s4 += yl[l+16] * (qs & qm[il/2][2]);
-                s5 += yl[l+17] * (qs & qm[il/2][3]);
-                s6 += ((h[l/2] & hm[2]) ? 0.f : yl[l+16]) + ((h[l/2] & hm[3]) ? 0.f : yl[l+17]);
-            }
-            float d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
-            float d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
-            sumf1[row] += d1 * (scales[0] - 32);
-            sumf2[row] += d2 * (scales[2] - 32);
-
-            s1 = s2 = s3 = s4 = s5 = s6 = 0;
-            for (short l = 0; l < 8; l += 2) {
-                const int32_t qs = q[l/2+8];
-                s1 += yl[l+8] * (qs & qm[il/2][0]);
-                s2 += yl[l+9] * (qs & qm[il/2][1]);
-                s3 += ((h[l/2+8] & hm[0]) ? 0.f : yl[l+8]) + ((h[l/2+8] & hm[1]) ? 0.f : yl[l+9]);
-                s4 += yl[l+24] * (qs & qm[il/2][2]);
-                s5 += yl[l+25] * (qs & qm[il/2][3]);
-                s6 += ((h[l/2+8] & hm[2]) ? 0.f : yl[l+24]) + ((h[l/2+8] & hm[3]) ? 0.f : yl[l+25]);
-            }
-            d1 = d_all * (s1 + 1.f/256.f * s2 - s3*v1);
-            d2 = d_all * (s4 + 1.f/256.f * s5 - s6*v2);
-            sumf1[row] += d1 * (scales[1] - 32);
-            sumf2[row] += d2 * (scales[3] - 32);
-
-            q  += args.nb01/2;
-            h  += args.nb01/2;
-            a  += args.nb01/2;
-            dh += args.nb01/2;
+        for (int row = 0; row < nr0; ++row) {
+            sumf[row] += (sumf1[row] + 0.25f * sumf2[row]) / (1 << shift);
         }
-
-        y1 += 4 * QK_K;
-    }
-
-    for (int row = 0; row < nr0; ++row) {
-        sumf1[row] = (sumf1[row] + 0.25f * sumf2[row]) / (1 << shift);
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -281,10 +290,11 @@ void kernel_mul_mv_q3_K_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-            buf[NW * row + ltid] = sumf1[row];
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
+            buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;
@@ -293,11 +303,11 @@ void kernel_mul_mv_q3_K_f32_impl(
         }
     } else {
         for (int row = 0; row < nr0; ++row) {
-            sumf1[row] = simd_sum(sumf1[row]);
+            sumf[row] = simd_sum(sumf[row]);
         }
         if (tiisg == 0) {
             for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-                dst_f32[first_row + row] = sumf1[row];
+                dst_f32[first_row + row] = sumf[row];
             }
         }
     }
@@ -330,7 +340,7 @@ void kernel_mul_mv_q4_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -338,17 +348,16 @@ void kernel_mul_mv_q4_K_f32_impl(
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
 
-    // 16-thread-per-superblock mapping (matches Vulkan mul_mat_vec_q4_k)
-    const short ix   = eff_tiisg/16;         // 0 or 1 (2 block groups)
-    const short itid = eff_tiisg%16;         // 0..15
-    const short il   = itid/4;           // 0..3
-    const short ir   = itid%4;           // 0..3
-    const short v_im = il/2;             // 0 or 1 (which 128-element half)
-    const short v_in = il%2;             // 0 or 1 (interleaved within half)
-    const short l0   = 4*(2*ir + v_in);  // 0,4,8,...,28
-
-    const uint q_offset = 32*v_im + l0;
-    const uint y_offset = 64*v_im + l0;
+    // Variable NW support for Intel iGPU (q4_K compiles to NW=16):
+    // Original 32-thread mapping: vtiisg 0..15 have ix=0 (even superblocks),
+    // vtiisg 16..31 have ix=1 (odd superblocks). At NW=16, only vtiisg 0..15
+    // exist → ix always 0, odd superblocks missed entirely.
+    // Fix: outer loop over chunks_per_thread = 32/NW. Each chunk advances
+    // vtiisg by NW, so chunk 0 covers vtiisg 0..NW-1 (ix=0) and chunk 1
+    // covers vtiisg NW..2*NW-1 (ix=1). Both chunks accumulate into sumf[].
+    // At NW=32 this is a single iteration (no-op change).
+    const short tiisg_base        = eff_tiisg;
+    const short chunks_per_thread = 32 / NW;  // 1 at NW=32, 2 at NW=16
 
     const int nb = args.ne00/QK_K;
 
@@ -370,56 +379,77 @@ void kernel_mul_mv_q4_K_f32_impl(
     float sumf[nr0]={0.f};
 
     uint16_t sc16[4];
-    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+    // sc8 declared locally within the row loop to avoid potential
+    // thread-private aliasing issues on Intel Metal at NW<32
 
-    for (int ib = ix; ib < nb; ib += 2) {
-        device const float * yb = y + ib*QK_K + y_offset;
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        // Virtual tiisg for this chunk: step by NW each iteration
+        const short vtiisg = tiisg_base + c * NW;
 
-        // 4 vec4 loads (16 floats per thread, half of old 32)
-        float4 by10  = *(device const float4 *)(yb +   0);
-        float4 by132 = *(device const float4 *)(yb +  32);
-        float4 by20  = *(device const float4 *)(yb + 128);
-        float4 by232 = *(device const float4 *)(yb + 160);
+        // 16-thread-per-superblock mapping (matches Vulkan mul_mat_vec_q4_k)
+        const short ix   = vtiisg/16;         // 0 or 1 (2 block groups)
+        const short itid = vtiisg%16;         // 0..15
+        const short il   = itid/4;            // 0..3
+        const short ir   = itid%4;            // 0..3
+        const short v_im = il/2;              // 0 or 1 (which 128-element half)
+        const short v_in = il%2;              // 0 or 1 (interleaved within half)
+        const short l0   = 4*(2*ir + v_in);   // 0,4,8,...,28
 
-        device const uint16_t * sc = (device const uint16_t *)x[ib].scales + v_im;
-        device const uint32_t * qs_ptr = (device const uint32_t *)(x[ib].qs + q_offset);
-        device const half     * dh = &x[ib].d;
+        const uint q_offset = 32*v_im + l0;
+        const uint y_offset = 64*v_im + l0;
 
-        for (short row = 0; row < nr0; row++) {
-            sc16[0] = sc[0] & kmask1;
-            sc16[1] = sc[2] & kmask1;
-            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
-            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+        for (int ib = ix; ib < nb; ib += 2) {
+            device const float * yb = y + ib*QK_K + y_offset;
 
-            // Extract nibbles from 4 bytes of quants + 4 bytes at +64
-            uint32_t qs0  = qs_ptr[0];
-            uint32_t qs64 = qs_ptr[16];  // +64 bytes
+            // 4 vec4 loads (16 floats per thread, half of old 32)
+            float4 by10  = *(device const float4 *)(yb +   0);
+            float4 by132 = *(device const float4 *)(yb +  32);
+            float4 by20  = *(device const float4 *)(yb + 128);
+            float4 by232 = *(device const float4 *)(yb + 160);
 
-            uchar4 qs0_lo  = as_type<uchar4>(qs0  & 0x0F0F0F0Fu);
-            uchar4 qs0_hi  = as_type<uchar4>((qs0  >> 4) & 0x0F0F0F0Fu);
-            uchar4 qs64_lo = as_type<uchar4>(qs64 & 0x0F0F0F0Fu);
-            uchar4 qs64_hi = as_type<uchar4>((qs64 >> 4) & 0x0F0F0F0Fu);
+            device const uint16_t * sc = (device const uint16_t *)x[ib].scales + v_im;
+            device const uint32_t * qs_ptr = (device const uint32_t *)(x[ib].qs + q_offset);
+            device const half     * dh = &x[ib].d;
 
-            // Dot products matching Vulkan's sx/sy/sz/sw
-            float sx = dot(by10,  float4(qs0_lo));
-            float sy = dot(by132, float4(qs0_hi));
-            float sz = dot(by20,  float4(qs64_lo));
-            float sw = dot(by232, float4(qs64_hi));
+            for (short row = 0; row < nr0; row++) {
+                sc16[0] = sc[0] & kmask1;
+                sc16[1] = sc[2] & kmask1;
+                sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+                sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+                // Declare sc8 locally after sc16 is populated to ensure
+                // the compiler always reads the freshly-computed values.
+                thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
-            // smin computed inline (no separate sumy registers)
-            float smin = (by10.x  + by10.y  + by10.z  + by10.w)  * float(sc8[2]) +
-                         (by132.x + by132.y + by132.z + by132.w) * float(sc8[3]) +
-                         (by20.x  + by20.y  + by20.z  + by20.w)  * float(sc8[6]) +
-                         (by232.x + by232.y + by232.z + by232.w) * float(sc8[7]);
+                // Extract nibbles from 4 bytes of quants + 4 bytes at +64
+                uint32_t qs0  = qs_ptr[0];
+                uint32_t qs64 = qs_ptr[16];  // +64 bytes
 
-            float2 dm = float2(dh[0], dh[1]);
-            sumf[row] = fma(dm.x, fma(sx, float(sc8[0]), fma(sy, float(sc8[1]),
-                            fma(sz, float(sc8[4]), sw * float(sc8[5])))),
-                        fma(-dm.y, smin, sumf[row]));
+                uchar4 qs0_lo  = as_type<uchar4>(qs0  & 0x0F0F0F0Fu);
+                uchar4 qs0_hi  = as_type<uchar4>((qs0  >> 4) & 0x0F0F0F0Fu);
+                uchar4 qs64_lo = as_type<uchar4>(qs64 & 0x0F0F0F0Fu);
+                uchar4 qs64_hi = as_type<uchar4>((qs64 >> 4) & 0x0F0F0F0Fu);
 
-            qs_ptr += args.nb01/4;
-            sc     += args.nb01/2;
-            dh     += args.nb01/2;
+                // Dot products matching Vulkan's sx/sy/sz/sw
+                float sx = dot(by10,  float4(qs0_lo));
+                float sy = dot(by132, float4(qs0_hi));
+                float sz = dot(by20,  float4(qs64_lo));
+                float sw = dot(by232, float4(qs64_hi));
+
+                // smin computed inline (no separate sumy registers)
+                float smin = (by10.x  + by10.y  + by10.z  + by10.w)  * float(sc8[2]) +
+                             (by132.x + by132.y + by132.z + by132.w) * float(sc8[3]) +
+                             (by20.x  + by20.y  + by20.z  + by20.w)  * float(sc8[6]) +
+                             (by232.x + by232.y + by232.z + by232.w) * float(sc8[7]);
+
+                float2 dm = float2(dh[0], dh[1]);
+                sumf[row] = fma(dm.x, fma(sx, float(sc8[0]), fma(sy, float(sc8[1]),
+                                fma(sz, float(sc8[4]), sw * float(sc8[5])))),
+                            fma(-dm.y, smin, sumf[row]));
+
+                qs_ptr += args.nb01/4;
+                sc     += args.nb01/2;
+                dh     += args.nb01/2;
+            }
         }
     }
 
@@ -429,10 +459,12 @@ void kernel_mul_mv_q4_K_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally over nr0 so all threads hit the same number of
+        // barriers — required for uniform control flow across simdgroups.
+        for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;
@@ -440,10 +472,12 @@ void kernel_mul_mv_q4_K_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-            float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
-                dst_f32[first_row + row] = sum_all;
+        for (int row = 0; row < nr0; ++row) {
+            sumf[row] = simd_sum(sumf[row]);
+        }
+        if (tiisg == 0) {
+            for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+                dst_f32[first_row + row] = sumf[row];
             }
         }
     }
@@ -476,7 +510,7 @@ void kernel_mul_mv_q5_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -505,75 +539,89 @@ void kernel_mul_mv_q5_K_f32_impl(
     constexpr uint16_t kmask2 = 0x0f0f;
     constexpr uint16_t kmask3 = 0xc0c0;
 
-    const short tid = eff_tiisg/4;
-    const short ix  = eff_tiisg%4;
-    const short iq  = tid/4;
-    const short ir  = tid%4;
-
-    const short l0 = 8*ir;
-    const short q_offset = 32*iq + l0;
-    const short y_offset = 64*iq + l0;
-
-    const uint8_t hm1 = 1u << (2*iq);
-    const uint8_t hm2 = hm1 << 1;
-    const uint8_t hm3 = hm1 << 4;
-    const uint8_t hm4 = hm2 << 4;
+    // Variable NW support (same pattern as q3_K fix, commit ced71af):
+    // Original mapping assumes 32 threads: tid = eff_tiisg/4 gives tid 0..7.
+    // At NW=16 (Intel iGPU), only eff_tiisg 0..15 exist → tid 0..3 covered,
+    // tid 4..7 missed. Fix: keep ix fixed (superblock stride), vary tid per chunk.
+    // chunks_per_thread = 32/NW ensures all 8 tid positions are covered.
+    const short ix             = eff_tiisg % 4;   // superblock stride index (fixed per thread)
+    const short tid_base       = eff_tiisg / 4;   // base tid position
+    const short chunks_per_thread = 32 / NW;      // 1 at NW=32, 2 at NW=16, 4 at NW=8
 
     uint16_t sc16[4];
     thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
 
-    device const float * y1 = yy + ix*QK_K + y_offset;
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        // Virtual tid: steps by NW/4 each chunk to cover all 8 tid positions
+        const short tid = tid_base + c * (NW / 4);
+        const short iq  = tid / 4;          // 0 or 1 (which 128-element half of QK_K)
+        const short ir  = tid % 4;          // 0..3 (position within half)
 
-    for (int i = ix; i < nb; i += 4) {
-        device const uint8_t * q1 = x[i].qs + q_offset;
-        device const uint8_t * qh = x[i].qh + l0;
-        device const half * dh = &x[i].d;
-        device const uint16_t * a = (device const uint16_t *)x[i].scales + iq;
+        const short l0 = 8*ir;
+        const short q_offset = 32*iq + l0;
+        const short y_offset = 64*iq + l0;
 
-        device const float * y2 = y1 + 128;
-        float4 sumy = {0.f, 0.f, 0.f, 0.f};
-        for (short l = 0; l < 8; ++l) {
-            yl[l+0] = y1[l+ 0]; sumy[0] += yl[l+0];
-            yl[l+8] = y1[l+32]; sumy[1] += yl[l+8];
-            yh[l+0] = y2[l+ 0]; sumy[2] += yh[l+0];
-            yh[l+8] = y2[l+32]; sumy[3] += yh[l+8];
-        }
+        // High-bit masks depend on iq (which half of the superblock)
+        const uint8_t hm1 = 1u << (2*iq);
+        const uint8_t hm2 = hm1 << 1;
+        const uint8_t hm3 = hm1 << 4;
+        const uint8_t hm4 = hm2 << 4;
 
-        for (short row = 0; row < nr0; ++row) {
-            device const uint8_t * q2 = q1 + 64;
+        device const float * y1 = yy + ix*QK_K + y_offset;
 
-            sc16[0] = a[0] & kmask1;
-            sc16[1] = a[2] & kmask1;
-            sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
-            sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+        for (int i = ix; i < nb; i += 4) {
+            device const uint8_t * q1 = x[i].qs + q_offset;
+            device const uint8_t * qh = x[i].qh + l0;
+            device const half * dh = &x[i].d;
+            device const uint16_t * a = (device const uint16_t *)x[i].scales + iq;
 
-            float4 acc1 = {0.f};
-            float4 acc2 = {0.f};
-            FOR_UNROLL (short l = 0; l < 8; ++l) {
-                uint8_t h = qh[l];
-                acc1[0] += yl[l+0] * (q1[l] & 0x0F);
-                acc1[1] += yl[l+8] * (q1[l] & 0xF0);
-                acc1[2] += yh[l+0] * (q2[l] & 0x0F);
-                acc1[3] += yh[l+8] * (q2[l] & 0xF0);
-                acc2[0] += h & hm1 ? yl[l+0] : 0.f;
-                acc2[1] += h & hm2 ? yl[l+8] : 0.f;
-                acc2[2] += h & hm3 ? yh[l+0] : 0.f;
-                acc2[3] += h & hm4 ? yh[l+8] : 0.f;
+            device const float * y2 = y1 + 128;
+            float4 sumy = {0.f, 0.f, 0.f, 0.f};
+            for (short l = 0; l < 8; ++l) {
+                yl[l+0] = y1[l+ 0]; sumy[0] += yl[l+0];
+                yl[l+8] = y1[l+32]; sumy[1] += yl[l+8];
+                yh[l+0] = y2[l+ 0]; sumy[2] += yh[l+0];
+                yh[l+8] = y2[l+32]; sumy[3] += yh[l+8];
             }
 
-            sumf[row] += dh[0] * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
-                                  sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
-                                  sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
-                                  sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
-                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            for (short row = 0; row < nr0; ++row) {
+                device const uint8_t * q2 = q1 + 64;
 
-            q1 += args.nb01;
-            qh += args.nb01;
-            dh += args.nb01/2;
-            a  += args.nb01/2;
+                sc16[0] = a[0] & kmask1;
+                sc16[1] = a[2] & kmask1;
+                sc16[2] = ((a[4] >> 0) & kmask2) | ((a[0] & kmask3) >> 2);
+                sc16[3] = ((a[4] >> 4) & kmask2) | ((a[2] & kmask3) >> 2);
+
+                float4 acc1 = {0.f};
+                float4 acc2 = {0.f};
+                FOR_UNROLL (short l = 0; l < 8; ++l) {
+                    uint8_t h = qh[l];
+                    acc1[0] += yl[l+0] * (q1[l] & 0x0F);
+                    acc1[1] += yl[l+8] * (q1[l] & 0xF0);
+                    acc1[2] += yh[l+0] * (q2[l] & 0x0F);
+                    acc1[3] += yh[l+8] * (q2[l] & 0xF0);
+                    acc2[0] += h & hm1 ? yl[l+0] : 0.f;
+                    acc2[1] += h & hm2 ? yl[l+8] : 0.f;
+                    acc2[2] += h & hm3 ? yh[l+0] : 0.f;
+                    acc2[3] += h & hm4 ? yh[l+8] : 0.f;
+                }
+
+                // Accumulate across chunks — each chunk covers different tid
+                // positions, so partial sums are independent and additive.
+                sumf[row] += dh[0] * (sc8[0] * (acc1[0]      + 16.f*acc2[0]) +
+                                      sc8[1] * (acc1[1]/16.f + 16.f*acc2[1]) +
+                                      sc8[4] * (acc1[2]      + 16.f*acc2[2]) +
+                                      sc8[5] * (acc1[3]/16.f + 16.f*acc2[3])) -
+                             dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+
+                q1 += args.nb01;
+                qh += args.nb01;
+                dh += args.nb01/2;
+                a  += args.nb01/2;
+            }
+
+            y1 += 4 * QK_K;
         }
-
-        y1 += 4 * QK_K;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -582,10 +630,12 @@ void kernel_mul_mv_q5_K_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally over nr0 so all threads hit the same barrier count.
+        // first_row can differ between simdgroups → conditional loop would deadlock.
+        for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;
@@ -593,9 +643,11 @@ void kernel_mul_mv_q5_K_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // simd_sum path — works at NW=8 (Intel q3_K) and NW=32 (Apple/AMD).
+        // Broken at NW=16 on Intel — use shmem_reduce (sr=1) instead for those.
+        for (int row = 0; row < nr0; ++row) {
             const float tot = simd_sum(sumf[row]);
-            if (tiisg == 0) {
+            if (tiisg == 0 && first_row + row < args.ne0) {
                 dst_f32[first_row + row] = tot;
             }
         }
@@ -629,7 +681,7 @@ void kernel_mul_mv_q6_K_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -659,50 +711,64 @@ void kernel_mul_mv_q6_K_f32_impl(
 
     float yl[16];
 
-    const short tid = eff_tiisg/2;
-    const short ix  = eff_tiisg%2;
-    const short ip  = tid/8;         // 0 or 1
-    const short il  = tid%8;
-    const short l0  = 4*il;
-    const short is  = 8*ip + l0/16;
+    // Variable NW support (same pattern as q3_K fix, commit ced71af):
+    // Original mapping: tid = eff_tiisg/2 gives 16 tid positions (0..15).
+    // At NW=16, eff_tiisg 0..15 → tid 0..7, missing tid 8..15.
+    // Fix: keep ix fixed (superblock stride=2), vary tid per chunk.
+    // chunks_per_thread = 32/NW ensures all 16 tid positions are covered.
+    const short ix             = eff_tiisg % 2;   // superblock stride index (fixed per thread)
+    const short tid_base       = eff_tiisg / 2;   // base tid position
+    const short chunks_per_thread = 32 / NW;      // 1 at NW=32, 2 at NW=16
 
-    const short y_offset   = 128*ip + l0;
-    const short q_offset_l =  64*ip + l0;
-    const short q_offset_h =  32*ip + l0;
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        // Virtual tid: steps by NW/2 each chunk to cover all 16 tid positions.
+        // At NW=16: tid_base 0..7, chunk 0 → tid 0..7, chunk 1 → tid 8..15.
+        const short tid = tid_base + c * (NW / 2);
+        const short ip  = tid/8;         // 0 or 1 (which 128-element half)
+        const short il  = tid%8;         // position within half
+        const short l0  = 4*il;
+        const short is  = 8*ip + l0/16;  // scale index
 
-    for (int i = ix; i < nb; i += 2) {
-        device const uint8_t * q1 = x[i].ql + q_offset_l;
-        device const uint8_t * q2 = q1 + 32;
-        device const uint8_t * qh = x[i].qh + q_offset_h;
-        device const int8_t  * sc = x[i].scales + is;
-        device const half    * dh = &x[i].d;
+        const short y_offset   = 128*ip + l0;
+        const short q_offset_l =  64*ip + l0;
+        const short q_offset_h =  32*ip + l0;
 
-        device const float * y = yy + i * QK_K + y_offset;
+        for (int i = ix; i < nb; i += 2) {
+            device const uint8_t * q1 = x[i].ql + q_offset_l;
+            device const uint8_t * q2 = q1 + 32;
+            device const uint8_t * qh = x[i].qh + q_offset_h;
+            device const int8_t  * sc = x[i].scales + is;
+            device const half    * dh = &x[i].d;
 
-        for (short l = 0; l < 4; ++l) {
-            yl[4*l + 0] = y[l +  0];
-            yl[4*l + 1] = y[l + 32];
-            yl[4*l + 2] = y[l + 64];
-            yl[4*l + 3] = y[l + 96];
-        }
+            device const float * y = yy + i * QK_K + y_offset;
 
-        for (short row = 0; row < nr0; ++row) {
-            float4 sums = {0.f, 0.f, 0.f, 0.f};
-
-            FOR_UNROLL (short l = 0; l < 4; ++l) {
-                sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
-                sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
-                sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
-                sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+            for (short l = 0; l < 4; ++l) {
+                yl[4*l + 0] = y[l +  0];
+                yl[4*l + 1] = y[l + 32];
+                yl[4*l + 2] = y[l + 64];
+                yl[4*l + 3] = y[l + 96];
             }
 
-            sumf[row] += dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+            for (short row = 0; row < nr0; ++row) {
+                float4 sums = {0.f, 0.f, 0.f, 0.f};
 
-            q1 += args.nb01;
-            q2 += args.nb01;
-            qh += args.nb01;
-            sc += args.nb01;
-            dh += args.nb01/2;
+                FOR_UNROLL (short l = 0; l < 4; ++l) {
+                    sums[0] += yl[4*l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & kmask1) << 4)) - 32);
+                    sums[1] += yl[4*l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & kmask2) << 2)) - 32);
+                    sums[2] += yl[4*l + 2] * ((int8_t)((q1[l]  >> 4) | ((qh[l] & kmask3) << 0)) - 32);
+                    sums[3] += yl[4*l + 3] * ((int8_t)((q2[l]  >> 4) | ((qh[l] & kmask4) >> 2)) - 32);
+                }
+
+                // Accumulate across chunks — each chunk covers different tid
+                // positions within the superblock, so partial sums are additive.
+                sumf[row] += dh[0] * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+
+                q1 += args.nb01;
+                q2 += args.nb01;
+                qh += args.nb01;
+                sc += args.nb01;
+                dh += args.nb01/2;
+            }
         }
     }
 
@@ -712,10 +778,12 @@ void kernel_mul_mv_q6_K_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally over nr0 so all threads hit the same barrier count.
+        // first_row can differ between simdgroups → conditional loop would deadlock.
+        for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;
@@ -723,10 +791,13 @@ void kernel_mul_mv_q6_K_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
-            float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
-                dst_f32[first_row + row] = sum_all;
+        // simd_sum path — works at NW=8 and NW=32. Broken at NW=16 on Intel.
+        for (int row = 0; row < nr0; ++row) {
+            sumf[row] = simd_sum(sumf[row]);
+        }
+        if (tiisg == 0) {
+            for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+                dst_f32[first_row + row] = sumf[row];
             }
         }
     }
@@ -761,7 +832,7 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -787,23 +858,47 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
 
     const int nb32 = nb * (QK_K / 32);
 
+    // Load shared-memory lookup tables for iq2_xxs dequantization.
+    // The tables need 256 uint64_t entries (svalues) and 128 uint8_t entries (ssigns).
+    // On GPUs with NW < 32 (e.g., Intel iGPU with NW=16), the total thread count per
+    // threadgroup may differ from the assumed 64 (2 simdgroups * 32 threads). We use
+    // tidx (flat thread index within the threadgroup) to ensure all entries are loaded
+    // regardless of NW. Total threads = NSG_dispatch * 32 (dispatch always uses 32
+    // threads per simdgroup slot), so tidx covers 0..(NSG_dispatch*32-1).
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
-        int nval = 4;
-        int pos  = (32*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        const int total_threads = NW * NSG;
+        const int nval = 4;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval; pos < 256; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xxs_grid[pos + i];
+        }
+        const int nval2 = 2;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval2; pos < 128; pos += total_threads*nval2) {
+            for (int i = 0; i < nval2; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     const int ix = eff_tiisg;
 
-    device const float * y4 = y + 32 * ix;
+    // Inner loop fix for variable SIMD width (NW).
+    //
+    // The original loop used a stride of 32, assuming NW=32 (one thread per ib32
+    // position per stride). On Intel iGPU with NW=16, only positions 0..15 are
+    // visited per stride, leaving positions 16..31 unprocessed. For k=1024,
+    // nb32 = 32, so half the data is skipped, causing ~50% error.
+    //
+    // Fix: stride by NW instead of 32. Each thread handles ib32 positions
+    // ix, ix+NW, ix+2*NW, ... covering all nb32 positions. The y pointer is
+    // re-derived per ib32 position (y + 32*ib32) instead of using incremental
+    // advancement, which was tied to the old stride of 32.
+    for (int ib32 = ix; ib32 < nb32; ib32 += NW) {
 
-    for (int ib32 = ix; ib32 < nb32; ib32 += 32) {
+        // Re-derive y pointer for this ib32 position.
+        // Each ib32 corresponds to a 32-float chunk of the input vector.
+        device const float * y4 = y + 32 * ib32;
+
         for (short i = 0; i < 32; ++i) {
             yl[i] = y4[i];
         }
@@ -834,8 +929,6 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
             dh += args.nb01/2;
             q2 += args.nb01/2;
         }
-
-        y4 += 32 * 32;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -844,10 +937,11 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot * 0.25f;
@@ -855,9 +949,10 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
+            if (tiisg == 0 && first_row + row < args.ne0) {
                 dst_f32[first_row + row] = sum_all * 0.25f;
             }
         }
@@ -890,7 +985,7 @@ void kernel_mul_mv_iq2_xs_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -919,12 +1014,15 @@ void kernel_mul_mv_iq2_xs_f32_impl(
     threadgroup uint64_t * svalues = (threadgroup uint64_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 512);
     {
-        int nval = 8;
-        int pos  = (32*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xs_grid[pos + i];
-        nval = 2;
-        pos  = (32*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        const int total_threads = NW * NSG;
+        const int nval = 8;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval; pos < 512; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xs_grid[pos + i];
+        }
+        const int nval2 = 2;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval2; pos < 128; pos += total_threads*nval2) {
+            for (int i = 0; i < nval2; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -983,10 +1081,11 @@ void kernel_mul_mv_iq2_xs_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot * 0.25f;
@@ -994,9 +1093,10 @@ void kernel_mul_mv_iq2_xs_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
+            if (tiisg == 0 && first_row + row < args.ne0) {
                 dst_f32[first_row + row] = sum_all * 0.25f;
             }
         }
@@ -1030,7 +1130,7 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1059,12 +1159,15 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
     threadgroup uint32_t * svalues = (threadgroup uint32_t *)(shmem);
     threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
     {
-        int nval = 4;
-        int pos  = (32*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3xxs_grid[pos + i];
-        nval = 2;
-        pos  = (32*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        const int total_threads = NW * NSG;
+        const int nval = 4;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval; pos < 256; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3xxs_grid[pos + i];
+        }
+        const int nval2 = 2;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval2; pos < 128; pos += total_threads*nval2) {
+            for (int i = 0; i < nval2; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -1116,10 +1219,11 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot * 0.5f;
@@ -1127,9 +1231,10 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
+            if (tiisg == 0 && first_row + row < args.ne0) {
                 dst_f32[first_row + row] = sum_all * 0.5f;
             }
         }
@@ -1163,7 +1268,7 @@ void kernel_mul_mv_iq3_s_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1191,9 +1296,11 @@ void kernel_mul_mv_iq3_s_f32_impl(
 
     threadgroup uint32_t * svalues = (threadgroup uint32_t *) shmem;
     {
-        int nval = 8;
-        int pos  = (32*eff_sgitg + eff_tiisg)*nval;
-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3s_grid[pos + i];
+        const int total_threads = NW * NSG;
+        const int nval = 8;
+        for (int pos = (NW*eff_sgitg + eff_tiisg)*nval; pos < 512; pos += total_threads*nval) {
+            for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3s_grid[pos + i];
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
@@ -1249,10 +1356,11 @@ void kernel_mul_mv_iq3_s_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;
@@ -1260,9 +1368,10 @@ void kernel_mul_mv_iq3_s_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
+            if (tiisg == 0 && first_row + row < args.ne0) {
                 dst_f32[first_row + row] = sum_all;
             }
         }
@@ -1296,7 +1405,7 @@ void kernel_mul_mv_iq2_s_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1383,10 +1492,11 @@ void kernel_mul_mv_iq2_s_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot * 0.25f;
@@ -1394,9 +1504,10 @@ void kernel_mul_mv_iq2_s_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
+            if (tiisg == 0 && first_row + row < args.ne0) {
                 dst_f32[first_row + row] = sum_all * 0.25f;
             }
         }
@@ -1430,7 +1541,7 @@ void kernel_mul_mv_iq1_s_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1504,10 +1615,11 @@ void kernel_mul_mv_iq1_s_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;
@@ -1515,9 +1627,10 @@ void kernel_mul_mv_iq1_s_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
+            if (tiisg == 0 && first_row + row < args.ne0) {
                 dst_f32[first_row + row] = sum_all;
             }
         }
@@ -1551,7 +1664,7 @@ void kernel_mul_mv_iq1_m_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1635,10 +1748,11 @@ void kernel_mul_mv_iq1_m_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0;
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;
@@ -1646,9 +1760,10 @@ void kernel_mul_mv_iq1_m_f32_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     } else {
-        for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+            for (int row = 0; row < nr0; ++row) {
             float sum_all = simd_sum(sumf[row]);
-            if (tiisg == 0) {
+            if (tiisg == 0 && first_row + row < args.ne0) {
                 dst_f32[first_row + row] = sum_all;
             }
         }
@@ -1682,7 +1797,7 @@ void kernel_mul_mv_iq4_nl_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1706,58 +1821,70 @@ void kernel_mul_mv_iq4_nl_f32_impl(
     const int nb   = args.ne00/QK4_NL;
     const int ns01 = args.nb01/args.nb00;
 
-    const short ix = eff_tiisg/2;  // 0...15
-    const short it = eff_tiisg%2;  // 0 or 1
+    // Variable NW support for Intel iGPU (iq4_nl compiles to NW=16):
+    // Original: ix = eff_tiisg/2 (0..15), it = eff_tiisg%2 (0 or 1).
+    // At NW=16, ix only covers 0..7, missing positions 8..15.
+    // Fix: keep it fixed, vary ix per chunk. chunks_per_thread = 32/NW.
+    const short it             = eff_tiisg % 2;   // 0 or 1 — fixed per thread
+    const short ix_base        = eff_tiisg / 2;   // base superblock position
+    const short chunks_per_thread = 32 / NW;      // 1 at NW=32, 2 at NW=16
 
     shmem_f32[eff_tiisg] = kvalues_iq4nl_f[eff_tiisg%16];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float4 yl[4];
     float sumf[NR0]={0.f};
-
-    device const float * yb = y + ix*QK4_NL + it*8;
 
     uint32_t aux32[2];
     thread const uint8_t * q8 = (thread const uint8_t *)aux32;
 
     float4 qf1, qf2;
 
-    // [TAG_MUL_MV_WEIRD]
-    for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
-        device const float4 * y4 = (device const float4 *)yb;
-        yl[0] = y4[0];
-        yl[1] = y4[4];
-        yl[2] = y4[1];
-        yl[3] = y4[5];
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        // At NW=32: ix = ix_base (single iteration, no change).
+        // At NW=16: ix = ix_base + c*8, covers positions 0-7 then 8-15.
+        const short ix = ix_base + c * (NW / 2);
 
-        for (short row = 0; row < NR0; row++) {
-            device const block_iq4_nl & xb = x[row*ns01 + ib];
-            device const uint16_t * q4 = (device const uint16_t *)(xb.qs + 8*it);
+        float4 yl[4];
 
-            float4 acc1 = {0.f}, acc2 = {0.f};
+        device const float * yb = y + ix*QK4_NL + it*8;
 
-            aux32[0] = q4[0] | (q4[1] << 16);
-            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
-            aux32[0] &= 0x0f0f0f0f;
-            qf1 = {shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]};
-            qf2 = {shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]};
-            acc1 += yl[0] * qf1;
-            acc2 += yl[1] * qf2;
+        // [TAG_MUL_MV_WEIRD]
+        for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
+            device const float4 * y4 = (device const float4 *)yb;
+            yl[0] = y4[0];
+            yl[1] = y4[4];
+            yl[2] = y4[1];
+            yl[3] = y4[5];
 
-            aux32[0] = q4[2] | (q4[3] << 16);
-            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
-            aux32[0] &= 0x0f0f0f0f;
-            qf1 = {shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]};
-            qf2 = {shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]};
-            acc1 += yl[2] * qf1;
-            acc2 += yl[3] * qf2;
+            for (short row = 0; row < NR0; row++) {
+                device const block_iq4_nl & xb = x[row*ns01 + ib];
+                device const uint16_t * q4 = (device const uint16_t *)(xb.qs + 8*it);
 
-            acc1 += acc2;
+                float4 acc1 = {0.f}, acc2 = {0.f};
 
-            sumf[row] += (float)xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+                aux32[0] = q4[0] | (q4[1] << 16);
+                aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
+                aux32[0] &= 0x0f0f0f0f;
+                qf1 = {shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]};
+                qf2 = {shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]};
+                acc1 += yl[0] * qf1;
+                acc2 += yl[1] * qf2;
+
+                aux32[0] = q4[2] | (q4[3] << 16);
+                aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
+                aux32[0] &= 0x0f0f0f0f;
+                qf1 = {shmem_f32[q8[0]], shmem_f32[q8[1]], shmem_f32[q8[2]], shmem_f32[q8[3]]};
+                qf2 = {shmem_f32[q8[4]], shmem_f32[q8[5]], shmem_f32[q8[6]], shmem_f32[q8[7]]};
+                acc1 += yl[2] * qf1;
+                acc2 += yl[3] * qf2;
+
+                acc1 += acc2;
+
+                sumf[row] += (float)xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+            }
+
+            yb += 16 * QK4_NL;
         }
-
-        yb += 16 * QK4_NL;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -1813,7 +1940,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1836,23 +1963,33 @@ void kernel_mul_mv_iq4_xs_f32_impl(
     const int nb   = args.ne00/QK_K;
     const int ns01 = args.nb01/args.nb00;
 
-    const short ix = eff_tiisg/16;  // 0 or 1
-    const short it = eff_tiisg%16;  // 0...15
-    const short ib = it/2;
-    const short il = it%2;
+    // Variable NW support for Intel iGPU (iq4_xs compiles to NW=16):
+    // Original: ix = eff_tiisg/16 (0 or 1), it = eff_tiisg%16 (0..15).
+    // At NW=16, ix is always 0 — odd superblocks missed.
+    // Fix: keep ix fixed via eff_tiisg%2, vary it per chunk. chunks_per_thread = 32/NW.
+    const short ix             = eff_tiisg % 2;    // superblock stride (fixed per thread)
+    const short it_base        = eff_tiisg / 2;    // base tile position
+    const short chunks_per_thread = 32 / NW;       // 1 at NW=32, 2 at NW=16
 
     shmem_f32[eff_tiisg] = kvalues_iq4nl_f[eff_tiisg%16];
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float4 yl[4];
     float sumf[NR0]={0.f};
-
-    device const float * yb = y + ix * QK_K + ib * 32 + il * 8;
 
     uint32_t aux32[2];
     thread const uint8_t * q8 = (thread const uint8_t *)aux32;
 
     float4 qf1, qf2;
+
+    for (short c = 0; c < chunks_per_thread; ++c) {
+        // At NW=32: it = it_base (single iteration). At NW=16: covers 0-7 then 8-15.
+        const short it = it_base + c * (NW / 2);
+        const short ib = it/2;
+        const short il = it%2;
+
+        float4 yl[4];
+
+        device const float * yb = y + ix * QK_K + ib * 32 + il * 8;
 
     // [TAG_MUL_MV_WEIRD]
     for (int ibl = ix; ibl < nb && ibl < ns01; ibl += 2) {
@@ -1890,6 +2027,7 @@ void kernel_mul_mv_iq4_xs_f32_impl(
 
         yb += 2 * QK_K;
     }
+    } // end chunks_per_thread loop
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
 
@@ -1944,7 +2082,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
         ushort sgitg,
         ushort tidx) {
     const short NSG = FC_mul_mv_nsg;
-    constexpr short NW = N_SIMDWIDTH;
+    const short NW = N_SIMDWIDTH;
     const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
     const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
 
@@ -1968,7 +2106,8 @@ void kernel_mul_mv_mxfp4_f32_impl(
     const int nb   = args.ne00/QK_MXFP4;
     const int ns01 = args.nb01/args.nb00; // this can be larger than nb for permuted src0 tensors
 
-    const short ix = eff_tiisg/2;  // 0...15
+    const short n_pairs = NW/2;    // number of (ix,it) pairs: 16 for NW=32, 8 for NW=16
+    const short ix = eff_tiisg/2;  // 0...n_pairs-1
     const short it = eff_tiisg%2;  // 0 or 1
 
     shmem_f32[eff_tiisg] = kvalues_mxfp4_f[eff_tiisg%16];
@@ -1981,7 +2120,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
 
     // note: just the check `ib < nb` is enough, but adding the redundant `&& ib < ns01` check makes the kernel a bit faster
     //       no idea why that is - needs some deeper investigation [TAG_MUL_MV_WEIRD]
-    for (int ib = ix; ib < nb && ib < ns01; ib += 16) {
+    for (int ib = ix; ib < nb && ib < ns01; ib += n_pairs) {
         device const float4 * y4 = (device const float4 *) yb;
 
         yl[0] = y4[0];
@@ -2003,7 +2142,7 @@ void kernel_mul_mv_mxfp4_f32_impl(
             sumf[row] += e8m0_to_fp32(xb.e) * ((acc1[0] + acc1[1]) + (acc1[2] + acc1[3]));
         }
 
-        yb += 16 * QK_MXFP4;
+        yb += n_pairs * QK_MXFP4;
     }
 
     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
@@ -2012,10 +2151,13 @@ void kernel_mul_mv_mxfp4_f32_impl(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const ushort ltid = tidx % NW;
         threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * NR0;
-        for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {
+        // Loop always runs NR0 iterations so all threads hit the same number of
+        // barriers — required for deadlock-free operation when ne0 is not a
+        // multiple of NSG*NR0 (some simdgroups may have out-of-bounds first_row).
+        for (int row = 0; row < NR0; ++row) {
             buf[NW * row + ltid] = sumf[row];
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (ltid == 0) {
+            if (ltid == 0 && first_row + row < args.ne0) {
                 float tot = 0.0f;
                 for (short i = 0; i < NW; i++) { tot += buf[NW * row + i]; }
                 dst_f32[first_row + row] = tot;

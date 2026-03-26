@@ -87,7 +87,7 @@ kernel void kernel_flash_attn_ext_blk(
     const int32_t Q = FC_flash_attn_ext_blk_nqptg;
     const int32_t C = FC_flash_attn_ext_blk_ncpsg;
 
-    constexpr short NW  = N_SIMDWIDTH;
+    const short NW  = N_SIMDWIDTH;
 
     const int32_t i3 = tgpig[2]/args.ne32;
     const int32_t i2 = tgpig[2]%args.ne32;
@@ -221,7 +221,7 @@ void kernel_flash_attn_ext_impl(
     constexpr short PV8  = PV/8;
   //constexpr short PV16 = PV/16;
 
-    constexpr short NW  = N_SIMDWIDTH;
+    const short NW  = N_SIMDWIDTH;
     constexpr short NQ  = Q/NSG;
     constexpr short SH  = 2*C; // shared memory per simdgroup (s_t == float)
 
