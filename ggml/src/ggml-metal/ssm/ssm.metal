@@ -519,53 +519,44 @@ kernel void kernel_gated_delta_net(
         ls[j] = (col < S) ? src5[state_row_base + col] : 0.0f;
     }
 
-    // Per-token recurrence — ls stays in registers across all tokens.
-    // This is why the fused kernel is fast: no device memory round-trip between steps.
+    // INCREMENTAL TEST: full computation but NO state update (ls[j] += k*d is skipped)
     for (int t = 0; t < T; t++) {
-        // gate and beta are per-head scalars: index = head (for single-token decode)
-        // For multi-token: gate[t * H + head], beta[t * H + head]
         const int gh_idx = t * H + head;
-
-        // GQA: q and k may have fewer heads than v
         const int k_head = head / group_ratio;
         const int qk_off = (t * H_k + k_head) * S;
 
-        // Step 1: decay — state *= exp(gate)
-        // gate is log(decay) ≤ 0, so exp(gate) ∈ (0, 1]
-        const float g_exp = exp(src3[gh_idx]);
+        // Step 1: decay
+        const float decay = exp(src3[gh_idx]);
 
-        // Step 2: dot(state_row, k) — need full reduction across S columns
-        float s_k = 0.0f;
+        // Step 2: dot(state, k)
+        float dot_state_k = 0.0f;
         for (int j = 0; j < NSG; j++) {
             const int col = (int)tx * NSG + j;
             if (col < S) {
-                ls[j] *= g_exp;                      // decay in-place
-                s_k += ls[j] * src0[qk_off + col];   // accumulate dot(state, k)
+                ls[j] *= decay;
+                dot_state_k += ls[j] * src0[qk_off + col];
             }
         }
-        s_k = simd_sum(s_k);  // full dot product via hardware butterfly reduction
+        dot_state_k = simd_sum(dot_state_k);
 
-        // Step 3: delta = (v[row] - dot(state, k)) * beta
-        // v is indexed per-head: v[(t * H + head) * S + row]
-        const float d = (src1[gh_idx * S + row] - s_k) * src4[gh_idx];
+        // Step 3: delta = (v - dot(state,k)) * beta
+        const float v_val = src1[gh_idx * S + row];
+        const float beta_val = src4[gh_idx];
+        const float delta = (v_val - dot_state_k) * beta_val;
 
-        // Step 4: state update + output accumulation (fused to reuse state read)
-        // state[row, col] += k[col] * delta
-        // output[row] = dot(updated_state, q)
-        float y = 0.0f;
+        // Step 4+5: state update + output (FUSED in one loop, like original)
+        float dot_state_q = 0.0f;
         for (int j = 0; j < NSG; j++) {
             const int col = (int)tx * NSG + j;
             if (col < S) {
-                ls[j] += src0[qk_off + col] * d;     // outer product update
-                y += ls[j] * src2[qk_off + col];      // accumulate dot(state, q)
+                ls[j] += src0[qk_off + col] * delta;
+                dot_state_q += ls[j] * src2[qk_off + col];
             }
         }
-        y = simd_sum(y);  // full dot product
+        dot_state_q = simd_sum(dot_state_q);
 
-        // Thread 0 writes output for this (token, head, row)
-        // Output layout: dst[t * S * H + head * S + row] for the first T rows of the packed tensor
         if (tx == 0) {
-            dst[(int64_t)t * S * H + head * S + row] = y * args.scale;
+            dst[(int64_t)t * S * H + head * S + row] = dot_state_q * args.scale;
         }
     }
 

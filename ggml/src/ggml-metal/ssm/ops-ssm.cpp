@@ -298,6 +298,36 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.scale    =*/ scale,
     };
 
+    // GGML_METAL_DEBUG_DISPATCH: print tensor shapes/strides at kernel dispatch time.
+    // Set env var to max number of dispatches to log (e.g. GGML_METAL_DEBUG_DISPATCH=2).
+    // Works for any Metal kernel — add the same block to other dispatch functions.
+    {
+        static int dispatch_count = 0;
+        static int dispatch_max = -1;
+        static bool dispatch_init = false;
+        if (!dispatch_init) {
+            dispatch_init = true;
+            const char * env = getenv("GGML_METAL_DEBUG_DISPATCH");
+            dispatch_max = env ? atoi(env) : -1;
+        }
+        if (dispatch_max >= 0 && dispatch_count < dispatch_max) {
+            fprintf(stderr, "\n[DISPATCH gated_delta_net #%d] S=%d H=%d T=%d n_seqs=%d H_k=%d scale=%.4f\n",
+                    dispatch_count, S, H, T, n_seqs, H_k, scale);
+            for (int i = 0; i < 6; i++) {
+                const ggml_tensor * src = op->src[i];
+                if (!src) continue;
+                fprintf(stderr, "  src[%d] %-24s ne=[%4lld,%4lld,%4lld,%4lld] nb=[%4zu,%6zu,%8zu,%10zu] cont=%d data=%p\n",
+                        i, src->name, src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                        src->nb[0], src->nb[1], src->nb[2], src->nb[3],
+                        ggml_is_contiguous(src), src->data);
+            }
+            fprintf(stderr, "  dst    %-24s ne=[%4lld,%4lld,%4lld,%4lld] nb=[%4zu,%6zu,%8zu,%10zu] data=%p\n",
+                    op->name, op->ne[0], op->ne[1], op->ne[2], op->ne[3],
+                    op->nb[0], op->nb[1], op->nb[2], op->nb[3], op->data);
+            dispatch_count++;
+        }
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);

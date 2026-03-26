@@ -1219,6 +1219,78 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // GGML_METAL_DUMP_TENSORS: post-compute tensor value inspection.
+    // Set env var to a comma-separated list of tensor name substrings.
+    // Example: GGML_METAL_DUMP_TENSORS="delta_net_result-0,output_tokens-0"
+    // Optional: append ":N" to limit to first N decode rounds (default 3).
+    // Prints first 16 float values of matching tensors after each graph compute.
+    // Works for any kernel — just set the env var to match your tensor names.
+    {
+        static const char * dump_env = getenv("GGML_METAL_DUMP_TENSORS");
+        static int dump_round = 0;
+        static int dump_max = 3;
+        static std::vector<std::string> dump_patterns;
+        static bool dump_init = false;
+
+        if (dump_env && !dump_init) {
+            dump_init = true;
+            std::string env_str(dump_env);
+            // Check for ":N" max round suffix
+            auto colon = env_str.rfind(':');
+            if (colon != std::string::npos) {
+                dump_max = std::atoi(env_str.c_str() + colon + 1);
+                env_str = env_str.substr(0, colon);
+            }
+            // Split by comma
+            size_t pos = 0;
+            while ((pos = env_str.find(',')) != std::string::npos) {
+                dump_patterns.push_back(env_str.substr(0, pos));
+                env_str.erase(0, pos + 1);
+            }
+            if (!env_str.empty()) {
+                dump_patterns.push_back(env_str);
+            }
+            fprintf(stderr, "[DUMP_TENSORS] patterns=[");
+            for (size_t i = 0; i < dump_patterns.size(); i++) {
+                fprintf(stderr, "%s%s", dump_patterns[i].c_str(), i+1 < dump_patterns.size() ? "," : "");
+            }
+            fprintf(stderr, "] max_rounds=%d\n", dump_max);
+        }
+
+        // One-shot: dump ALL node names for first decode graph
+        static bool decode_graph_dumped = false;
+        if (dump_env && !decode_graph_dumped && ubatch.n_tokens == 1) {
+            decode_graph_dumped = true;
+            ggml_cgraph * gf = res->get_gf();
+            fprintf(stderr, "[DUMP] decode graph has %d nodes. Searching for patterns...\n", ggml_graph_n_nodes(gf));
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                (void)t; // graph dump disabled
+            }
+        }
+        if (dump_env && dump_round < dump_max) {
+            ggml_cgraph * gf = res->get_gf();
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                ggml_tensor * t = ggml_graph_node(gf, i);
+                for (const auto & pat : dump_patterns) {
+                    if (strstr(t->name, pat.c_str())) {
+                        const int n_vals = std::min((int64_t)16, ggml_nelements(t));
+                        float buf[16] = {};
+                        ggml_backend_tensor_get(t, buf, 0, n_vals * sizeof(float));
+                        fprintf(stderr, "\n[DUMP #%d tok=%d] %s op=%s ne=[%lld,%lld,%lld,%lld]\n  ",
+                                dump_round, (int)ubatch.n_tokens, t->name, ggml_op_name(t->op),
+                                t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+                        for (int j = 0; j < n_vals; j++) fprintf(stderr, "%.6f ", buf[j]);
+                        fprintf(stderr, "\n");
+                        dump_round++;
+                        break; // one match per pattern per round
+                    }
+                }
+                if (dump_round >= dump_max) break;
+            }
+        }
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;

@@ -418,10 +418,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_delta_net_autore
     ggml_tensor * core_attn_out;
     ggml_tensor * new_state;
 
-    if (n_seqs == 1) {
-        // Fused gated delta-net kernel: replaces 16 elementwise dispatches with 1.
-        // State stays in GPU registers — no intermediate device memory writes.
-        // Only for n_seqs==1 — multi-seq requires per-seq state indexing not yet in kernel.
+    if (n_seqs == 1 && getenv("USE_FUSED")) {
+        // Fused gated delta-net kernel
         ggml_tensor * g_t    = ggml_cont(ctx0, ggml_reshape_4d(ctx0, g, 1, 1, H_k, n_seqs));
         ggml_tensor * beta_t = ggml_cont(ctx0, ggml_reshape_4d(ctx0, beta, 1, 1, H_k, n_seqs));
 
@@ -429,19 +427,22 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_delta_net_autore
         ggml_tensor * k3 = ggml_reshape_3d(ctx0, k, S_k, H_k, n_tokens);
         ggml_tensor * v3 = ggml_reshape_3d(ctx0, v, S_v, H_v, n_tokens);
 
-        // scale=1.0 because q was already scaled above (ggml_scale(q, 1/sqrt(S_v)))
         ggml_tensor * result = ggml_gated_delta_net(ctx0, k3, v3, q3, g_t, beta_t, state, 1.0f);
         cb(result, "delta_net_result", il);
 
         const int64_t n_embd = S_v * H_v;
-        core_attn_out = ggml_view_4d(ctx0, result,
-            S_v, 1, H_v, n_seqs,
-            result->nb[0] * S_v, result->nb[0] * S_v, result->nb[0] * S_v * H_v, 0);
+
+        // Force copies of BOTH output and state from the packed result
+        // to prevent buffer reuse from corrupting them
+        core_attn_out = ggml_view_1d(ctx0, result, n_embd * n_tokens, 0);
+        core_attn_out = ggml_reshape_4d(ctx0, core_attn_out, S_v, 1, H_v, n_seqs);
+        core_attn_out = ggml_cont(ctx0, core_attn_out);
 
         new_state = ggml_view_1d(ctx0, result,
             n_embd * S_v * n_seqs,
             n_embd * n_tokens * sizeof(float));
         new_state = ggml_reshape_4d(ctx0, new_state, S_v, S_v, H_v, n_seqs);
+        new_state = ggml_cont(ctx0, new_state);
     } else {
         // Fallback: elementwise ops for multi-seq (n_seqs > 1).
         // TODO: extend kernel to handle per-seq state indexing.
