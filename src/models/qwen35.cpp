@@ -418,7 +418,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_delta_net_autore
     ggml_tensor * core_attn_out;
     ggml_tensor * new_state;
 
-    if (n_seqs == 1 && getenv("USE_FUSED")) {
+    if (n_seqs == 1) {
         // Fused gated delta-net kernel
         ggml_tensor * g_t    = ggml_cont(ctx0, ggml_reshape_4d(ctx0, g, 1, 1, H_k, n_seqs));
         ggml_tensor * beta_t = ggml_cont(ctx0, ggml_reshape_4d(ctx0, beta, 1, 1, H_k, n_seqs));
@@ -631,11 +631,18 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     // DEBUG: track when the persistent tensor's data pointer changes
     if (il == 0 && getenv("GGML_METAL_DUMP_TENSORS")) {
         static void * last_data = nullptr;
-        if (ssm_states_all->data != last_data) {
-            fprintf(stderr, "[BUILD il=0] ssm_states_all@%p (was %p) buffer=%p n_tokens=%lld\n",
-                    ssm_states_all->data, last_data, (void*)ssm_states_all->buffer,
-                    (long long)n_seq_tokens);
-            last_data = ssm_states_all->data;
+        static void * last_buffer = nullptr;
+        void * cur_data = ssm_states_all->data;
+        void * cur_buffer = (void*)ssm_states_all->buffer;
+        // Walk to root
+        ggml_tensor * root = ssm_states_all;
+        while (root->view_src) root = root->view_src;
+        if (cur_data != last_data || cur_buffer != last_buffer) {
+            fprintf(stderr, "[BUILD il=0 tok=%lld] ssm_states='%s'@%p buf=%p root='%s'@%p root_buf=%p (was data=%p buf=%p)\n",
+                    (long long)n_seq_tokens, ssm_states_all->name, cur_data, cur_buffer,
+                    root->name, root->data, (void*)root->buffer, last_data, last_buffer);
+            last_data = cur_data;
+            last_buffer = cur_buffer;
         }
     }
 
