@@ -413,49 +413,54 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_delta_net_autore
     cb(beta, "beta_in", il);
     cb(g, "g_in", il);
 
+    // Fused gated delta-net recurrence kernel: replaces 16 elementwise dispatches with 1.
+    // State stays in GPU registers — no intermediate device memory traffic between steps.
+    // The kernel handles: decay(state, exp(gate)), dot(state,k), delta=(v-dot)*beta,
+    // state update, and dot(state,q) in a single pass per token.
+    //
+    // Reshape inputs to match kernel's expected layout:
+    //   q,k,v: [S, H, T] (T=n_tokens=1 for decode)
+    //   gate, beta: [1, 1, H, n_seqs] — per-head scalars
+    //   state: [S, S, H, n_seqs]
     state = ggml_reshape_4d(ctx0, state, S_v, S_v, H_v, n_seqs);
 
-    ggml_tensor * g_t    = ggml_reshape_4d(ctx0, ggml_transpose(ctx0, g), 1, 1, H_k, n_seqs);
-    ggml_tensor * beta_t = ggml_reshape_4d(ctx0, ggml_transpose(ctx0, beta), 1, 1, H_k, n_seqs);
+    // gate needs to be [1, 1, H, n_seqs] and contiguous.
+    // g arrives as [H_v, 1, n_seqs] — reshape to [1, 1, H_v, n_seqs] with cont.
+    // beta arrives as [H_v, 1, 1, n_seqs] — reshape similarly.
+    // These are small (H scalars) so cont is cheap — not the bottleneck.
+    ggml_tensor * g_t    = ggml_cont(ctx0, ggml_reshape_4d(ctx0, g, 1, 1, H_k, n_seqs));
+    ggml_tensor * beta_t = ggml_cont(ctx0, ggml_reshape_4d(ctx0, beta, 1, 1, H_k, n_seqs));
 
-    // Apply exponential to g_t
-    g_t = ggml_exp(ctx0, g_t);
+    // Reshape q,k,v from [S, H, 1, n_seqs] to [S, H, 1] for the kernel
+    // (n_seqs handled by state indexing, not by q/k/v batch dimension)
+    ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, S_k, H_k, n_tokens);
+    ggml_tensor * k3 = ggml_reshape_3d(ctx0, k, S_k, H_k, n_tokens);
+    ggml_tensor * v3 = ggml_reshape_3d(ctx0, v, S_v, H_v, n_tokens);
 
-    // Apply the gated delta rule for the single timestep
-    // last_recurrent_state = last_recurrent_state * g_t
-    state = ggml_mul(ctx0, state, g_t);
+    // scale=1.0 because q was already scaled at line 407 (ggml_scale(q, 1/sqrt(S_v)))
 
-    // kv_mem = (last_recurrent_state * k_t.unsqueeze(-1)).sum(dim=-2)
-    ggml_tensor * k_t_unsqueezed = ggml_reshape_4d(ctx0, k, 1, S_v, H_v, n_seqs);
-    ggml_tensor * kv_mem         = ggml_mul(ctx0, state, k_t_unsqueezed);
-    // sum over dim=-2 (ne[1]): transpose swaps dim0/dim1, sum_rows reduces the new dim0,
-    // transpose back. The ggml_cont was removed — sum_rows kernel now handles non-contiguous
-    // (transposed) input via nb00 byte-strided access, eliminating a GPU memcpy dispatch.
-    kv_mem = ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_transpose(ctx0, kv_mem)));
+    // Single fused kernel call replaces lines 418-452 (16 dispatches per layer):
+    //   exp(gate) → state *= decay → dot(state,k) → delta=(v-dot)*beta →
+    //   state += k*delta → output=dot(state,q)
+    // Reference: arc-b60 kernel_gated_delta_net
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, k3, v3, q3, g_t, beta_t, state, 1.0f);
+    cb(result, "delta_net_result", il);
 
-    // v_t = v.unsqueeze(2) (we insert the singleton dimension after n_seqs and H_v)
-    ggml_tensor * v_t    = ggml_reshape_4d(ctx0, v, S_v, 1, H_v, n_seqs);
-    // delta = (v_t - kv_mem) * beta_t
-    ggml_tensor * v_diff = ggml_sub(ctx0, v_t, kv_mem);  // both should be [S_v, 1, H_v, n_seqs]
-    ggml_tensor * delta  = ggml_mul(ctx0, v_diff, beta_t);
-
-    // last_recurrent_state = last_recurrent_state + k_t.unsqueeze(-1) * delta
-    ggml_tensor * k_t_delta = ggml_mul(ctx0, ggml_repeat_4d(ctx0, k_t_unsqueezed, S_v, S_v, H_v, n_seqs), delta);
-    state                   = ggml_add(ctx0, state, k_t_delta);
-
-    // Compute the attention output
-    // core_attn_out = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
-    ggml_tensor * q_t_unsqueezed = ggml_reshape_4d(ctx0, q, 1, S_v, H_v, n_seqs);  // unsqueeze q_t
-    ggml_tensor * state_q        = ggml_mul(ctx0, state, q_t_unsqueezed);
-    // sum over dim=-2: ggml_cont removed — sum_rows handles transposed input via nb00 stride
-    ggml_tensor * core_attn_out =
-        ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_transpose(ctx0, state_q)));
-
-    // core_attn_out should be [S_v, 1, H_v, n_seqs] after this
+    // Unpack: output is first S*H*T floats, new_state is the rest.
+    // Same pattern as ggml_gated_linear_attn / ggml_rwkv_wkv6.
+    const int64_t n_embd = S_v * H_v;
+    ggml_tensor * core_attn_out = ggml_view_4d(ctx0, result,
+        S_v, 1, H_v, n_seqs,
+        result->nb[0] * S_v, result->nb[0] * S_v, result->nb[0] * S_v * H_v, 0);
     cb(core_attn_out, "output_tokens", il);
-    cb(state, "new_state", il);
 
-    return {core_attn_out, state};
+    ggml_tensor * new_state = ggml_view_1d(ctx0, result,
+        n_embd * S_v * n_seqs,
+        n_embd * n_tokens * sizeof(float));
+    new_state = ggml_reshape_4d(ctx0, new_state, S_v, S_v, H_v, n_seqs);
+    cb(new_state, "new_state", il);
+
+    return {core_attn_out, new_state};
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_qkvz(
