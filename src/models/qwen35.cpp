@@ -628,7 +628,16 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
 
-    // bool use_precomputed_states = n_seq_tokens == 1 && mctx_cur->has_previous_state();
+    // DEBUG: track when the persistent tensor's data pointer changes
+    if (il == 0 && getenv("GGML_METAL_DUMP_TENSORS")) {
+        static void * last_data = nullptr;
+        if (ssm_states_all->data != last_data) {
+            fprintf(stderr, "[BUILD il=0] ssm_states_all@%p (was %p) buffer=%p n_tokens=%lld\n",
+                    ssm_states_all->data, last_data, (void*)ssm_states_all->buffer,
+                    (long long)n_seq_tokens);
+            last_data = ssm_states_all->data;
+        }
+    }
 
     // Build the convolution states tensor
     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
