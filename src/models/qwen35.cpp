@@ -727,9 +727,12 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
         static int state_write_count = 0;
         if (getenv("GGML_METAL_DUMP_TENSORS") && state_write_count < 6 && il == 0) {
             size_t offset = kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all);
-            fprintf(stderr, "[STATE_WRITE #%d il=%d] kv_head=%d n_embd_s=%d offset=%zu new_state_ne=[%lld,%lld,%lld,%lld]\n",
-                    state_write_count, il, (int)kv_head, (int)hparams.n_embd_s(), offset,
-                    new_state->ne[0], new_state->ne[1], new_state->ne[2], new_state->ne[3]);
+            // Walk view_src to find the root tensor
+            ggml_tensor * root = ssm_states_all;
+            while (root->view_src) root = root->view_src;
+            fprintf(stderr, "[STATE_WRITE #%d il=%d] ssm_states='%s'@%p root='%s'@%p kv_head=%d\n",
+                    state_write_count, il, ssm_states_all->name, ssm_states_all->data,
+                    root->name, root->data, (int)kv_head);
             state_write_count++;
         }
     }

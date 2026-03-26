@@ -1212,26 +1212,53 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
-    // DEBUG: read persistent state BEFORE graph compute to detect corruption between graphs
+    // DEBUG: read the PERSISTENT state cache (cache_s_l0) before graph compute
     if (getenv("GGML_METAL_DUMP_TENSORS")) {
-        static ggml_tensor * pre_tracked = nullptr;
-        // Find state_predelta-0 tensor in current graph
-        ggml_cgraph * gf_pre = res->get_gf();
-        for (int i = 0; i < ggml_graph_n_nodes(gf_pre); i++) {
-            ggml_tensor * t = ggml_graph_node(gf_pre, i);
-            if (strstr(t->name, "state_predelta-0") && t->ne[1] == 4096) {
-                pre_tracked = t;
-                break;
+        static ggml_tensor * cache_tensor = nullptr;
+        // Find the persistent cache tensor by tracing from state_predelta-0
+        // state_predelta-0 is reshape(get_rows(reshape(cache_s_l0), s_copy))
+        // So: state_predelta-0 → src[0] = get_rows → src[0] = reshape → src[0] = cache_s_l0
+        if (!cache_tensor) {
+            ggml_cgraph * gf_pre = res->get_gf();
+            for (int i = 0; i < ggml_graph_n_nodes(gf_pre); i++) {
+                ggml_tensor * t = ggml_graph_node(gf_pre, i);
+                if (strstr(t->name, "state_predelta-0") && t->ne[1] == 4096) {
+                    // Walk up: reshape → get_rows → reshape → cache_s_l0
+                    ggml_tensor * cur = t;
+                    while (cur && cur->src[0]) {
+                        fprintf(stderr, "[TRACE] %s op=%s data=%p view_src=%p\n",
+                                cur->name, ggml_op_name(cur->op), cur->data,
+                                cur->view_src ? cur->view_src->data : nullptr);
+                        cur = cur->src[0];
+                        if (strstr(cur->name, "cache_s_l")) {
+                            cache_tensor = cur;
+                            // Also find the ultimate source (non-view)
+                            ggml_tensor * root = cur;
+                            while (root->view_src) root = root->view_src;
+                            fprintf(stderr, "[CACHE_FOUND] %s ne=[%lld,%lld] data=%p root=%s@%p\n",
+                                    cur->name, cur->ne[0], cur->ne[1], cur->data,
+                                    root->name, root->data);
+                            cache_tensor = root; // use the ROOT persistent tensor
+                            break;
+                        }
+                    }
+                    break;
+                }
             }
         }
-        if (pre_tracked) {
-            // Read the view_src (the persistent ssm_states_all) if available
-            ggml_tensor * persistent = pre_tracked->view_src ? pre_tracked->view_src : pre_tracked;
-            if (persistent->view_src) persistent = persistent->view_src; // one more level
-            float buf[4] = {};
-            ggml_backend_tensor_get(persistent, buf, 0, 4 * sizeof(float));
-            fprintf(stderr, "[PRE-COMPUTE tok=%d] ssm_states_all[0:3]: %.6f %.6f %.6f %.6f  ptr=%p\n",
-                    (int)ubatch.n_tokens, buf[0], buf[1], buf[2], buf[3], persistent->data);
+        if (cache_tensor) {
+            // Read from multiple offsets to find where the state actually lives
+            float buf0[4] = {}, buf1[4] = {};
+            size_t total = ggml_nbytes(cache_tensor);
+            ggml_backend_tensor_get(cache_tensor, buf0, 0, 4 * sizeof(float));
+            // Also try reading from midpoint
+            size_t mid = total / 2;
+            if (mid + 16 <= total)
+                ggml_backend_tensor_get(cache_tensor, buf1, mid, 4 * sizeof(float));
+            fprintf(stderr, "[PRE-COMPUTE tok=%d] %s@%p total=%zuB [0:3]: %.6f %.6f %.6f %.6f  [mid]: %.6f %.6f %.6f %.6f\n",
+                    (int)ubatch.n_tokens, cache_tensor->name, cache_tensor->data, total,
+                    buf0[0], buf0[1], buf0[2], buf0[3],
+                    buf1[0], buf1[1], buf1[2], buf1[3]);
         }
     }
 
