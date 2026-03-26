@@ -95,7 +95,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
     int simd_width = ggml_metal_library_get_simd_width(lib);
 
     res.c4   = is_c4;  // T3.1 fix: set c4 flag like L2_NORM does
-    res.smem = simd_width*sizeof(float);
+    // Norm kernels use shmem tree reduction (simd_sum broken at NW=16 on Intel).
+    // Need nth * sizeof(float) where nth can be up to 1024. The actual nth is
+    // computed at dispatch time; allocate for max possible (1024 threads).
+    res.smem = 1024*sizeof(float);
 
     return res;
 }
