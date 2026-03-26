@@ -428,8 +428,6 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_delta_net_autore
 
         const int64_t n_embd = S_v * H_v;
 
-        // Force copies of BOTH output and state from the packed result
-        // to prevent buffer reuse from corrupting them
         core_attn_out = ggml_view_1d(ctx0, result, n_embd * n_tokens, 0);
         core_attn_out = ggml_reshape_4d(ctx0, core_attn_out, S_v, 1, H_v, n_seqs);
         core_attn_out = ggml_cont(ctx0, core_attn_out);
@@ -706,6 +704,8 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     v_conv = ggml_cont_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    // State in cache is stored in KERNEL convention: S^T[j, i, h] where dim 0 (j) has stride 1.
+    // Reshape to [S_v, S_v, H_v, n_seqs] — this matches kernel layout directly.
     state               = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim * num_v_heads, 1, n_seqs);
     cb(state, "state_predelta", il);
 
@@ -721,12 +721,26 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // Choose between build_delta_net_chunking, build_delta_net_recurrent, and build_delta_net_autoregressive based on n_tokens
-    std::pair<ggml_tensor *, ggml_tensor *> attn_out; // pair of (output, new_state)
+    // Choose decode path. State in cache is stored in kernel convention (S^T).
+    // The fused autoregressive path reads/writes S^T directly — zero overhead.
+    // The chunking path uses ggml convention (S), so transpose at the boundary.
+    std::pair<ggml_tensor *, ggml_tensor *> attn_out;
     if (n_seq_tokens == 1) {
+        // Fused decode: state is already in kernel layout (S^T), pass directly.
+        // Kernel returns new_state in kernel layout — write to cache as-is.
         attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, il);
     } else {
-        attn_out = build_delta_net_chunking(q_conv, k_conv, v_conv, gate, beta, state, causal_mask, identity, diag_mask, il);
+        // Chunking prompt: transpose S^T → S for ggml ops, transpose result S → S^T for cache.
+        ggml_tensor * state_ggml = ggml_cont(ctx0, ggml_transpose(ctx0,
+            ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs)));
+        state_ggml = ggml_reshape_4d(ctx0, state_ggml, head_v_dim, head_v_dim * num_v_heads, 1, n_seqs);
+        attn_out = build_delta_net_chunking(q_conv, k_conv, v_conv, gate, beta, state_ggml, causal_mask, identity, diag_mask, il);
+        // Transpose chunking output S → S^T for cache storage
+        ggml_tensor * ns = attn_out.second;
+        ns = ggml_reshape_4d(ctx0, ns, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        ns = ggml_cont(ctx0, ggml_transpose(ctx0, ns));
+        ns = ggml_reshape_4d(ctx0, ns, head_v_dim, head_v_dim * num_v_heads, 1, n_seqs);
+        attn_out.second = ns;
     }
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;
