@@ -75,13 +75,20 @@ kernel void kernel_sum_rows_impl(
         shmem_t[tiisg] = 0.0f;
     }
 
-    device const T0 * src_row = (device const T0 *) (src0 + i1*args.nb01 + i2*args.nb02 + i3*args.nb03);
-    device       T  * dst_row = (device       T  *) (dst  + i1*args.nb1  + i2*args.nb2  + i3*args.nb3);
+    device const char * src_base = src0 + i1*args.nb01 + i2*args.nb02 + i3*args.nb03;
+    device       T   * dst_row  = (device T *)(dst + i1*args.nb1 + i2*args.nb2 + i3*args.nb3);
+
+    // nb00 stride: when src0 is contiguous, nb00 == sizeof(T0) and src_base[i0] works.
+    // When src0 is transposed (e.g., ggml_transpose view feeding sum_rows for a "sum_cols"
+    // operation), nb00 is the column stride and elements are nb00 apart. Using byte-level
+    // addressing with nb00 handles both cases — eliminates the need for ggml_cont before
+    // sum_rows, removing 2 GPU memcpy dispatches per layer in SSM delta-net autoregressive path.
+    const uint64_t nb00 = args.nb00;
 
     T0 sumf = T0(0.0f);
 
     for (int64_t i0 = tpitg.x; i0 < args.ne00; i0 += ntg.x) {
-        sumf += src_row[i0];
+        sumf += *((device const T0 *)(src_base + i0 * nb00));
     }
 
     sumf = simd_sum(sumf);

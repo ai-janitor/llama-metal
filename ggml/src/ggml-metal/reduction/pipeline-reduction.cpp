@@ -24,7 +24,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum(ggml_metal_l
 }
 
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum_rows(ggml_metal_library_t lib, const ggml_tensor * op) {
-    GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
+    // Contiguous rows not required — kernel uses nb00 byte-strided access.
 
     char base[256];
     char name[256];
@@ -40,7 +40,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sum_rows(ggml_me
     const char * t0_str = ggml_type_name(op->src[0]->type);
     const char * t_str  = ggml_type_name(op->type);
 
-    const bool is_c4 = op->src[0]->ne[0] % 4 == 0;
+    // float4 variant requires contiguous rows (nb00 == sizeof(type)) — can't use vec4
+    // reads on transposed input where elements are nb00 apart.
+    const bool is_c4 = op->src[0]->ne[0] % 4 == 0 && ggml_is_contiguous_rows(op->src[0]);
 
     snprintf(base, 256, "kernel_sum_rows_%s_%s%s", t0_str, t_str, is_c4 ? "_4" : "");
     snprintf(name, 256, "%s_op=%d", base, op_num);

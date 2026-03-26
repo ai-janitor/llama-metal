@@ -1310,6 +1310,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_TRI:
             return ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_SUM_ROWS:
+            // SUM_ROWS now handles non-contiguous (transposed) src0 via nb00 stride.
+            // This eliminates ggml_cont(ggml_transpose(...)) before sum_rows in SSM
+            // delta-net autoregressive path — the "sum_cols" workaround pattern.
+            return has_simdgroup_reduction;
         case GGML_OP_CUMSUM:
         case GGML_OP_MEAN:
         case GGML_OP_SOFT_MAX:

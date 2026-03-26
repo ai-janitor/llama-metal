@@ -418,7 +418,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen3next::build_delta_net_aut
     ggml_tensor * k_t_unsqueezed = ggml_reshape_4d(ctx0, k, 1, S_v, H_v, n_seqs);
     ggml_tensor * kv_mem         = ggml_mul(ctx0, state, k_t_unsqueezed);
     // we need to sum over dim=-2, so we transpose, sum, then transpose again
-    kv_mem = ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, kv_mem))));
+    // ggml_cont removed — sum_rows handles transposed input via nb00 byte-strided access
+    kv_mem = ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_transpose(ctx0, kv_mem)));
 
     // v_t = v.unsqueeze(2) (we insert the singleton dimension after n_seqs and H_v)
     ggml_tensor * v_t    = ggml_reshape_4d(ctx0, v, S_v, 1, H_v, n_seqs);
@@ -434,9 +435,9 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen3next::build_delta_net_aut
     // core_attn_out = (last_recurrent_state * q_t.unsqueeze(-1)).sum(dim=-2)
     ggml_tensor * q_t_unsqueezed = ggml_reshape_4d(ctx0, q, 1, S_v, H_v, n_seqs);  // unsqueeze q_t
     ggml_tensor * state_q        = ggml_mul(ctx0, state, q_t_unsqueezed);
-    // again, since it's over dim = -2, transpose, sum, transpose back
+    // sum over dim=-2: ggml_cont removed — sum_rows handles transposed input via nb00 stride
     ggml_tensor * core_attn_out =
-        ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, state_q))));
+        ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_transpose(ctx0, state_q)));
 
     // core_attn_out should be [S_v, 1, H_v, n_seqs] after this
     cb(core_attn_out, "output_tokens", il);
