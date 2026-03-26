@@ -405,26 +405,55 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen3next::build_delta_net_aut
     // Fused gated delta-net kernel — same as qwen35.cpp, see comments there.
     state = ggml_reshape_4d(ctx0, state, S_v, S_v, H_v, n_seqs);
 
-    ggml_tensor * g_t    = ggml_cont(ctx0, ggml_reshape_4d(ctx0, g, 1, 1, H_k, n_seqs));
-    ggml_tensor * beta_t = ggml_cont(ctx0, ggml_reshape_4d(ctx0, beta, 1, 1, H_k, n_seqs));
+    ggml_tensor * core_attn_out;
+    ggml_tensor * new_state;
 
-    ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, S_k, H_k, n_tokens);
-    ggml_tensor * k3 = ggml_reshape_3d(ctx0, k, S_k, H_k, n_tokens);
-    ggml_tensor * v3 = ggml_reshape_3d(ctx0, v, S_v, H_v, n_tokens);
+    if (n_seqs == 1) {
+        ggml_tensor * g_t    = ggml_cont(ctx0, ggml_reshape_4d(ctx0, g, 1, 1, H_k, n_seqs));
+        ggml_tensor * beta_t = ggml_cont(ctx0, ggml_reshape_4d(ctx0, beta, 1, 1, H_k, n_seqs));
 
-    ggml_tensor * result = ggml_gated_delta_net(ctx0, k3, v3, q3, g_t, beta_t, state, 1.0f);
-    cb(result, "delta_net_result", il);
+        ggml_tensor * q3 = ggml_reshape_3d(ctx0, q, S_k, H_k, n_tokens);
+        ggml_tensor * k3 = ggml_reshape_3d(ctx0, k, S_k, H_k, n_tokens);
+        ggml_tensor * v3 = ggml_reshape_3d(ctx0, v, S_v, H_v, n_tokens);
 
-    const int64_t n_embd = S_v * H_v;
-    ggml_tensor * core_attn_out = ggml_view_4d(ctx0, result,
-        S_v, 1, H_v, n_seqs,
-        result->nb[0] * S_v, result->nb[0] * S_v, result->nb[0] * S_v * H_v, 0);
+        ggml_tensor * result = ggml_gated_delta_net(ctx0, k3, v3, q3, g_t, beta_t, state, 1.0f);
+        cb(result, "delta_net_result", il);
+
+        const int64_t n_embd = S_v * H_v;
+        core_attn_out = ggml_view_4d(ctx0, result,
+            S_v, 1, H_v, n_seqs,
+            result->nb[0] * S_v, result->nb[0] * S_v, result->nb[0] * S_v * H_v, 0);
+
+        new_state = ggml_view_1d(ctx0, result,
+            n_embd * S_v * n_seqs,
+            n_embd * n_tokens * sizeof(float));
+        new_state = ggml_reshape_4d(ctx0, new_state, S_v, S_v, H_v, n_seqs);
+    } else {
+        // Fallback for multi-seq — same as qwen35.cpp
+        ggml_tensor * g_t    = ggml_reshape_4d(ctx0, ggml_transpose(ctx0, g), 1, 1, H_k, n_seqs);
+        ggml_tensor * beta_t = ggml_reshape_4d(ctx0, ggml_transpose(ctx0, beta), 1, 1, H_k, n_seqs);
+
+        g_t = ggml_exp(ctx0, g_t);
+        state = ggml_mul(ctx0, state, g_t);
+
+        ggml_tensor * k_t_unsqueezed = ggml_reshape_4d(ctx0, k, 1, S_v, H_v, n_seqs);
+        ggml_tensor * kv_mem         = ggml_mul(ctx0, state, k_t_unsqueezed);
+        kv_mem = ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_transpose(ctx0, kv_mem)));
+
+        ggml_tensor * v_t    = ggml_reshape_4d(ctx0, v, S_v, 1, H_v, n_seqs);
+        ggml_tensor * v_diff = ggml_sub(ctx0, v_t, kv_mem);
+        ggml_tensor * delta  = ggml_mul(ctx0, v_diff, beta_t);
+
+        ggml_tensor * k_t_delta = ggml_mul(ctx0, ggml_repeat_4d(ctx0, k_t_unsqueezed, S_v, S_v, H_v, n_seqs), delta);
+        state = ggml_add(ctx0, state, k_t_delta);
+
+        ggml_tensor * q_t_unsqueezed = ggml_reshape_4d(ctx0, q, 1, S_v, H_v, n_seqs);
+        ggml_tensor * state_q        = ggml_mul(ctx0, state, q_t_unsqueezed);
+        core_attn_out = ggml_transpose(ctx0, ggml_sum_rows(ctx0, ggml_transpose(ctx0, state_q)));
+        new_state = state;
+    }
+
     cb(core_attn_out, "output_tokens", il);
-
-    ggml_tensor * new_state = ggml_view_1d(ctx0, result,
-        n_embd * S_v * n_seqs,
-        n_embd * n_tokens * sizeof(float));
-    new_state = ggml_reshape_4d(ctx0, new_state, S_v, S_v, H_v, n_seqs);
     cb(new_state, "new_state", il);
 
     return {core_attn_out, new_state};
