@@ -571,6 +571,7 @@ private:
                         int   il);
 
     // returns pair of output and new state
+    // state_dst: when non-null, passed to fused path for direct cache write.
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_autoregressive(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -578,10 +579,12 @@ private:
                 ggml_tensor * g,
                 ggml_tensor * beta,
                 ggml_tensor * state,
+                ggml_tensor * state_dst,
                 int           il);
 
     // Fused decode path — Metal kernel, single-sequence only (n_seqs == 1).
     // Inputs must be preprocessed (l2-normed, scaled, sigmoided, state reshaped).
+    // state_dst: when non-null, kernel writes state directly to cache (no ggml_cpy needed).
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_fused(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -589,6 +592,7 @@ private:
                 ggml_tensor * g,
                 ggml_tensor * beta,
                 ggml_tensor * state,
+                ggml_tensor * state_dst,
                 int           il);
 
     // Unfused decode path — elementwise ops, multi-sequence fallback (n_seqs > 1).

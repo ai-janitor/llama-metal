@@ -2473,6 +2473,20 @@ extern "C" {
             struct ggml_tensor  * state,
             float scale);
 
+    // Same as ggml_gated_delta_net but writes new state directly to state_dst
+    // instead of packing it into dst. Eliminates one ggml_cpy per layer.
+    // state_dst must have shape [S*S*H*n_seqs] (flat view into cache).
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * state_dst,
+            float scale);
+
     GGML_API struct ggml_tensor * ggml_rwkv_wkv7(
             struct ggml_context * ctx,
             struct ggml_tensor  * r,

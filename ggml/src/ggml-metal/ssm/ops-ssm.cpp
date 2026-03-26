@@ -289,13 +289,16 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
 
     const float scale = ggml_get_op_params_f32(op, 0);
 
+    const bool has_state_dst = (op->src[6] != nullptr);
+
     ggml_metal_kargs_gated_delta_net args = {
-        /*.S        =*/ S,
-        /*.H        =*/ H,
-        /*.n_tokens =*/ T,
-        /*.n_seqs   =*/ n_seqs,
-        /*.H_k      =*/ H_k,
-        /*.scale    =*/ scale,
+        /*.S             =*/ S,
+        /*.H             =*/ H,
+        /*.n_tokens      =*/ T,
+        /*.n_seqs        =*/ n_seqs,
+        /*.H_k           =*/ H_k,
+        /*.scale         =*/ scale,
+        /*.has_state_dst =*/ has_state_dst ? 1 : 0,
     };
 
     // GGML_METAL_DEBUG_DISPATCH: print tensor shapes/strides at kernel dispatch time.
@@ -339,6 +342,12 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 5); // beta
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), 6); // state
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         7); // dst
+    if (has_state_dst) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[6]), 8); // state_dst
+    } else {
+        // Bind dst again as placeholder — kernel won't use it (has_state_dst == 0)
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 8);
+    }
 
     // Grid: S rows × H heads, TG = 32 threads (1 simdgroup)
     ggml_metal_encoder_dispatch_threadgroups(enc, S, H, 1, 32, 1, 1);

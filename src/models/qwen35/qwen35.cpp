@@ -105,6 +105,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_delta_net_autore
         ggml_tensor * g,
         ggml_tensor * beta,
         ggml_tensor * state,
+        ggml_tensor * state_dst,
         int           il) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
@@ -145,7 +146,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_delta_net_autore
     state = ggml_reshape_4d(ctx0, state, S_v, S_v, H_v, n_seqs);
 
     if (n_seqs == 1) {
-        return build_delta_net_fused(q, k, v, g, beta, state, il);
+        return build_delta_net_fused(q, k, v, g, beta, state, state_dst, il);
     } else {
         return build_delta_net_unfused(q, k, v, g, beta, state, il);
     }
@@ -400,10 +401,20 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     // The fused autoregressive path reads/writes S^T directly — zero overhead.
     // The chunking path uses ggml convention (S), so transpose at the boundary.
     std::pair<ggml_tensor *, ggml_tensor *> attn_out;
-    if (n_seq_tokens == 1) {
-        // Fused decode: state is already in kernel layout (S^T), pass directly.
-        // Kernel returns new_state in kernel layout — write to cache as-is.
-        attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, il);
+    bool state_written_by_kernel = false;
+
+    if (n_seq_tokens == 1 && n_seqs == 1) {
+        // Fused single-seq decode: kernel writes state directly to cache.
+        // Create a view into the cache at the writeback offset — kernel writes here.
+        ggml_tensor * state_dst = ggml_view_1d(ctx0, ssm_states_all,
+            hparams.n_embd_s() * n_seqs,
+            kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+
+        attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, state_dst, il);
+        state_written_by_kernel = true;
+    } else if (n_seq_tokens == 1) {
+        // Multi-seq decode: use legacy packed output (unfused path, no direct cache write)
+        attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, nullptr, il);
     } else {
         // Chunking prompt: transpose S^T → S for ggml ops, transpose result S → S^T for cache.
         ggml_tensor * state_ggml = ggml_cont(ctx0, ggml_transpose(ctx0,
@@ -422,11 +433,13 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
 
-    // Update the recurrent states
-    ggml_build_forward_expand(gf,
-                              ggml_cpy(ctx0, new_state,
-                                       ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
-                                                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    // Update the recurrent states — skip for fused path (kernel wrote directly to cache)
+    if (!state_written_by_kernel) {
+        ggml_build_forward_expand(gf,
+                                  ggml_cpy(ctx0, new_state,
+                                           ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
+                                                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    }
 
     // Reshape both attn_out_final and z to 2D tensors for normalization
     // attn_out_final: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]

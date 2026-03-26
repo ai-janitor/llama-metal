@@ -5791,6 +5791,54 @@ struct ggml_tensor * ggml_gated_delta_net(
     return result;
 }
 
+struct ggml_tensor * ggml_gated_delta_net_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * state_dst,
+        float scale) {
+    GGML_ASSERT(ggml_is_contiguous(k));
+    GGML_ASSERT(ggml_is_contiguous(v));
+    GGML_ASSERT(ggml_is_contiguous(q));
+    GGML_ASSERT(ggml_is_contiguous(gate));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+
+    const int64_t S = k->ne[0];
+    const int64_t H = k->ne[1];
+    const int64_t n_tokens = k->ne[2];
+    const int64_t n_seqs = state->ne[3];
+    {
+        GGML_ASSERT(v->ne[0] == S && v->ne[1] == H && v->ne[2] == n_tokens);
+        GGML_ASSERT(q->ne[0] == S && q->ne[1] == H && q->ne[2] == n_tokens);
+        GGML_ASSERT(gate->ne[0] == 1 && gate->ne[1] == 1 && gate->ne[2] == H);
+        GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == 1 && beta->ne[2] == H);
+        GGML_ASSERT(state->ne[0] == S && state->ne[1] == S && state->ne[2] == H);
+        GGML_ASSERT(ggml_nelements(state_dst) == S * S * H * n_seqs);
+    }
+
+    // Output layout: only attention output [S*H, n_tokens] — state goes to state_dst
+    const int64_t ne[4] = { S * H, n_tokens, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->src[0] = k;
+    result->src[1] = v;
+    result->src[2] = q;
+    result->src[3] = gate;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = state_dst;
+
+    return result;
+}
+
 // ggml_rwkv_wkv7
 
 struct ggml_tensor * ggml_rwkv_wkv7(

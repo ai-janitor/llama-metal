@@ -483,13 +483,14 @@ kernel void kernel_rwkv_wkv7_f32(
 //   dst  = packed [S*H, T + S*B] (output rows then new_state rows)
 kernel void kernel_gated_delta_net(
         constant ggml_metal_kargs_gated_delta_net & args,
-        device const float * src0, // k
-        device const float * src1, // v
-        device const float * src2, // q
-        device const float * src3, // gate (log decay)
-        device const float * src4, // beta
-        device const float * src5, // state (input)
-        device       float * dst,  // packed output + new_state
+        device const float * src0,      // k
+        device const float * src1,      // v
+        device const float * src2,      // q
+        device const float * src3,      // gate (log decay)
+        device const float * src4,      // beta
+        device const float * src5,      // state (input)
+        device       float * dst,       // output (+ new_state if no state_dst)
+        device       float * state_dst, // direct state write target (or unused)
         uint3  tgpig[[threadgroup_position_in_grid]],
         uint   tx   [[thread_index_in_threadgroup]]) {
 
@@ -560,14 +561,24 @@ kernel void kernel_gated_delta_net(
         }
     }
 
-    // Write state row back to the new_state portion of dst (after all T output rows).
-    // new_state layout: dst[T * S * H + (seq * H + head) * S * S + row * S + col]
-    // For single-seq: dst[T * S * H + state_row_base + col]
-    const int64_t state_dst_base = (int64_t)T * S * H + state_row_base;
-    for (int j = 0; j < NSG; j++) {
-        const int col = (int)tx * NSG + j;
-        if (col < S) {
-            dst[state_dst_base + col] = ls[j];
+    // Write state row back. If state_dst is provided (has_state_dst == 1),
+    // write directly to the cache buffer. Otherwise, pack into dst after output rows.
+    if (args.has_state_dst) {
+        // Direct cache write: state_dst has same layout as src5 [S, S, H, n_seqs]
+        for (int j = 0; j < NSG; j++) {
+            const int col = (int)tx * NSG + j;
+            if (col < S) {
+                state_dst[state_row_base + col] = ls[j];
+            }
+        }
+    } else {
+        // Legacy packed layout: state goes after T output rows in dst
+        const int64_t packed_base = (int64_t)T * S * H + state_row_base;
+        for (int j = 0; j < NSG; j++) {
+            const int col = (int)tx * NSG + j;
+            if (col < S) {
+                dst[packed_base + col] = ls[j];
+            }
         }
     }
 }
