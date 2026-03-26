@@ -638,9 +638,9 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
         ggml_tensor * root = ssm_states_all;
         while (root->view_src) root = root->view_src;
         if (cur_data != last_data || cur_buffer != last_buffer) {
-            fprintf(stderr, "[BUILD il=0 tok=%lld] ssm_states='%s'@%p buf=%p root='%s'@%p root_buf=%p (was data=%p buf=%p)\n",
-                    (long long)n_seq_tokens, ssm_states_all->name, cur_data, cur_buffer,
-                    root->name, root->data, (void*)root->buffer, last_data, last_buffer);
+            fprintf(stderr, "[BUILD il=0 tok=%lld] OBJ=%p '%s'@%p buf=%p root_OBJ=%p '%s'@%p root_buf=%p (was data=%p buf=%p)\n",
+                    (long long)n_seq_tokens, (void*)ssm_states_all, ssm_states_all->name, cur_data, cur_buffer,
+                    (void*)root, root->name, root->data, (void*)root->buffer, last_data, last_buffer);
             last_data = cur_data;
             last_buffer = cur_buffer;
         }

@@ -1157,7 +1157,17 @@ ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
-    return mem->s_l[il];
+    ggml_tensor * t = mem->s_l[il];
+    if (il == 0 && getenv("GGML_METAL_DUMP_TENSORS")) {
+        static void * last = nullptr;
+        if ((void*)t != last) {
+            fprintf(stderr, "[get_s_l(0)] tensor=%p '%s' data=%p buffer=%p mem=%p (was %p)\n",
+                    (void*)t, t ? t->name : "null", t ? t->data : nullptr,
+                    t ? (void*)t->buffer : nullptr, (void*)mem, last);
+            last = (void*)t;
+        }
+    }
+    return t;
 }
 
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
