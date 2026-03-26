@@ -1246,6 +1246,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 }
             }
         }
+        // Also read AFTER compute to see if ggml_cpy wrote anything
+        if (cache_tensor && ubatch.n_tokens > 1) {
+            float buf_post[4] = {};
+            ggml_backend_tensor_get(cache_tensor, buf_post, 0, 4 * sizeof(float));
+            fprintf(stderr, "[POST-COMPUTE tok=%d] %s@%p [0:3]: %.6f %.6f %.6f %.6f\n",
+                    (int)ubatch.n_tokens, cache_tensor->name, cache_tensor->data,
+                    buf_post[0], buf_post[1], buf_post[2], buf_post[3]);
+        }
         if (cache_tensor) {
             // Read from multiple offsets to find where the state actually lives
             float buf0[4] = {}, buf1[4] = {};

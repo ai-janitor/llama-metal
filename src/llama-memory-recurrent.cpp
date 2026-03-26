@@ -1159,12 +1159,12 @@ ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
     ggml_tensor * t = mem->s_l[il];
     if (il == 0 && getenv("GGML_METAL_DUMP_TENSORS")) {
-        static void * last = nullptr;
-        if ((void*)t != last) {
-            fprintf(stderr, "[get_s_l(0)] tensor=%p '%s' data=%p buffer=%p mem=%p (was %p)\n",
-                    (void*)t, t ? t->name : "null", t ? t->data : nullptr,
-                    t ? (void*)t->buffer : nullptr, (void*)mem, last);
-            last = (void*)t;
+        static int call_count = 0;
+        if (call_count < 20) {
+            fprintf(stderr, "[get_s_l(0) #%d] tensor=%p data=%p buffer=%p mem=%p\n",
+                    call_count, (void*)t, t ? t->data : nullptr,
+                    t ? (void*)t->buffer : nullptr, (void*)mem);
+            call_count++;
         }
     }
     return t;
