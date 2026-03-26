@@ -43,10 +43,23 @@ void kernel_mul_mv_ext_q4_f32_impl(
 
     device const q_t * xq = (i01 < args.ne01) ? (device const q_t *) (src0 + offset0) + tx/chpb : (device const q_t *) src0;
 
+    // ks1: K-stride in elements for src1. 1 when contiguous, >1 when transposed.
+    // When src1 is transposed (e.g., delta-net SSM), consecutive K elements are ks1 apart.
+    // This eliminates ggml_cont(ggml_transpose(...)) GPU memcpy dispatches in the graph.
+    const int ks1 = args.nb10 / sizeof(float);
+
+    // When src1 is contiguous (ks1==1), use float4* bulk addressing.
+    // When transposed (ks1>1), use scalar base pointer with strided gather.
     device const float4 * y4[r1ptg];
+    device const float  * yf[r1ptg]; // scalar pointer for transposed path
 
     for (int ir1 = 0; ir1 < r1ptg; ++ir1) {
-        y4[ir1] = (i11 + ir1 < args.ne11) ? (device const float4 *) (src1 + offset1 + ir1*args.nb11) + tx : (device const float4 *) src1;
+        if (ks1 == 1) {
+            y4[ir1] = (i11 + ir1 < args.ne11) ? (device const float4 *) (src1 + offset1 + ir1*args.nb11) + tx : (device const float4 *) src1;
+        } else {
+            // transposed: base pointer + element offset, will gather with ks1 stride
+            yf[ir1] = (i11 + ir1 < args.ne11) ? (device const float *) (src1 + offset1 + ir1*args.nb11) + tx*4*ks1 : (device const float *) src1;
+        }
     }
 
     float sumf[r1ptg] = { [ 0 ... r1ptg - 1 ] = 0.0f };
@@ -71,13 +84,25 @@ void kernel_mul_mv_ext_q4_f32_impl(
         for (short ch = 0; ch < chpt; ++ch) {
 #pragma unroll(r1ptg)
             for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-                sumf[ir1] += dot(lx[ch], y4[ir1][ch*nxpsg]);
+                if (ks1 == 1) {
+                    sumf[ir1] += dot(lx[ch], y4[ir1][ch*nxpsg]);
+                } else {
+                    // transposed src1: gather 4 elements with ks1 stride into float4 for dot product.
+                    // Cannot use float4* cast because K elements are ks1 apart in device memory.
+                    const int base = ch*nxpsg*4*ks1;
+                    float4 yv = float4(yf[ir1][base], yf[ir1][base + ks1], yf[ir1][base + 2*ks1], yf[ir1][base + 3*ks1]);
+                    sumf[ir1] += dot(lx[ch], yv);
+                }
             }
         }
 
 #pragma unroll(r1ptg)
         for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-            y4[ir1] += chpt*nxpsg;
+            if (ks1 == 1) {
+                y4[ir1] += chpt*nxpsg;
+            } else {
+                yf[ir1] += chpt*nxpsg*4*ks1;
+            }
         }
     }
 
@@ -391,6 +416,9 @@ void kernel_mul_mv_t_t_impl(
   //device const T0 * x = (device const T0 *) (src0 + offset0);
     device const T1 * y = (device const T1 *) (src1 + offset1);
 
+    // ks1: K-stride in elements for src1 (1=contiguous, >1=transposed)
+    const int ks1 = args.nb10 / sizeof(T1);
+
     // pointers to src0 rows
     device const T0 * ax [NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
@@ -417,10 +445,11 @@ void kernel_mul_mv_t_t_impl(
         for (short c = 0; c < chunks_per_thread; c++) {
             const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
 
-            device const T1 * yb = y + (ib*NB + il*NF);
+            // ks1-strided: when src1 is transposed, K elements are ks1 apart
+            const int y_offset = (ib*NB + il*NF) * ks1;
 
             for (short i = 0; i < NF; ++i) {
-                yl[i] = yb[i];
+                yl[i] = y[y_offset + i*ks1];
             }
 
             for (short row = 0; row < NR0; row++) {
@@ -436,9 +465,10 @@ void kernel_mul_mv_t_t_impl(
         }
     }
 
+    // remainder elements (when ne00 is not a multiple of NB)
     for (int i = nb*NB + eff_sgitg*NW + eff_tiisg; i < args.ne00; i += NW*NSG) {
         for (short row = 0; row < NR0; row++) {
-            sumf[row] += ax[row][i] * y[i];
+            sumf[row] += ax[row][i] * y[i*ks1];
         }
     }
 
@@ -527,6 +557,9 @@ void kernel_mul_mv_t_t_4_impl(
     device const T1  * y  = (device const T1  *) (src1 + offset1);
     device const T14 * y4 = (device const T14 *) (src1 + offset1);
 
+    // ks1: K-stride in elements (1=contiguous, >1=transposed)
+    const int ks1 = args.nb10 / sizeof(T1);
+
     // pointers to src0 rows
     device const T0  * ax [NR0];
     device const T04 * ax4[NR0];
@@ -551,10 +584,19 @@ void kernel_mul_mv_t_t_4_impl(
         for (short c = 0; c < chunks_per_thread; c++) {
             const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
 
-            device const T14 * yb4 = y4 + (ib*NB + il*NF)/4;
-
-            for (short i = 0; i < NF4; ++i) {
-                yl4[i] = yb4[i];
+            if (ks1 == 1) {
+                // contiguous fast path: vec4 bulk load
+                device const T14 * yb4 = y4 + (ib*NB + il*NF)/4;
+                for (short i = 0; i < NF4; ++i) {
+                    yl4[i] = yb4[i];
+                }
+            } else {
+                // transposed src1: gather individual elements with ks1 stride into vec4
+                const int y_base = (ib*NB + il*NF) * ks1;
+                for (short i = 0; i < NF4; ++i) {
+                    const int off = y_base + i*4*ks1;
+                    yl4[i] = T14(y[off], y[off + ks1], y[off + 2*ks1], y[off + 3*ks1]);
+                }
             }
 
             for (short row = 0; row < NR0; row++) {
@@ -572,7 +614,7 @@ void kernel_mul_mv_t_t_4_impl(
 
     for (int i = nb*NB + eff_sgitg*NW + eff_tiisg; i < args.ne00; i += NW*NSG) {
         for (short row = 0; row < NR0; row++) {
-            sumf[row] += ax[row][i] * y[i];
+            sumf[row] += ax[row][i] * y[i*ks1];
         }
     }
 
@@ -653,10 +695,13 @@ void kernel_mul_mv_t_t_short_impl(
 
     device const T1 * y = (device const T1 *) (src1 + offset1);
 
+    // ks1: K-stride in elements (1=contiguous, >1=transposed)
+    const int ks1 = args.nb10 / sizeof(T1);
+
     float res = 0.0f;
 
     for (int i = 0; i < args.ne00; ++i) {
-        res += (float) x[i] * (float) y[i];
+        res += (float) x[i] * (float) y[i*ks1];
     }
 
     dst_f32[(uint64_t)r1*args.ne0 + r0] = res;
