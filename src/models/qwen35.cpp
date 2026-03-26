@@ -240,12 +240,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_delta_net_chunki
     ggml_tensor * kbeta_gexp = ggml_mul(ctx0, k_beta, gexp);
     cb(kbeta_gexp, "kbeta_gexp", il); // shape: (S_k, chunk_size, n_chunks, H_v * n_seqs)
 
-    // Inner cont(transpose(kbeta_gexp)) removed: Metal matmul kernels now handle transposed src1
-    // natively via nb10 stride in B-loading. This eliminates a GPU memcpy dispatch per layer.
-    // (Profile=2 showed CONT at 28% of decode GPU time on Qwen3.5-4B, AMD 5500M)
-    // Outer cont(transpose(...)) on the mul_mat result remains — that's output transposition, not src1.
+    // Restore cont(transpose) — transposed src1 without cont produces wrong results
+    // for this tensor shape. Bisect: f6f4057 good, 05fc539 bad.
     ggml_tensor * k_cumdecay =
-        ggml_cont(ctx0, ggml_transpose(ctx0, ggml_mul_mat(ctx0, attn, ggml_transpose(ctx0, kbeta_gexp))));
+        ggml_cont(ctx0, ggml_transpose(ctx0, ggml_mul_mat(ctx0, attn, ggml_cont(ctx0, ggml_transpose(ctx0, kbeta_gexp)))));
     cb(k_cumdecay, "k_cumdecay", il); // shape: (chunk_size, chunk_size, n_chunks, H_v * n_seqs)
 
     ggml_tensor * attn_kq = ggml_mul_mat(ctx0, k, q);
@@ -283,10 +281,8 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen35::build_delta_net_chunki
     ggml_tensor * key_gdiff = ggml_mul(ctx0, k, g_diff_exp_t);
     cb(key_gdiff, "key_gdiff", il); // shape: (S_k, chunk_size, n_chunks, H_v * n_seqs)
 
-    // cont removed: key_gdiff_t is used as src1 in mul_mat (line 340). Metal matmul kernels
-    // now handle transposed src1 natively via nb10 stride. The transpose view is sliced by
-    // get_slice_2d before reaching mul_mat — the slice preserves the transposed strides.
-    ggml_tensor * key_gdiff_t = ggml_transpose(ctx0, key_gdiff);
+    // Restore cont(transpose) — same issue as kbeta_gexp above.
+    ggml_tensor * key_gdiff_t = ggml_cont(ctx0, ggml_transpose(ctx0, key_gdiff));
     cb(key_gdiff_t, "key_gdiff_t", il); // shape: (chunk_size, S_k, n_chunks, H_v * n_seqs)
 
     // state to be updated per chunk
