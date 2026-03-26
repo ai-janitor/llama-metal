@@ -722,6 +722,17 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     cb(new_state, "new_state", il);
 
     // Update the recurrent states
+    // DEBUG: print kv_head and state offset
+    {
+        static int state_write_count = 0;
+        if (getenv("GGML_METAL_DUMP_TENSORS") && state_write_count < 6 && il == 0) {
+            size_t offset = kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all);
+            fprintf(stderr, "[STATE_WRITE #%d il=%d] kv_head=%d n_embd_s=%d offset=%zu new_state_ne=[%lld,%lld,%lld,%lld]\n",
+                    state_write_count, il, (int)kv_head, (int)hparams.n_embd_s(), offset,
+                    new_state->ne[0], new_state->ne[1], new_state->ne[2], new_state->ne[3]);
+            state_write_count++;
+        }
+    }
     ggml_build_forward_expand(gf,
                               ggml_cpy(ctx0, new_state,
                                        ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,

@@ -509,6 +509,15 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         for (uint32_t i = 0; i < n_rs; ++i) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
+
+        // DEBUG: print s_copy indices (controlled by GGML_METAL_DUMP_TENSORS)
+        static int hybrid_set_count = 0;
+        if (getenv("GGML_METAL_DUMP_TENSORS") && hybrid_set_count < 6) {
+            fprintf(stderr, "[HYBRID_SET_INPUT #%d] s_copy n_rs=%d: [", hybrid_set_count, (int)n_rs);
+            for (uint32_t i = 0; i < n_rs && i < 4; ++i) fprintf(stderr, "%s%d", i ? "," : "", data[i]);
+            fprintf(stderr, "...]\n");
+            hybrid_set_count++;
+        }
     }
 }
 

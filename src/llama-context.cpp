@@ -1265,7 +1265,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             fprintf(stderr, "[DUMP] decode graph has %d nodes. Searching for patterns...\n", ggml_graph_n_nodes(gf));
             for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
                 ggml_tensor * t = ggml_graph_node(gf, i);
-                (void)t; // graph dump disabled
+                if (strstr(t->name, "state_predelta-0") || (strstr(t->name, "s_copy") && t->ne[0] <= 4)) {
+                    fprintf(stderr, "  [%3d] %-40s op=%-16s ne=[%lld,%lld,%lld,%lld] data=%p\n",
+                            i, t->name, ggml_op_name(t->op), t->ne[0], t->ne[1], t->ne[2], t->ne[3], t->data);
+                }
             }
         }
         if (dump_env && dump_round < dump_max) {
@@ -2246,7 +2249,10 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
-    // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
+    // DEBUG: force synchronize after every graph compute to test for race conditions
+    if (getenv("GGML_METAL_SYNC_GRAPHS")) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
 
     return status;
 }
