@@ -6,18 +6,16 @@ kernel void kernel_ssm_conv_f32_f32(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
+        device       float * state_dst, // direct conv state write target (or unused)
         uint3 tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
-    const int64_t i2 = tgpig.y;
-    const int64_t i3 = tgpig.z;
+    const int64_t ir = tgpig.x;  // channel
+    const int64_t i2 = tgpig.y;  // token position
+    const int64_t i3 = tgpig.z;  // sequence
 
-    const int64_t nc  = args.ne10;
-  //const int64_t ncs = args.ne00;
-  //const int64_t nr  = args.ne01;
-  //const int64_t n_t = args.ne1;
-  //const int64_t n_s = args.ne2;
+    const int64_t nc  = args.ne10;  // d_conv (kernel size)
+    const int64_t ncs = args.ne00;  // conv window size (d_conv - 1 + n_tokens)
 
     device const float * s = (device const float *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
     device const float * c = (device const float *) ((device const char *) src1 + ir*args.nb11);
@@ -30,6 +28,21 @@ kernel void kernel_ssm_conv_f32_f32(
     }
 
     x[0] = sumf;
+
+    // Write conv state directly to cache if state_dst is provided.
+    // The new state is the last (d_conv - 1) elements of the conv window for this channel.
+    // Only the last token position writes state (avoid duplicate writes in batched mode).
+    if (args.has_state_dst && i2 == args.ne1 - 1) {
+        const int64_t state_width = nc - 1;  // d_conv - 1
+        // Source: last (d_conv-1) positions in conv window for this channel/seq
+        device const float * conv_tail = (device const float *) ((device const char *) src0
+            + ir*args.nb01 + (ncs - state_width)*args.nb00 + i3*args.nb02);
+        // Destination: state_dst layout is [d_conv-1, channels, n_seqs] contiguous
+        device float * sd = state_dst + i3 * (state_width * args.ne01) + ir * state_width;
+        for (int64_t i0 = 0; i0 < state_width; ++i0) {
+            sd[i0] = conv_tail[i0];
+        }
+    }
 }
 
 kernel void kernel_ssm_conv_f32_f32_4(
@@ -37,18 +50,16 @@ kernel void kernel_ssm_conv_f32_f32_4(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
+        device       float * state_dst,
         uint3 tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;
-    const int64_t i2 = tgpig.y;
-    const int64_t i3 = tgpig.z;
+    const int64_t ir = tgpig.x;  // channel
+    const int64_t i2 = tgpig.y;  // token position
+    const int64_t i3 = tgpig.z;  // sequence
 
-    const int64_t nc  = args.ne10;
-  //const int64_t ncs = args.ne00;
-  //const int64_t nr  = args.ne01;
-  //const int64_t n_t = args.ne1;
-  //const int64_t n_s = args.ne2;
+    const int64_t nc  = args.ne10;  // d_conv
+    const int64_t ncs = args.ne00;  // conv window size
 
     device const float4 * s = (device const float4 *) ((device const char *) src0 + ir*args.nb01 + i2*args.nb00 + i3*args.nb02);
     device const float4 * c = (device const float4 *) ((device const char *) src1 + ir*args.nb11);
@@ -61,6 +72,17 @@ kernel void kernel_ssm_conv_f32_f32_4(
     }
 
     x[0] = sumf;
+
+    // Write conv state directly to cache if state_dst is provided.
+    if (args.has_state_dst && i2 == args.ne1 - 1) {
+        const int64_t state_width = nc - 1;
+        device const float * conv_tail = (device const float *) ((device const char *) src0
+            + ir*args.nb01 + (ncs - state_width)*args.nb00 + i3*args.nb02);
+        device float * sd = state_dst + i3 * (state_width * args.ne01) + ir * state_width;
+        for (int64_t i0 = 0; i0 < state_width; ++i0) {
+            sd[i0] = conv_tail[i0];
+        }
+    }
 }
 
 constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
@@ -72,6 +94,7 @@ kernel void kernel_ssm_conv_f32_f32_batched(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
+        device       float * state_dst,
         uint3 tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
@@ -117,6 +140,7 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
         device const  void * src0,
         device const  void * src1,
         device       float * dst,
+        device       float * state_dst,
         uint3 tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {

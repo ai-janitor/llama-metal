@@ -13,6 +13,8 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
+    const bool has_state_dst = (op->src[2] != nullptr);
+
     ggml_metal_kargs_ssm_conv args = {
         /*.ne00 =*/ ne00,
         /*.ne01 =*/ ne01,
@@ -30,6 +32,7 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         /*.nb0  =*/ nb0,
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
+        /*.has_state_dst =*/ has_state_dst ? 1 : 0,
     };
 
     // Use batched kernel for prefill (ne1 > 1) to reduce threadgroup dispatch overhead
@@ -53,6 +56,11 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         3);
+        if (has_state_dst) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[2]), 4);
+        } else {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 4);
+        }
 
         // Dispatch: ne01 rows, ceil(ne1/BATCH_SIZE) token batches, ne02 sequences
         // Each threadgroup has BATCH_SIZE threads, each handling one token
@@ -66,6 +74,11 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         3);
+        if (has_state_dst) {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[2]), 4);
+        } else {
+            ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op), 4);
+        }
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
     }

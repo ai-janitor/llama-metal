@@ -2380,6 +2380,14 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // Same as ggml_ssm_conv but writes the last (d_conv-1) elements per channel
+    // directly to state_dst, eliminating a separate ggml_cpy for conv state writeback.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_ext(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * sx,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * state_dst);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,

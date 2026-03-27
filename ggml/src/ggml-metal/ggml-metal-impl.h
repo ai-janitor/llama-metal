@@ -762,6 +762,7 @@ typedef struct {
     uint64_t nb0;
     uint64_t nb1;
     uint64_t nb2;
+    int32_t  has_state_dst;  // 1 if src[2] provides direct conv state write target
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
