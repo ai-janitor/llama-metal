@@ -519,6 +519,7 @@ private:
                 ggml_tensor * g,
                 ggml_tensor * beta,
                 ggml_tensor * state,
+                ggml_tensor * state_dst,
                 int           il);
 
     ggml_tensor * build_norm_gated(

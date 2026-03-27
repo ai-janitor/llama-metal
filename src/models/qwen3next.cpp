@@ -365,6 +365,7 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen3next::build_delta_net_aut
         ggml_tensor * g,
         ggml_tensor * beta,
         ggml_tensor * state,
+        ggml_tensor * state_dst,
         int           il) {
     const int64_t S_k      = q->ne[0];
     const int64_t H_k      = q->ne[1];
@@ -418,18 +419,30 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_qwen3next::build_delta_net_aut
         ggml_tensor * k3 = ggml_reshape_3d(ctx0, k, S_k, H_k, n_tokens);
         ggml_tensor * v3 = ggml_reshape_3d(ctx0, v, S_v, H_v, n_tokens);
 
-        ggml_tensor * result = ggml_gated_delta_net(ctx0, k3, v3, q3, g_t, beta_t, state, 1.0f);
-        cb(result, "delta_net_result", il);
-
+        ggml_tensor * result;
         const int64_t n_embd = S_v * H_v;
-        core_attn_out = ggml_view_4d(ctx0, result,
-            S_v, 1, H_v, n_seqs,
-            result->nb[0] * S_v, result->nb[0] * S_v, result->nb[0] * S_v * H_v, 0);
 
-        new_state = ggml_view_1d(ctx0, result,
-            n_embd * S_v * n_seqs,
-            n_embd * n_tokens * sizeof(float));
-        new_state = ggml_reshape_4d(ctx0, new_state, S_v, S_v, H_v, n_seqs);
+        if (state_dst) {
+            // Direct cache write: kernel writes state to state_dst, dst is output-only.
+            result = ggml_gated_delta_net_ext(ctx0, k3, v3, q3, g_t, beta_t, state, state_dst, 1.0f);
+            cb(result, "delta_net_result", il);
+
+            core_attn_out = ggml_reshape_4d(ctx0, result, S_v, 1, H_v, n_seqs);
+            new_state = state_dst;
+        } else {
+            // Legacy packed output
+            result = ggml_gated_delta_net(ctx0, k3, v3, q3, g_t, beta_t, state, 1.0f);
+            cb(result, "delta_net_result", il);
+
+            core_attn_out = ggml_view_4d(ctx0, result,
+                S_v, 1, H_v, n_seqs,
+                result->nb[0] * S_v, result->nb[0] * S_v, result->nb[0] * S_v * H_v, 0);
+
+            new_state = ggml_view_1d(ctx0, result,
+                n_embd * S_v * n_seqs,
+                n_embd * n_tokens * sizeof(float));
+            new_state = ggml_reshape_4d(ctx0, new_state, S_v, S_v, H_v, n_seqs);
+        }
     } else {
         // Fallback for multi-seq — same as qwen35.cpp
         ggml_tensor * g_t    = ggml_reshape_4d(ctx0, ggml_transpose(ctx0, g), 1, 1, H_k, n_seqs);
@@ -724,23 +737,31 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
     ggml_tensor * conv_input = ggml_concat(ctx0, conv_states, qkv_mixed, 0);
     cb(conv_input, "conv_input", il);
 
-    // Update convolution state cache
-    // Extract the last (conv_kernel_size - 1) states from conv_input
-    ggml_tensor * last_conv_states =
-        ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs, conv_input->nb[1],
-                     conv_input->nb[2], (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
-    cb(last_conv_states, "last_conv_states", il);
+    // Apply SSM convolution.
+    // For single-seq decode, use _ext variant to write conv state directly to cache.
+    ggml_tensor * conv_output_proper;
 
-    ggml_tensor * state_update_target =
-        ggml_view_1d(ctx0, conv_states_all, (conv_kernel_size - 1) * conv_channels * n_seqs,
-                     kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
-    cb(state_update_target, "state_update_target", il);
+    if (n_seq_tokens == 1 && n_seqs == 1) {
+        ggml_tensor * conv_state_dst =
+            ggml_view_1d(ctx0, conv_states_all, (conv_kernel_size - 1) * conv_channels * n_seqs,
+                         kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
-    cb(conv_states_all, "conv_states_updated", il);
+        conv_output_proper = ggml_ssm_conv_ext(ctx0, conv_input, conv_kernel, conv_state_dst);
+    } else {
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
 
-    // Apply SSM convolution
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        ggml_tensor * last_conv_states =
+            ggml_view_3d(ctx0, conv_input, conv_kernel_size - 1, conv_channels, n_seqs, conv_input->nb[1],
+                         conv_input->nb[2], (conv_input->ne[0] - conv_states->ne[0]) * ggml_element_size(conv_input));
+        cb(last_conv_states, "last_conv_states", il);
+
+        ggml_tensor * state_update_target =
+            ggml_view_1d(ctx0, conv_states_all, (conv_kernel_size - 1) * conv_channels * n_seqs,
+                         kv_head * (conv_kernel_size - 1) * conv_channels * ggml_element_size(conv_states_all));
+        cb(state_update_target, "state_update_target", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    }
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
@@ -808,10 +829,20 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // Choose between build_delta_net_chunking, build_delta_net_recurrent, and build_delta_net_autoregressive based on n_tokens
-    std::pair<ggml_tensor *, ggml_tensor *> attn_out; // pair of (output, new_state)
-    if (n_seq_tokens == 1) {
-        attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, il);
+    // Choose decode path. For single-seq decode, pass state_dst so the fused kernel
+    // writes state directly to cache (eliminates ggml_cpy for SSM state writeback).
+    std::pair<ggml_tensor *, ggml_tensor *> attn_out;
+    bool ssm_state_written_by_kernel = false;
+
+    if (n_seq_tokens == 1 && n_seqs == 1) {
+        ggml_tensor * state_dst = ggml_view_1d(ctx0, ssm_states_all,
+            hparams.n_embd_s() * n_seqs,
+            kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
+
+        attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, state_dst, il);
+        ssm_state_written_by_kernel = true;
+    } else if (n_seq_tokens == 1) {
+        attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, nullptr, il);
     } else {
         attn_out = build_delta_net_chunking(q_conv, k_conv, v_conv, gate, beta, state, causal_mask, identity, diag_mask, il);
     }
@@ -820,11 +851,13 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
     cb(output, "attn_output", il);
     cb(new_state, "new_state", il);
 
-    // Update the recurrent states
-    ggml_build_forward_expand(gf,
-                              ggml_cpy(ctx0, new_state,
-                                       ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
-                                                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    // Update the recurrent states — skip for fused path (kernel wrote directly to cache)
+    if (!ssm_state_written_by_kernel) {
+        ggml_build_forward_expand(gf,
+                                  ggml_cpy(ctx0, new_state,
+                                           ggml_view_1d(ctx0, ssm_states_all, hparams.n_embd_s() * n_seqs,
+                                                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    }
 
     // Reshape both attn_out_final and z to 2D tensors for normalization
     // attn_out_final: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
