@@ -67,3 +67,54 @@
 3. `8a7ec77` — Direct SSM state writes via `ggml_gated_delta_net_ext`
 4. `9f1b657` — Direct conv state writes via `ggml_ssm_conv_ext`
 5. `a789076` — Propagate direct writes to qwen3next/qwen35moe
+
+## Replication
+
+Use short cold-run `llama-simple` for correctness and throughput checks on the AMD 5500M. `llama-bench` `tg128` showed large variance on this GPU after sustained runs and was only used as a secondary signal.
+
+### Correctness + short-run throughput
+
+```bash
+./build/bin/llama-simple \
+  -m /Users/hung/models/Qwen3.5-4B-Q4_0.gguf \
+  -ngl 999 \
+  -n 32 \
+  -p "The capital of France is" \
+  2>&1 | grep -E 'capital|eval time'
+```
+
+```bash
+./build/bin/llama-simple \
+  -m /Users/hung/models/Qwen3.5-0.8B-Q8_0.gguf \
+  -ngl 999 \
+  -n 64 \
+  -p "The capital of France is" \
+  2>&1 | grep -E 'capital|eval time'
+```
+
+### Metal per-op profile
+
+```bash
+GGML_METAL_PROFILE=2 ./build/bin/llama-simple \
+  -m /Users/hung/models/Qwen3.5-4B-Q4_0.gguf \
+  -ngl 999 \
+  -n 4 \
+  -p "Hello" \
+  2>&1 | grep -E 'METAL_PROFILE.*per-op' -A 25
+```
+
+### Secondary benchmark signal
+
+```bash
+./build/bin/llama-bench \
+  -m /Users/hung/models/Qwen3.5-4B-Q4_0.gguf \
+  -ngl 999 \
+  -p 512 \
+  -n 128
+```
+
+Notes:
+
+- Prefer the first decode graph after pipeline warmup when comparing profile shapes.
+- On the AMD Radeon Pro 5500M, long `llama-bench` runs showed thermal drift and large `tg128` variance; do not use those numbers as the primary source of truth for decode throughput.
+- Deterministic greedy decoding with `llama-simple` was used for correctness checks.
