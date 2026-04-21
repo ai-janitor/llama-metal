@@ -382,7 +382,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     // regardless of stride — reshape is sufficient and avoids a copy.
     // For prompt (n_seq_tokens>1), the interleaved QKV stride makes the view
     // non-contiguous, so cont is needed to materialize the data.
-    if (n_seq_tokens == 1) {
+    if (n_seq_tokens * n_seqs == 1) {
         q_conv = ggml_reshape_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_reshape_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
         v_conv = ggml_reshape_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -416,7 +416,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     std::pair<ggml_tensor *, ggml_tensor *> attn_out;
     bool state_written_by_kernel = false;
 
-    if (n_seq_tokens == 1 && n_seqs == 1) {
+    if (n_seq_tokens * n_seqs == 1) {
         // Fused single-seq decode: kernel writes state directly to cache.
         // Create a view into the cache at the writeback offset — kernel writes here.
         ggml_tensor * state_dst = ggml_view_1d(ctx0, ssm_states_all,

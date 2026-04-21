@@ -789,7 +789,7 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
     // Reshape conv output slices to 4D.
     // For decode (n_seq_tokens==1), single-row view is contiguous — reshape suffices.
     // For prompt (n_seq_tokens>1), interleaved QKV stride requires cont.
-    if (n_seq_tokens == 1) {
+    if (n_seq_tokens * n_seqs == 1) {
         q_conv = ggml_reshape_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
         k_conv = ggml_reshape_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
         v_conv = ggml_reshape_4d(ctx0, v_conv, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
@@ -834,7 +834,8 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
     std::pair<ggml_tensor *, ggml_tensor *> attn_out;
     bool ssm_state_written_by_kernel = false;
 
-    if (n_seq_tokens == 1 && n_seqs == 1) {
+    if (n_seq_tokens * n_seqs == 1) {
+        // Fused single-seq decode: kernel writes state directly to cache.
         ggml_tensor * state_dst = ggml_view_1d(ctx0, ssm_states_all,
             hparams.n_embd_s() * n_seqs,
             kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all));
@@ -842,8 +843,10 @@ ggml_tensor * llm_build_qwen3next::build_layer_attn_linear(
         attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, state_dst, il);
         ssm_state_written_by_kernel = true;
     } else if (n_seq_tokens == 1) {
+        // Multi-seq decode: use legacy packed output (unfused path, no direct cache write)
         attn_out = build_delta_net_autoregressive(q_conv, k_conv, v_conv, gate, beta, state, nullptr, il);
     } else {
+        // Chunking prompt: transpose S^T → S for ggml ops, transpose result S → S^T for cache.
         attn_out = build_delta_net_chunking(q_conv, k_conv, v_conv, gate, beta, state, causal_mask, identity, diag_mask, il);
     }
     ggml_tensor * output    = attn_out.first;
