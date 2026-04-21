@@ -743,18 +743,63 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
     assert(dev != NULL);
 
     if (dev->mtl_device == nil) {
-        // Enumerate GPUs with system default first (high-perf GPU).
-        // device 0 = system default, device 1+ = remaining GPUs in enumeration order.
+        // Enumerate GPUs. By default the system default device is listed first (high-perf GPU).
+        // device 0 = first in our ordered list, device 1+ = remaining GPUs in enumeration order.
+        //
+        // To allow forcing an eGPU (e.g. external RX 6800 XT) or selecting by name, two
+        // environment variables are supported:
+        //   GGML_METAL_DEVICE_NAME      - substring to match in the device name (case-insensitive). The first
+        //                                 device that matches will be placed first in the ordering.
+        //   GGML_METAL_PREFER_EXTERNAL  - if set (any value), external devices (eGPU) will be preferred and
+        //                                 placed before internal devices.
         {
             id<MTLDevice> defaultDevice = MTLCreateSystemDefaultDevice();
             NSArray<id<MTLDevice>> *allDevices = MTLCopyAllDevices();
 
-            // Build ordered list: default device first, then others
+            const char *env_dev_name = getenv("GGML_METAL_DEVICE_NAME");
+            const char *env_pref_external = getenv("GGML_METAL_PREFER_EXTERNAL");
+
             NSMutableArray<id<MTLDevice>> *ordered = [NSMutableArray arrayWithCapacity:allDevices.count];
-            [ordered addObject:defaultDevice];
-            for (id<MTLDevice> d in allDevices) {
-                if (d.registryID != defaultDevice.registryID) {
-                    [ordered addObject:d];
+
+            // If the user requested a device by name, try to find it first and put it at index 0.
+            if (env_dev_name) {
+                NSString *nameMatch = [NSString stringWithUTF8String:env_dev_name];
+                NSString *nameMatchLower = [nameMatch lowercaseString];
+                for (id<MTLDevice> d in allDevices) {
+                    NSString *dnameLower = [[d name] lowercaseString];
+                    if ([dnameLower containsString:nameMatchLower]) {
+                        [ordered addObject:d];
+                        break;
+                    }
+                }
+            }
+
+            // If prefer external is requested, put external devices next (unless already added).
+            if (env_pref_external) {
+                for (id<MTLDevice> d in allDevices) {
+                    if ([d location] == MTLDeviceLocationExternal) {
+                        if (![ordered containsObject:d]) {
+                            [ordered addObject:d];
+                        }
+                    }
+                }
+
+                // Then add the rest (internal) devices that are not yet in the ordered list.
+                for (id<MTLDevice> d in allDevices) {
+                    if (![ordered containsObject:d]) {
+                        [ordered addObject:d];
+                    }
+                }
+            } else {
+                // Default behavior: put the system default device first (unless a name match already did),
+                // then append the remaining devices in enumeration order.
+                if (![ordered containsObject:defaultDevice]) {
+                    [ordered addObject:defaultDevice];
+                }
+                for (id<MTLDevice> d in allDevices) {
+                    if (![ordered containsObject:d]) {
+                        [ordered addObject:d];
+                    }
                 }
             }
 
@@ -917,11 +962,11 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->props.use_residency_sets = getenv("GGML_METAL_NO_RESIDENCY") == nil;
 #endif
 
+            // Use shared buffers only when the device actually has unified memory.
+            // Do NOT force shared buffers for external (eGPU) devices connected over
+            // Thunderbolt — that causes the GPU to read from host memory over the
+            // bus for every operation and frequently triggers the macOS GPU watchdog.
             dev->props.use_shared_buffers = dev->props.has_unified_memory;
-#if TARGET_OS_OSX
-            // In case of eGPU, shared memory may be preferable.
-            dev->props.use_shared_buffers |= [dev->mtl_device location] == MTLDeviceLocationExternal;
-#endif
             if (getenv("GGML_METAL_SHARED_BUFFERS_DISABLE") != NULL) {
                 dev->props.use_shared_buffers = false;
             }
@@ -949,7 +994,22 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->profile.simd_width                  = 32; // default; probed below after library init
             dev->profile.max_threads_per_threadgroup = (uint32_t)dev->mtl_device.maxThreadsPerThreadgroup.width;
             dev->profile.shared_mem_size             = (uint32_t)dev->mtl_device.maxThreadgroupMemoryLength;
-            dev->profile.max_threadgroups_per_dispatch = (dev->profile.vendor == GGML_GPU_VENDOR_INTEL) ? 512 : 0;
+            // Intel iGPU: limit to avoid watchdog timeout. For other devices, allow override
+            // - default: 0 (no chunking)
+            // - Intel: 512 (safe default)
+            // - external (eGPU): try a conservative default (512) to avoid Thunderbolt/watchdog timeouts
+            const char *env_max_tg = getenv("GGML_METAL_MAX_TG_PER_DISPATCH");
+            if (env_max_tg) {
+                dev->profile.max_threadgroups_per_dispatch = atoi(env_max_tg);
+            } else if (dev->profile.vendor == GGML_GPU_VENDOR_INTEL) {
+                dev->profile.max_threadgroups_per_dispatch = 512;
+            } else if ([dev->mtl_device location] == MTLDeviceLocationExternal) {
+                // External GPUs connected over Thunderbolt may require chunked dispatch to avoid GPU watchdog timeouts.
+                // Start conservatively at 512; users can tune via GGML_METAL_MAX_TG_PER_DISPATCH.
+                dev->profile.max_threadgroups_per_dispatch = 512;
+            } else {
+                dev->profile.max_threadgroups_per_dispatch = 0;
+            }
 
             dev->props.supports_gpu_family_apple7 = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
 
