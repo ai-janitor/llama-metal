@@ -46,6 +46,39 @@ struct ggml_device_profile {
     uint32_t max_threads_per_threadgroup;
     uint32_t shared_mem_size;     // threadgroup/shared memory per block (bytes)
     uint32_t max_threadgroups_per_dispatch; // max threadgroups per dispatch for timeout-prone ops (0 = unlimited)
+
+    // Cache hierarchy (0 = unknown).
+    // These come from a hardware lookup table, not Metal API queries.
+    // Used to tune activation reuse (nr0), tiling, and prefetch strategies.
+    uint32_t l1_cache_per_cu;     // L1 data cache per CU/SM, bytes (e.g., 16384 for GCN)
+    uint32_t l2_cache_total;      // L2 cache total, bytes (e.g., 786432 for D700)
+
+    // Matvec row-sum tail on the shared-memory reduce path: 0 serial, 1 tree (from the hw row).
+    uint32_t mv_reduce;
+
+    // f16 scalar matvec at simd width 64: 1 runs it, 0 keeps the width-64 fallback (from the hw row).
+    uint32_t f_scalar_w64;
+
+    // Q8_0 matvecs that read one activation: 1 runs the 2-4 of them in one launch, 0 one launch each (from the hw row).
+    uint32_t mv_group;
+
+    // Attention gate copy, sigmoid, output copy and multiply: 1 runs them as one launch, 0 one launch each (from the hw row).
+    uint32_t attn_gate_fuse;
+
+    // conv_state launch also writes split_l2 of its q and k heads: 1 on, 0 off (from the hw row).
+    uint32_t conv_l2_fold;
+
+    // Residual add, rms norm of its sum and the weight multiply: 1 runs them as one launch, 0 one launch each (from the hw row).
+    uint32_t add_norm_fuse;
+
+    // Command buffers after the first, encoded and committed in order on the calling thread (from the hw row); 0 keeps one buffer encoded as before.
+    uint32_t cb_seq;
+
+    // Q8_0 matvec weight load width in bytes (from the hw row): 1 single bytes, 4 aligned words.
+    uint32_t q8_load_bytes;
+
+    // Smallest row count of a single Q8_0 matvec that runs 8 whole rows per simdgroup (from the hw row); 0 = never.
+    uint32_t q8_rows8_min;
 };
 
 #ifdef __cplusplus

@@ -51,9 +51,14 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    const int nth = std::min(1024, ne0);
-
-    ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, nth, 1, 1);
+    // Narrow rows otherwise leave most native lanes idle. Pack independent rows
+    // into one TG; use the actual width so the kernel agrees on every device.
+    const bool pack_rows = ne0 < 32;
+    const int nth = pack_rows ? std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline))
+                              : std::min(1024, ne0);
+    const int rows_per_group = pack_rows ? std::max(1, nth/ne0) : 1;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (ne1 + rows_per_group - 1)/rows_per_group,
+                                            ne2, ne3, nth, 1, 1);
 
     return 1;
 }
@@ -166,7 +171,7 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 
-        ggml_metal_op_concurrency_reset(ctx);
+        ggml_metal_op_concurrency_reset(ctx, idx);
     }
 
     ggml_metal_kargs_bin args = {
@@ -287,7 +292,9 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     if (pipeline.cnt) {
         const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
+        const int nth = MIN(256, n);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
     } else {
         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -342,7 +349,9 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
 
     const int64_t nrows = ggml_nrows(op->src[0]);
 
-    const int32_t nth = std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), ne00/2);
+    // split each row over several threadgroups: with a single row (decode) one threadgroup would run on one GPU core
+    const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), std::min(256, ne0)));
+    const int32_t nk  = (ne0 + nth - 1)/nth;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -354,7 +363,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     }
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, nk, nrows, 1, nth, 1, 1);
 
     return 1;
 }
@@ -447,6 +456,11 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
                 break;
             }
 
+            // an add that must leave its mean of squares for a fused norm is encoded on its own
+            if (ggml_metal_norm_matvec_add_scale() && ggml_metal_add_scale_applies(f1)) {
+                break;
+            }
+
             // b[0] === b[1] === ...
             if (!ggml_are_same_layout(f0->src[1], f1->src[1])) {
                 break;
@@ -481,8 +495,8 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
         bid_dst = ggml_metal_get_buffer_id(ctx->node(idx + n_fuse - 1));
 
         for (int i = 1; i < n_fuse; ++i) {
-            if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
-                ggml_metal_op_concurrency_reset(ctx);
+            if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i), idx + i)) {
+                ggml_metal_op_concurrency_reset(ctx, idx + i);
 
                 break;
             }
@@ -504,7 +518,9 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     if (pipeline.cnt) {
         const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
 
-        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
+        const int nth = MIN(256, n);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
     } else {
         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 

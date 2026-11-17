@@ -1,5 +1,8 @@
 #include "00-common.metal"
 
+// INTENT: preserve destination element strides for reshaped/permuted copies.
+// PDL: map the source row, then advance each destination element by nb0.
+// Reference: ggml-org/llama.cpp 4e5116f47, kernels/quantize.metal:29-33 (MIT).
 template<typename T0, typename T1>
 kernel void kernel_cpy_t_t(
         constant ggml_metal_kargs_cpy & args,
@@ -13,6 +16,10 @@ kernel void kernel_cpy_t_t(
     const int i01 = ntg[1] == 1 ? tgpig[0]%args.ne01 : tgpig[0]*ntg[1] + tiitg/ntg[0];
     const int iw0 = ntg[1] == 1 ? tgpig[0]/args.ne01 : 0;
 
+    if (i01 >= args.ne01) {
+        return;
+    }
+
     const int64_t n = i03*args.ne02*args.ne01*args.ne00 + i02*args.ne01*args.ne00 + i01*args.ne00;
 
     const int64_t i3 = n/(args.ne2*args.ne1*args.ne0);
@@ -20,11 +27,11 @@ kernel void kernel_cpy_t_t(
     const int64_t i1 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0)/args.ne0;
     const int64_t i0 = (n - i3*args.ne2*args.ne1*args.ne0 - i2*args.ne1*args.ne0 - i1*args.ne0);
 
-    device T1 * dst_data = (device T1 *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
+    device char * dst_data = dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0;
 
     for (int64_t i00 = iw0*ntg[0] + tiitg%ntg[0]; i00 < args.ne00; ) {
         device const T0 * src = (device T0 *)(src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01 + i00*args.nb00);
-        dst_data[i00] = (T1) src[0];
+        *(device T1 *)(dst_data + i00*args.nb0) = (T1) src[0];
         break;
     }
 }
@@ -145,14 +152,22 @@ kernel void kernel_concat(
 
     const int i3 = tgpig.z;
     const int i2 = tgpig.y;
-    const int i1 = tgpig.x;
+    // For narrow rows, consecutive lane spans own consecutive output rows.
+    // Derive the row count from the dispatched width, not a hardware assumption.
+    const bool pack_rows = args.ne0 < 32;
+    const int rows_per_group = pack_rows ? max(1, int(ntg.x)/args.ne0) : 1;
+    const int row_in_group = pack_rows ? int(tpitg.x)/args.ne0 : 0;
+    if (row_in_group >= rows_per_group) return; // unused tail lanes when ne0 is not a divisor
+    const int i1 = tgpig.x*rows_per_group + row_in_group;
+    if (i1 >= args.ne1) return; // partial final group
 
     int o[4] = {0, 0, 0, 0};
     o[args.dim] = args.dim == 0 ? args.ne00 : (args.dim == 1 ? args.ne01 : (args.dim == 2 ? args.ne02 : args.ne03));
 
     device const float * x;
 
-    for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+    const int first_column = pack_rows ? int(tpitg.x)%args.ne0 : int(tpitg.x);
+    for (int i0 = first_column; i0 < args.ne0; i0 += ntg.x) {
         if (i0 < args.ne00 && i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
             x = (device const float *)(src0 + (i3       )*args.nb03 + (i2       )*args.nb02 + (i1       )*args.nb01 + (i0       )*args.nb00);
         } else {

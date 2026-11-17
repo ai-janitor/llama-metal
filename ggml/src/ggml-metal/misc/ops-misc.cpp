@@ -131,7 +131,7 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 1, 1, 1);
     }
 
-    ggml_metal_op_concurrency_reset(ctx);
+    ggml_metal_op_concurrency_reset(ctx, idx);
 
     {
         ggml_metal_kargs_count_equal args = {

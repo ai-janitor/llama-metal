@@ -153,6 +153,7 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         /*.nbf1   =*/ { nb01 },
         /*.nbf2   =*/ { nb02 },
         /*.nbf3   =*/ { nb03 },
+        /*.scale  =*/ 1.0f,
     };
 
     ggml_op fops[8];
@@ -218,25 +219,38 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    bool fused_norm_scale = false;
+    if (use_fusion && op->op == GGML_OP_RMS_NORM) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_SCALE) {
+            n_fuse = n;
+            fused_norm_scale = true;
+            args.scale = ggml_get_op_params_f32(ctx->node(idx + 1), 0);
+        }
+    }
+
     if (n_fuse > 1) {
         bid_dst = ggml_metal_get_buffer_id(ctx->node(idx + n_fuse - 1));
 
         for (int i = 1; i < n_fuse; ++i) {
-            if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i))) {
-                ggml_metal_op_concurrency_reset(ctx);
+            if (!ggml_metal_op_concurrency_check(ctx, ctx->node(idx + i), idx + i)) {
+                ggml_metal_op_concurrency_reset(ctx, idx + i);
 
                 break;
             }
         }
     }
 
-    auto pipeline = ggml_metal_library_get_pipeline_norm(lib, op, n_fuse);
+    auto pipeline = fused_norm_scale ?
+        ggml_metal_library_get_pipeline_norm_scale(lib, op) :
+        ggml_metal_library_get_pipeline_norm(lib, op, n_fuse);
 
     if (pipeline.c4) {
         args.ne00_t = ne00/4;
     }
 
-    int nth = 32; // SIMD width
+    int nth = (int) ggml_metal_device_get_profile(ctx->dev)->simd_width;
 
     while (nth < args.ne00_t && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;

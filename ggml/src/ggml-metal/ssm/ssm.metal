@@ -1,6 +1,11 @@
 #include "00-common.metal"
 
+// FU-MU-40, upstream 4e5116f47: retain channel packing and optional state destination.
+constant bool FC_ssm_conv_silu [[function_constant(FC_SSM_CONV + 1)]];
+
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
+// Grid mapping: each TG handles multiple channels (tgpig.x * ntg.x + tpitg.x).
+// On D700/GCN (NW=64), TG=64 fills full wavefront instead of 1-thread TGs.
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,
@@ -10,9 +15,11 @@ kernel void kernel_ssm_conv_f32_f32(
         uint3 tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;  // channel
+    const int64_t ir = (int64_t)tgpig.x * ntg.x + tpitg.x;  // channel (packed across TG threads)
     const int64_t i2 = tgpig.y;  // token position
     const int64_t i3 = tgpig.z;  // sequence
+
+    if (ir >= args.ne01) return;  // guard for ceil division padding
 
     const int64_t nc  = args.ne10;  // d_conv (kernel size)
     const int64_t ncs = args.ne00;  // conv window size (d_conv - 1 + n_tokens)
@@ -27,7 +34,7 @@ kernel void kernel_ssm_conv_f32_f32(
         sumf += s[i0] * c[i0];
     }
 
-    x[0] = sumf;
+    x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 
     // Write conv state directly to cache if state_dst is provided.
     // The new state is the last (d_conv - 1) elements of the conv window for this channel.
@@ -45,6 +52,7 @@ kernel void kernel_ssm_conv_f32_f32(
     }
 }
 
+// float4 vectorized variant — same channel-packing as above.
 kernel void kernel_ssm_conv_f32_f32_4(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,
@@ -54,9 +62,11 @@ kernel void kernel_ssm_conv_f32_f32_4(
         uint3 tgpig[[threadgroup_position_in_grid]],
         ushort3 tpitg[[thread_position_in_threadgroup]],
         ushort3   ntg[[threads_per_threadgroup]]) {
-    const int64_t ir = tgpig.x;  // channel
+    const int64_t ir = (int64_t)tgpig.x * ntg.x + tpitg.x;  // channel (packed across TG threads)
     const int64_t i2 = tgpig.y;  // token position
     const int64_t i3 = tgpig.z;  // sequence
+
+    if (ir >= args.ne01) return;  // guard for ceil division padding
 
     const int64_t nc  = args.ne10;  // d_conv
     const int64_t ncs = args.ne00;  // conv window size
@@ -71,7 +81,7 @@ kernel void kernel_ssm_conv_f32_f32_4(
         sumf += dot(s[i0], c[i0]);
     }
 
-    x[0] = sumf;
+    x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 
     // Write conv state directly to cache if state_dst is provided.
     if (args.has_state_dst && i2 == args.ne1 - 1) {
@@ -82,6 +92,138 @@ kernel void kernel_ssm_conv_f32_f32_4(
         for (int64_t i0 = 0; i0 < state_width; ++i0) {
             sd[i0] = conv_tail[i0];
         }
+    }
+}
+
+// One decode token: conv + silu over (state, input) as kernel_ssm_conv_f32_f32[_4], then the state
+// shifted by one into its cache cell. A thread owns one channel and reads its state before writing it.
+template <bool V4>
+static float kernel_ssm_conv_state_impl(
+        constant ggml_metal_kargs_conv_state & args,
+        device const char * state,
+        device const char * input,
+        device const char * weight,
+        device       float * dst,
+        device       float * cell,
+        int c) {
+    const int nc = args.nc;
+
+    device const float * s = (device const float *) (state  + c*args.nbs1);
+    device const float * w = (device const float *) (weight + c*args.nbw1);
+    const float xin = *((device const float *) (input + c*args.nbx1));
+
+    float sumf = 0.0f;
+    if (V4) {
+        for (int i0 = 0; i0 < nc/4; ++i0) {
+            float4 win;
+            for (short j = 0; j < 4; ++j) {
+                const int i = 4*i0 + j;
+                win[j] = i < nc - 1 ? s[i] : xin;
+            }
+            sumf += dot(win, ((device const float4 *) w)[i0]);
+        }
+    } else {
+        for (int i0 = 0; i0 < nc; ++i0) {
+            sumf += (i0 < nc - 1 ? s[i0] : xin) * w[i0];
+        }
+    }
+
+    const float y = sumf/(1.0f + exp(-sumf));
+    dst[c] = y;
+
+    // in increasing order: column i is written only after column i + 1 was read
+    device float * cs = cell + (int64_t) c*(nc - 1);
+    for (int i = 0; i < nc - 2; ++i) {
+        cs[i] = s[i + 1];
+    }
+    cs[nc - 2] = xin;
+    return y;
+}
+
+kernel void kernel_ssm_conv_state_f32(
+        constant ggml_metal_kargs_conv_state & args,
+        device const char * state,
+        device const char * input,
+        device const char * weight,
+        device       float * dst,
+        device       float * cell,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int c = (int) tgpig.x*ntg.x + tpitg.x;
+    if (c >= args.channels) return;
+    kernel_ssm_conv_state_impl<false>(args, state, input, weight, dst, cell, c);
+}
+
+kernel void kernel_ssm_conv_state_f32_4(
+        constant ggml_metal_kargs_conv_state & args,
+        device const char * state,
+        device const char * input,
+        device const char * weight,
+        device       float * dst,
+        device       float * cell,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int c = (int) tgpig.x*ntg.x + tpitg.x;
+    if (c >= args.channels) return;
+    kernel_ssm_conv_state_impl<true>(args, state, input, weight, dst, cell, c);
+}
+
+// conv_state, then on q and k heads the split_l2 norm of kernel_small_split_l2_f32_4 on the values just
+// computed: one threadgroup per head, float4 partials and the same power-of-two tree, same op order.
+kernel void kernel_ssm_conv_state_l2_f32_4(
+        constant ggml_metal_kargs_conv_state_l2 & args,
+        device const char * state,
+        device const char * input,
+        device const char * weight,
+        device       float * dst,
+        device       float * cell,
+        device       char  * out_q,
+        device       char  * out_k,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int tid = tpitg.x;
+    const int c = (int) tgpig.x*ntg.x + tid;
+    const float yv = kernel_ssm_conv_state_impl<true>(args.cs, state, input, weight, dst, cell, c);
+
+    const int head = tgpig.x;
+    const int which = head < args.rows[0] ? 0 : 1;
+    if (head >= args.rows[0] + args.rows[1]) {
+        return; // v heads: conv only
+    }
+    const int row = head - (which ? args.rows[0] : 0);
+    threadgroup float * xs   = shmem;
+    threadgroup float * part = shmem + args.head_dim;
+    xs[tid] = yv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int threads = args.head_dim/4;
+    float4 xv = 0.0f;
+    float sum = 0.0f;
+    if (tid < threads) {
+        xv = float4(xs[4*tid + 0], xs[4*tid + 1], xs[4*tid + 2], xs[4*tid + 3]);
+        sum += dot(xv, xv);
+        part[tid] = sum;
+    }
+    int np2 = 1;
+    while (np2 < threads) np2 <<= 1;
+    for (int i = threads + tid; i < np2 && tid < threads; i += threads) part[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int step = np2 / 2; step > 0; step >>= 1) {
+        if (tid < step) {
+            part[tid] += part[tid + step];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    sum = part[0];
+    const float mean  = sum / args.ne00[which];
+    const float scale = 1.0f / sqrt(mean + args.eps[which]);
+    if (tid < threads) {
+        device float4 * y = (device float4 *) ((which ? out_k : out_q) + row*args.nb1[which]);
+        y[tid] = (xv * scale) * args.scale[which];
     }
 }
 
@@ -132,7 +274,7 @@ kernel void kernel_ssm_conv_f32_f32_batched(
         sumf += s[i0] * c[i0];
     }
 
-    x[0] = sumf;
+    x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 }
 
 kernel void kernel_ssm_conv_f32_f32_batched_4(
@@ -178,7 +320,7 @@ kernel void kernel_ssm_conv_f32_f32_batched_4(
         sumf += dot(s[i0], c[i0]);
     }
 
-    x[0] = sumf;
+    x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 }
 
 // ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-2 part
@@ -488,121 +630,157 @@ kernel void kernel_rwkv_wkv7_f32(
     }
 }
 
-// Fused gated delta-net recurrence kernel.
-// Replaces 16 elementwise graph ops per SSM layer with one GPU dispatch.
-// State stays in registers — no intermediate device memory traffic between steps.
-//
-// Architecture (from arc-b60 kernel_gated_delta_net):
-//   1 threadgroup per (state_row, head) — each TG owns one row of the S×S state matrix.
-//   32 threads (1 simdgroup) collaborate on the S_v-wide dot products via simd_sum.
-//   Per-token loop: decay → dot(state,k) → delta → state update → dot(state,q)
-//
-// Buffer layout:
-//   src0 = k  [S, H, T]       (contiguous f32)
-//   src1 = v  [S, H, T]       (contiguous f32)
-//   src2 = q  [S, H, T]       (contiguous f32)
-//   src3 = gate [1, 1, H, B]  (log decay per head, contiguous f32)
-//   src4 = beta [1, 1, H, B]  (gating scalar per head, contiguous f32)
-//   src5 = state [S, S, H, B] (contiguous f32, mutated in-place via output packing)
-//   dst  = packed [S*H, T + S*B] (output rows then new_state rows)
-kernel void kernel_gated_delta_net(
+// INTENT: implement the current q/k/v, gate, beta and K-snapshot GDN contract.
+// PDL: preserve upstream recurrence and snapshots; the host derives the split from simd_width.
+// Reference: ggml-org/llama.cpp 4e5116f47, kernels/gated_delta_net.metal (MIT).
+// FU-MU-14: the upstream nb_out path now binds the cache directly when the host matches GDN + CPY.
+
+constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 0)]];
+constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
+constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
+
+template<short NSG>
+kernel void kernel_gated_delta_net_impl(
         constant ggml_metal_kargs_gated_delta_net & args,
-        device const float * src0,      // k
-        device const float * src1,      // v
-        device const float * src2,      // q
-        device const float * src3,      // gate (log decay)
-        device const float * src4,      // beta
-        device const float * src5,      // state (input)
-        device       float * dst,       // output (+ new_state if no state_dst)
-        device       float * state_dst, // direct state write target (or unused)
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        uint   tx   [[thread_index_in_threadgroup]]) {
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * g,
+        device const char * b,
+        device const char * s,
+        device       char * dst,
+        device       char * dst_fuse,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]],
+        uint3   ntg[[threads_per_threadgroup]])  {
+#define S_v FC_gated_delta_net_ne20
+#define G   FC_gated_delta_net_ne30
+#define K   FC_gated_delta_net_K
 
-    const int S = args.S;           // state dimension
-    const int H = args.H;           // value heads
-    const int T = args.n_tokens;    // tokens in batch
-    const int H_k = args.H_k;      // key heads (GQA)
-    const int group_ratio = H / H_k;
+    const uint tx = tpitg.x;
+    const uint ty = tpitg.y;
 
-    const int row  = (int)tgpig.x;  // which row of the S×S state matrix this TG owns
-    const int head = (int)tgpig.y;  // which head
+    const uint i23 = tgpig.z; // B (n_seqs)
+    const uint i21 = tgpig.y; // H (head)
+    const uint i20 = tgpig.x*NSG + ty; // row within S_v
 
-    if (head >= H || row >= S) return;
+    const uint i01 = i21 % args.ne01;
+    const uint i11 = i21 % args.ne11;
 
-    // Elements per thread — each thread handles NSG consecutive state columns.
-    // With TG=32 and NSG=4: 32*4=128 elements max. S_v for Qwen3.5 is 128.
-    constexpr int NSG = 4;
+    const float scale = 1.0f / sqrt((float)S_v);
 
-    // Load this state row into registers.
-    // State layout: [S_v, S_v, H_v, n_seqs] — row `row` of head `head`:
-    //   state_base = (seq * H + head) * S * S + row * S
-    // For single-seq (n_seqs=1): (head * S + row) * S
-    const int state_row_base = (head * S + row) * S;
+    // input state layout [S_v, S_v, H, n_seqs] (s0 only): per-seq stride is H*D.
+    // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
+    const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    device const float * s_ptr = (device const float *) (s) + state_in_base;
+
     float ls[NSG];
-    for (int j = 0; j < NSG; j++) {
-        const int col = (int)tx * NSG + j;
-        ls[j] = (col < S) ? src5[state_row_base + col] : 0.0f;
+
+    FOR_UNROLL (short j = 0; j < NSG; j++) {
+        const short is = tx*NSG + j;
+        ls[j] = s_ptr[is];
     }
 
-    // INCREMENTAL TEST: full computation but NO state update (ls[j] += k*d is skipped)
-    for (int t = 0; t < T; t++) {
-        const int gh_idx = t * H + head;
-        const int k_head = head / group_ratio;
-        const int qk_off = (t * H_k + k_head) * S;
+    device float * dst_attn = (device float *) (dst) + (i23*args.ne22*args.ne21 + i21)*S_v + i20;
 
-        // Step 1: decay
-        const float decay = exp(src3[gh_idx]);
+    device const float * q_ptr = (device const float *) (q + i23*args.nb03 + i01*args.nb01);
+    device const float * k_ptr = (device const float *) (k + i23*args.nb13 + i11*args.nb11);
+    device const float * v_ptr = (device const float *) (v + i23*args.nb23 + i21*args.nb21);
 
-        // Step 2: dot(state, k)
-        float dot_state_k = 0.0f;
-        for (int j = 0; j < NSG; j++) {
-            const int col = (int)tx * NSG + j;
-            if (col < S) {
-                ls[j] *= decay;
-                dot_state_k += ls[j] * src0[qk_off + col];
+    device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
+    device const float * g_ptr = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
+
+    // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+    // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
+
+    // output state base offset: after attention scores
+    const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
+    // output state per-slot size: S_v * S_v * H * n_seqs
+    const uint state_size_per_snap = S_v * S_v * args.ne21 * args.ne23;
+    // per-(seq,head) offset within a slot
+    const uint state_out_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+
+    // when fused with the cache cpy, write the snapshots straight into the cache buffer using
+    // the slot stride; otherwise append them after the attn scores (nb_out == 0)
+    const bool fused = args.nb_out > 0;
+    const device float * state_out = fused ? (device float *)dst_fuse : (device float *)dst + attn_size;
+    const uint slot_stride = fused ? (uint)args.nb_out : state_size_per_snap;
+
+    for (short t = 0; t < args.ne22; t++) {
+        float s_k = 0.0f;
+
+        if (G == 1) {
+            const float g_exp = exp(g_ptr[0]);
+
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                const short is = tx*NSG + j;
+                ls[j] *= g_exp;
+
+                s_k += ls[j]*k_ptr[is];
+            }
+        } else {
+            // KDA
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                const short is = tx*NSG + j;
+                ls[j] *= exp(g_ptr[is]);
+
+                s_k += ls[j]*k_ptr[is];
             }
         }
-        dot_state_k = simd_sum(dot_state_k);
 
-        // Step 3: delta = (v - dot(state,k)) * beta
-        const float v_val = src1[gh_idx * S + row];
-        const float beta_val = src4[gh_idx];
-        const float delta = (v_val - dot_state_k) * beta_val;
+        s_k = simd_sum(s_k);
 
-        // Step 4+5: state update + output (FUSED in one loop, like original)
-        float dot_state_q = 0.0f;
-        for (int j = 0; j < NSG; j++) {
-            const int col = (int)tx * NSG + j;
-            if (col < S) {
-                ls[j] += src0[qk_off + col] * delta;
-                dot_state_q += ls[j] * src2[qk_off + col];
-            }
+        const float d = (v_ptr[i20] - s_k)*b_ptr[0];
+
+        float y = 0.0f;
+
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            const short is = tx*NSG + j;
+            ls[j] += k_ptr[is]*d;
+
+            y += ls[j]*q_ptr[is];
         }
-        dot_state_q = simd_sum(dot_state_q);
+
+        y = simd_sum(y);
 
         if (tx == 0) {
-            dst[(int64_t)t * S * H + head * S + row] = dot_state_q * args.scale;
+            dst_attn[t*args.ne21*S_v] = y*scale;
+        }
+
+        q_ptr += args.ns02;
+        k_ptr += args.ns12;
+        v_ptr += args.ns22;
+
+        b_ptr += args.ne21;
+        g_ptr += args.ne21*G;
+
+        if (K > 1) {
+            const int target_slot = (int)args.ne22 - 1 - (int)t;
+            if (target_slot >= 0 && target_slot < (int)K) {
+                device float * dst_state = (device float *)state_out + (uint)target_slot * slot_stride + state_out_base;
+                FOR_UNROLL (short j = 0; j < NSG; j++) {
+                    const short is = tx*NSG + j;
+                    dst_state[is] = ls[j];
+                }
+            }
         }
     }
 
-    // Write state row back. If state_dst is provided (has_state_dst == 1),
-    // write directly to the cache buffer. Otherwise, pack into dst after output rows.
-    if (args.has_state_dst) {
-        // Direct cache write: state_dst has same layout as src5 [S, S, H, n_seqs]
-        for (int j = 0; j < NSG; j++) {
-            const int col = (int)tx * NSG + j;
-            if (col < S) {
-                state_dst[state_row_base + col] = ls[j];
-            }
-        }
-    } else {
-        // Legacy packed layout: state goes after T output rows in dst
-        const int64_t packed_base = (int64_t)T * S * H + state_row_base;
-        for (int j = 0; j < NSG; j++) {
-            const int col = (int)tx * NSG + j;
-            if (col < S) {
-                dst[packed_base + col] = ls[j];
-            }
+    if (K == 1) {
+        device float * dst_state = (device float *)state_out + state_out_base;
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            const short is = tx*NSG + j;
+            dst_state[is] = ls[j];
         }
     }
+
+#undef S_v
+#undef G
+#undef K
 }
+
+typedef decltype(kernel_gated_delta_net_impl<4>) kernel_gated_delta_net_t;
+
+template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<1>;
+template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<2>;
+template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<4>;

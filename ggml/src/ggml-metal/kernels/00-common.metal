@@ -27,6 +27,21 @@ using namespace metal;
 
 constant short N_SIMDWIDTH [[function_constant(FC_SIMD_WIDTH)]];
 
+// Threadgroup-memory tree reduction — works at any SIMD width.
+// Use when simd_sum/simd_shuffle_down are unreliable (AMD GCN NW=64).
+inline float tgmem_reduce_sum(float val, uint tidx, uint ntg, threadgroup float * buf) {
+    buf[tidx] = val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Serial reduction by thread 0.  ntg is small (≤ 64) so this is fast.
+    if (tidx == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < ntg; i++) { s += buf[i]; }
+        buf[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return buf[0];
+}
+
 // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
 //
 // cmd:

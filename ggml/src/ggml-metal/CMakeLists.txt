@@ -1,15 +1,18 @@
 find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
 find_library(METAL_FRAMEWORK    Metal      REQUIRED)
 find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
+find_library(IOKIT_FRAMEWORK    IOKit      REQUIRED)
 
 message(STATUS "Metal framework found")
 
 # C++ sources — split into ops/ and device/ subdirectories
 ggml_add_backend_library(ggml-metal
                          ggml-metal.cpp
+                         ggml-metal-fusion.cpp
                          ggml-metal-device.m
                          ggml-metal-common.cpp
                          ggml-metal-context.m
+                         ggml-metal-command-buffer-error.m
                          # device/ — pipeline selection (maps ggml ops to MSL kernel names)
                          device/ggml-metal-device.cpp
                          copy/pipeline-copy.cpp
@@ -22,6 +25,7 @@ ggml_add_backend_library(ggml-metal
                          norm/pipeline-norm.cpp
                          softmax/pipeline-softmax.cpp
                          matmul/pipeline.cpp
+                         matmul/lane-policy.cpp
                          ssm/pipeline-ssm.cpp
                          flash-attn/pipeline-flash-attn.cpp
                          spatial/pipeline-spatial.cpp
@@ -31,8 +35,14 @@ ggml_add_backend_library(ggml-metal
                          unary/ops-elementwise.cpp
                          reduction/ops-reduction.cpp
                          norm/ops-norm.cpp
+                         norm/ops-fuse-small.cpp
                          softmax/ops-softmax.cpp
                          matmul/dispatch.cpp
+                         matmul/dispatch-grouped.cpp
+                         matmul/dispatch-ext.cpp
+                         matmul/dispatch-matmul.cpp
+                         matmul/dispatch-scalar.cpp
+                         matmul/dispatch-gcn.cpp
                          ssm/ops-ssm.cpp
                          flash-attn/ops-flash-attn.cpp
                          rope/ops-rope.cpp
@@ -50,7 +60,12 @@ target_link_libraries(ggml-metal PRIVATE
                       ${FOUNDATION_LIBRARY}
                       ${METAL_FRAMEWORK}
                       ${METALKIT_FRAMEWORK}
+                      ${IOKIT_FRAMEWORK}
                       )
+
+if (GGML_METAL_TEST_OBSERVER)
+    target_compile_definitions(ggml-metal PRIVATE GGML_METAL_TEST_OBSERVER)
+endif()
 
 if (GGML_METAL_NDEBUG)
     add_compile_definitions(GGML_METAL_NDEBUG)
@@ -61,6 +76,14 @@ endif()
 set(METAL_KERNEL_SOURCES
     kernels/00-common.metal
     matmul/dequant.metal
+    matmul/block-dot-lane.metal
+    matmul/block-dot-basic.metal
+    matmul/block-dot-q2-k.metal
+    matmul/block-dot-q3-k.metal
+    matmul/block-dot-q4-k.metal
+    matmul/block-dot-q8-0.metal
+    matmul/block-dot.metal
+    matmul/block-dot-q6-grouped.metal
     unary/unary-binary.metal
     activation/activation.metal
     reduction/reduction.metal
@@ -68,11 +91,15 @@ set(METAL_KERNEL_SOURCES
     ssm/ssm.metal
     misc/solve-argmax.metal
     norm/norm.metal
+    norm/fuse-small.metal
     matmul/kernel-scalar-basic.metal
+    matmul/kernel-q8-lab.metal
     matmul/kernel-scalar.metal
     matmul/kernel-scalar-kquant.metal
     matmul/kernel-mm.metal
     matmul/kernel-tiled.metal
+    matmul/kernel-grouped-mv.metal
+    matmul/kernel-gcn.metal
     rows/rows.metal
     rope/rope.metal
     conv/conv.metal
@@ -113,9 +140,12 @@ if (GGML_METAL_EMBED_LIBRARY)
     #   5. Wrap in .s assembly for .incbin embedding
     add_custom_command(
         OUTPUT "${METALLIB_EMBED_ASM}"
+        # P11.66: the assembled MSL is a side product of this rule; declaring it lets the
+        # opt-in ggml-metal-test-metallib target depend on it (generated-file dependency edge).
+        BYPRODUCTS "${METALLIB_SOURCE_EMBED}"
         COMMAND echo "Embedding Metal library from kernels/"
-        # Step 1+2: concatenate kernel files, strip #include "00-common.metal" and "dequant.metal"
-        COMMAND cat ${METAL_KERNEL_DEPS} | grep -v "^#include \"00-common.metal\"\\|^#include \"dequant.metal\"" > "${METALLIB_SOURCE_EMBED}.tmp"
+        # Step 1+2: concatenate kernel files, strip internal shared-module includes
+        COMMAND cat ${METAL_KERNEL_DEPS} | grep -v "^#include \"00-common.metal\"\\|^#include \"dequant.metal\"\\|^#include \"block-dot-lane.metal\"\\|^#include \"block-dot-basic.metal\"\\|^#include \"block-dot-q2-k.metal\"\\|^#include \"block-dot-q3-k.metal\"\\|^#include \"block-dot-q4-k.metal\"\\|^#include \"block-dot-q8-0.metal\"\\|^#include \"block-dot.metal\"\\|^#include \"block-dot-q6-grouped.metal\"" > "${METALLIB_SOURCE_EMBED}.tmp"
         # Step 3: inline ggml-common.h
         COMMAND sed -e "/__embed_ggml-common.h__/r ${METALLIB_COMMON}" -e "/__embed_ggml-common.h__/d" < "${METALLIB_SOURCE_EMBED}.tmp" > "${METALLIB_SOURCE_EMBED}.tmp2"
         # Step 4: inline ggml-metal-impl.h
@@ -140,6 +170,49 @@ if (GGML_METAL_EMBED_LIBRARY)
     )
 
     target_sources(ggml-metal PRIVATE "${METALLIB_EMBED_ASM}")
+
+    # P11.66: opt-in offline payload (not in ALL). Compiles the embedded MSL (the same text
+    # embedded in the production binary, included once) plus test-contract-probe.metal into
+    # bin/ggml-metal-test.metallib without loading a device. Flags mirror the non-embedded path.
+    set(METALLIB_PROBE   "${CMAKE_CURRENT_SOURCE_DIR}/test-contract-probe.metal")
+    set(METALLIB_TEST_WRAPPER "${CMAKE_CURRENT_BINARY_DIR}/autogenerated/ggml-metal-test-wrapper.metal")
+    set(METALLIB_TEST_AIR     "${CMAKE_CURRENT_BINARY_DIR}/autogenerated/ggml-metal-test.air")
+    set(METALLIB_TEST_OUT     "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/ggml-metal-test.metallib")
+
+    if (GGML_METAL_SHADER_DEBUG)
+        set(TEST_XC_FLAGS -fno-fast-math -fno-inline)
+    else()
+        set(TEST_XC_FLAGS -O3)
+    endif()
+    if (GGML_METAL_MACOSX_VERSION_MIN)
+        list(APPEND TEST_XC_FLAGS -mmacosx-version-min=${GGML_METAL_MACOSX_VERSION_MIN})
+    endif()
+    if (GGML_METAL_STD)
+        list(APPEND TEST_XC_FLAGS -std=${GGML_METAL_STD})
+    endif()
+
+    # Wrapper includes each source exactly once (an include, not a second concatenation).
+    file(WRITE "${METALLIB_TEST_WRAPPER}"
+"// generated by ggml/src/ggml-metal/CMakeLists.txt (P11.66); do not edit
+#include \"${METALLIB_SOURCE_EMBED}\"
+#include \"${METALLIB_PROBE}\"
+")
+
+    add_custom_command(
+        OUTPUT "${METALLIB_TEST_OUT}"
+        # -DGGML_METAL_EMBED_LIBRARY=1: same macro ggml-metal-device.m passes the runtime compile (guards the embedded text)
+        COMMAND xcrun -sdk macosx metal ${TEST_XC_FLAGS} -DGGML_METAL_EMBED_LIBRARY=1 -c "${METALLIB_TEST_WRAPPER}" -o "${METALLIB_TEST_AIR}"
+        COMMAND xcrun -sdk macosx metallib "${METALLIB_TEST_AIR}" -o "${METALLIB_TEST_OUT}"
+        DEPENDS "${METALLIB_EMBED_ASM}" "${METALLIB_SOURCE_EMBED}" "${METALLIB_PROBE}" "${METALLIB_TEST_WRAPPER}"
+                ${METAL_KERNEL_DEPS} ${METALLIB_COMMON} ${METALLIB_IMPL}
+                ${CMAKE_CURRENT_SOURCE_DIR}/matmul/kernel-tiled-loaders-qk32.metal
+                ${CMAKE_CURRENT_SOURCE_DIR}/matmul/kernel-tiled-loaders-kquant.metal
+                ${CMAKE_CURRENT_SOURCE_DIR}/matmul/kernel-tiled-loaders-iq.metal
+        COMMENT "Compiling offline Metal test payload"
+        VERBATIM
+    )
+    # SOURCES: metadata only (no compile); lets the File-API source collection see the probe this target owns.
+    add_custom_target(ggml-metal-test-metallib DEPENDS "${METALLIB_TEST_OUT}" SOURCES "${METALLIB_PROBE}")
 else()
     # Non-embedded path: copy kernel files to bin directory, compile to metallib
     # Copy headers needed by Metal compiler
@@ -185,7 +258,7 @@ else()
 
     add_custom_command(
         OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
-        COMMAND cat ${METAL_KERNEL_BIN_DEPS} | grep -v "^#include \"00-common.metal\"\\|^#include \"dequant.metal\"" > "${METALLIB_MERGED}"
+        COMMAND cat ${METAL_KERNEL_BIN_DEPS} | grep -v "^#include \"00-common.metal\"\\|^#include \"dequant.metal\"\\|^#include \"block-dot-lane.metal\"\\|^#include \"block-dot-basic.metal\"\\|^#include \"block-dot-q2-k.metal\"\\|^#include \"block-dot-q3-k.metal\"\\|^#include \"block-dot-q4-k.metal\"\\|^#include \"block-dot-q8-0.metal\"\\|^#include \"block-dot.metal\"\\|^#include \"block-dot-q6-grouped.metal\"" > "${METALLIB_MERGED}"
         COMMAND xcrun -sdk macosx metal ${XC_FLAGS}
                 -I ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
                 -c "${METALLIB_MERGED}" -o - |

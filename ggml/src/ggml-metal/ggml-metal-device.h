@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-device-profile.h"
+#include "ggml-model-profile.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,13 @@ struct ggml_metal_buffer_id {
     void * metal; // id<MTLBuffer>
     size_t offs;
 };
+
+// Length in bytes of the Metal buffer behind this binding (0 when there is none).
+size_t ggml_metal_buffer_id_length(struct ggml_metal_buffer_id buffer);
+
+// Returns the effective GPU address for this exact Metal binding, including offs.
+// It is unavailable on pre-macOS-13 systems and callers must retain scalar fallback.
+bool ggml_metal_buffer_get_gpu_address(struct ggml_metal_buffer_id buffer, uint64_t * address);
 
 typedef struct ggml_metal_device * ggml_metal_device_t;
 
@@ -108,12 +116,23 @@ typedef void * ggml_metal_cmd_buf_t;
 typedef struct ggml_metal_encoder * ggml_metal_encoder_t;
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent);
+#ifdef GGML_METAL_TEST_OBSERVER
+bool ggml_metal_encoder_is_concurrent(ggml_metal_encoder_t encoder);
+#endif
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name);
 void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_metal_pipeline_with_params pipeline);
+
+// Set the current ggml op name on the encoder (for profiler labeling).
+// Called before dispatch when profile=3 is active.
+void ggml_metal_encoder_set_op_name(ggml_metal_encoder_t encoder, const char * op_name);
+
+// Set tensor shape for shape-attributed profiling (profile=3).
+// Allows bucketing dispatches by ne00 to identify which matmul shapes dominate.
+void ggml_metal_encoder_set_dispatch_shape(ggml_metal_encoder_t encoder, int32_t ne00, int32_t ne01);
 
 void ggml_metal_encoder_set_bytes (ggml_metal_encoder_t encoder, void * data, size_t size, int idx);
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx);
@@ -125,6 +144,45 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
+
+//
+// Per-dispatch GPU profiler (GGML_METAL_PROFILE=3)
+// Uses MTLCounterSampleBuffer to capture GPU timestamps at dispatch boundaries
+// in the normal async multi-CB path, without serializing execution.
+//
+
+// Opaque profiler handle — created per-graph, resolved at synchronize
+typedef struct ggml_metal_profiler * ggml_metal_profiler_t;
+
+// Create/destroy profiler (returns NULL if counters unsupported or profile != 3)
+ggml_metal_profiler_t ggml_metal_profiler_init(ggml_metal_device_t dev, int profile_level);
+void                  ggml_metal_profiler_free(ggml_metal_profiler_t prof);
+
+// Per-graph lifecycle
+void ggml_metal_profiler_begin_graph(ggml_metal_profiler_t prof, int n_nodes);
+
+// Per-command-buffer: create profiling-aware encoder (with sample buffer attached)
+// Returns standard encoder if profiler is NULL or inactive
+ggml_metal_encoder_t ggml_metal_encoder_init_profiled(
+    ggml_metal_cmd_buf_t  cmd_buf_raw,
+    bool                  concurrent,
+    ggml_metal_profiler_t prof,
+    int                   cb_idx);
+
+// Record a dispatch: inserts timestamp samples before/after the real dispatch.
+// op_name is the ggml op string (e.g. "MUL_MAT"), pipeline_name is the Metal kernel name.
+// If prof is NULL, dispatches normally with zero overhead.
+void ggml_metal_encoder_dispatch_profiled(
+    ggml_metal_encoder_t  encoder,
+    int tg0, int tg1, int tg2,
+    int tptg0, int tptg1, int tptg2,
+    ggml_metal_profiler_t prof,
+    int                   cb_idx,
+    const char *          op_name,
+    const char *          pipeline_name);
+
+// Resolve all sample buffers and print sorted summary to stderr
+void ggml_metal_profiler_end_graph(ggml_metal_profiler_t prof);
 
 //
 // MTLLibrary wrapper
@@ -141,6 +199,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline    (ggml_
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv);
 
 int ggml_metal_library_get_simd_width(ggml_metal_library_t lib);
+const struct ggml_device_profile * ggml_metal_library_get_device_profile(ggml_metal_library_t lib);
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base              (ggml_metal_library_t lib, enum ggml_op op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cpy               (ggml_metal_library_t lib, enum ggml_type tsrc, enum ggml_type tdst);
@@ -158,15 +217,18 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_bl
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_add        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri               (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool use_silu);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state_l2(ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state        (ggml_metal_library_t lib, int nc);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, bool use_silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, enum ggml_type tsrc0, enum ggml_type tsrc1, int nsg, int nxpsg, int r1ptg, bool use_shmem_reduce, bool src1_trans);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
-struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op, bool use_shmem_reduce, bool src1_trans);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op, bool use_shmem_reduce, bool src1_trans, int nr0_override, bool use_residual);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_gcn        (ggml_metal_library_t lib, enum ggml_type tsrc0, enum ggml_type tsrc1);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0    (ggml_metal_library_t lib, int ne02, int ne20);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op, bool use_shmem_reduce);
@@ -179,6 +241,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin      
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one           (ggml_metal_library_t lib, enum ggml_op op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale(ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col            (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -294,6 +357,10 @@ void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQue
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
 
+// GGML_METAL_NORM_MATVEC: a device-owned buffer of GGML_METAL_NORM_MEANS_SLOTS floats; slot = graph node index of the residual add
+#define GGML_METAL_NORM_MEANS_SLOTS 65536
+struct ggml_metal_buffer_id ggml_metal_device_get_norm_means(ggml_metal_device_t dev, int slot);
+
 void ggml_metal_device_rsets_add(ggml_metal_device_t dev, ggml_metal_rset_t rset);
 void ggml_metal_device_rsets_rm (ggml_metal_device_t dev, ggml_metal_rset_t rset);
 
@@ -325,6 +392,14 @@ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_de
 
 const struct ggml_device_profile * ggml_metal_device_get_profile(ggml_metal_device_t dev);
 
+// Model profile: captures model dimensions for kernel tuning decisions.
+// Set via ggml_backend_metal_set_model_profile() after loading GGUF metadata.
+// Returns default (populated=false) until explicitly set.
+void ggml_metal_device_set_model_profile(ggml_metal_device_t dev,
+        uint32_t n_embd, uint32_t n_ff, uint32_t n_layer,
+        uint32_t n_head, uint32_t n_head_kv);
+const struct ggml_model_profile * ggml_metal_device_get_model_profile(ggml_metal_device_t dev);
+
 //
 // device buffers
 //
@@ -348,6 +423,10 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 // Metal buffer based on the host memory pointer
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
+#ifdef GGML_METAL_TEST_OBSERVER
+// Test-observer mapping with a caller-checked span; never recomputes ggml_nbytes.
+struct ggml_metal_buffer_id ggml_metal_buffer_get_id_checked(ggml_metal_buffer_t buf, const struct ggml_tensor * t, size_t span);
+#endif
 
 #ifdef __cplusplus
 }

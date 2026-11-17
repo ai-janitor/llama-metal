@@ -1,3 +1,4 @@
+#include "ggml-metal-fusion.h"
 #include "ggml-metal.h"
 
 #include "ggml-impl.h"
@@ -6,6 +7,8 @@
 #include "ggml-metal-device.h"
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
+#include "ggml-metal-test-observer-helpers.h"
+#include "ggml-metal-test-override.h"
 
 #include <mutex>
 #include <string>
@@ -90,9 +93,14 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_shared_i = {
     /* .memset_tensor   = */ ggml_backend_metal_buffer_shared_memset_tensor,
     /* .set_tensor      = */ ggml_backend_metal_buffer_shared_set_tensor,
     /* .get_tensor      = */ ggml_backend_metal_buffer_shared_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_metal_buffer_shared_cpy_tensor,
     /* .clear           = */ ggml_backend_metal_buffer_shared_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 // private buffer
@@ -164,9 +172,14 @@ static ggml_backend_buffer_i ggml_backend_metal_buffer_private_i = {
     /* .memset_tensor   = */ ggml_backend_metal_buffer_private_memset_tensor,
     /* .set_tensor      = */ ggml_backend_metal_buffer_private_set_tensor,
     /* .get_tensor      = */ ggml_backend_metal_buffer_private_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
     /* .cpy_tensor      = */ ggml_backend_metal_buffer_private_cpy_tensor,
     /* .clear           = */ ggml_backend_metal_buffer_private_clear,
     /* .reset           = */ NULL,
+    /* .set_tensor_n    = */ NULL,
+    /* .get_tensor_n    = */ NULL,
+    /* .cpy_tensor_n    = */ NULL,
 };
 
 static bool ggml_backend_buffer_is_metal(ggml_backend_buffer_t buffer) {
@@ -295,9 +308,11 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_shared(int devi
                 /* .iface = */ {
                     /* .get_name         = */ ggml_backend_metal_buffer_type_shared_get_name,
                     /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_shared_alloc_buffer,
+                    /* .alloc_buffer_n   = */ NULL,
                     /* .get_alignment    = */ ggml_backend_metal_buffer_type_shared_get_alignment,
                     /* .get_max_size     = */ ggml_backend_metal_buffer_type_shared_get_max_size,
                     /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_shared_get_alloc_size,
+                    /* .get_alloc_size_n = */ NULL,
                     /* .is_host          = */ ggml_backend_metal_buffer_type_shared_is_host,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
@@ -370,9 +385,11 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_private(int dev
                 /* .iface = */ {
                     /* .get_name         = */ ggml_backend_metal_buffer_type_private_get_name,
                     /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_private_alloc_buffer,
+                    /* .alloc_buffer_n   = */ NULL,
                     /* .get_alignment    = */ ggml_backend_metal_buffer_type_private_get_alignment,
                     /* .get_max_size     = */ ggml_backend_metal_buffer_type_private_get_max_size,
                     /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_private_get_alloc_size,
+                    /* .get_alloc_size_n = */ NULL,
                     /* .is_host          = */ ggml_backend_metal_buffer_type_private_is_host,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
@@ -448,9 +465,11 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_mapped(int devi
                 /* .iface = */ {
                     /* .get_name         = */ ggml_backend_metal_buffer_type_mapped_get_name,
                     /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_mapped_alloc_buffer,
+                    /* .alloc_buffer_n   = */ NULL,
                     /* .get_alignment    = */ ggml_backend_metal_buffer_type_mapped_get_alignment,
                     /* .get_max_size     = */ ggml_backend_metal_buffer_type_mapped_get_max_size,
                     /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_mapped_get_alloc_size,
+                    /* .get_alloc_size_n = */ NULL,
                     /* .is_host          = */ ggml_backend_metal_buffer_type_mapped_is_host,
                 },
                 /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
@@ -544,10 +563,17 @@ static void ggml_backend_metal_event_wait(ggml_backend_t backend, ggml_backend_e
     ggml_metal_event_wait(ctx, ev);
 }
 
-static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    GGML_ASSERT(params && params->add_alloc_dep);
     ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_graph_optimize(ctx, cgraph);
+    const bool small = ggml_metal_fuse_small_enabled();
+    if (small) {
+        ggml_metal_graph_optimize(ctx, cgraph);
+    }
+    ggml_metal_fusion_add_alloc_deps(params->user_data, params->add_alloc_dep, cgraph);
+    if (!small) {
+        ggml_metal_graph_optimize(ctx, cgraph);
+    }
 }
 
 static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
@@ -563,6 +589,8 @@ static ggml_backend_i ggml_backend_metal_i = {
     /* .free                    = */ ggml_backend_metal_free,
     /* .set_tensor_async        = */ ggml_backend_metal_set_tensor_async,
     /* .get_tensor_async        = */ ggml_backend_metal_get_tensor_async,
+    /* .set_tensor_2d_async     = */ NULL,
+    /* .get_tensor_2d_async     = */ NULL,
     /* .cpy_tensor_async        = */ ggml_backend_metal_cpy_tensor_async, // only needed for multi-GPU setups
     /* .synchronize             = */ ggml_backend_metal_synchronize,
     /* .graph_plan_create       = */ NULL,
@@ -616,6 +644,17 @@ void ggml_backend_metal_set_abort_callback(ggml_backend_t backend, ggml_abort_ca
     ggml_metal_set_abort_callback(ctx, abort_callback, user_data);
 }
 
+void ggml_backend_metal_set_model_profile(ggml_backend_t backend,
+        uint32_t n_embd, uint32_t n_ff, uint32_t n_layer,
+        uint32_t n_head, uint32_t n_head_kv) {
+    GGML_ASSERT(ggml_backend_is_metal(backend));
+
+    ggml_metal_t ctx = (ggml_metal_t)backend->context;
+    ggml_metal_device_t dev = ggml_metal_get_dev(ctx);
+
+    ggml_metal_device_set_model_profile(dev, n_embd, n_ff, n_layer, n_head, n_head_kv);
+}
+
 bool ggml_backend_metal_supports_family(ggml_backend_t backend, int family) {
     GGML_ASSERT(ggml_backend_is_metal(backend));
 
@@ -631,6 +670,65 @@ void ggml_backend_metal_capture_next_compute(ggml_backend_t backend) {
 
     ggml_metal_capture_next_compute(ctx);
 }
+
+int ggml_backend_metal_profile_window(int n_graphs) {
+    return ggml_metal_profile_window(n_graphs);
+}
+
+int ggml_backend_metal_test_candidate_loader_version(void) {
+    return GGML_METAL_TEST_CANDIDATE_LOADER_VERSION;
+}
+
+#ifdef GGML_METAL_TEST_OBSERVER
+bool ggml_backend_metal_test_tensor_range(
+        ggml_backend_t backend, const struct ggml_tensor * tensor,
+        struct ggml_backend_metal_test_tensor_range * range) {
+    if (!range || !ggml_backend_is_metal(backend) || !tensor) {
+        return false;
+    }
+
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (!buffer || !buffer->context || !ggml_backend_buffer_is_metal(buffer) || !tensor->data) {
+        return false;
+    }
+
+    if (tensor->type < 0 || tensor->type >= GGML_TYPE_COUNT) {
+        return false;
+    }
+
+    size_t length = 0;
+    if (!ggml_metal_test_observer_checked_span(tensor->ne, tensor->nb,
+            ggml_type_size(tensor->type), ggml_blck_size(tensor->type), &length)) {
+        return false;
+    }
+    const uintptr_t base = (uintptr_t) ggml_backend_buffer_get_base(buffer);
+    const uintptr_t data = (uintptr_t) tensor->data;
+    const size_t buffer_size = ggml_backend_buffer_get_size(buffer);
+    if (!ggml_metal_test_observer_checked_range(true, base, data, buffer_size, length)) {
+        return false;
+    }
+
+    const ggml_metal_buffer_id id = ggml_metal_buffer_get_id_checked((ggml_metal_buffer_t) buffer->context, tensor, length);
+    if (!ggml_metal_test_observer_mapped_range((uintptr_t) id.metal, id.offs, length)) {
+        return false;
+    }
+
+    range->metal_buffer_id = (uintptr_t) id.metal;
+    range->offset = id.offs;
+    range->length = length;
+    return true;
+}
+
+void ggml_backend_metal_test_set_observer(
+        ggml_backend_t backend, ggml_backend_metal_test_observer_callback callback,
+        void * user_data) {
+    if (!ggml_backend_is_metal(backend)) {
+        return;
+    }
+
+    ggml_metal_test_set_observer((ggml_metal_t) backend->context, callback, user_data);
+}
+#endif
 
 // backend device
 

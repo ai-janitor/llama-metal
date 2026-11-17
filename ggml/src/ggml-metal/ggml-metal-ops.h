@@ -1,6 +1,9 @@
 #pragma once
 
 #include "ggml-metal-device.h"
+#ifdef GGML_METAL_TEST_OBSERVER
+#include "ggml-metal.h"
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,7 +21,14 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_concurrency,
         bool use_capture,
         int  debug_graph,
-        int  debug_fusion);
+        int  debug_fusion,
+        ggml_metal_profiler_t profiler,
+        int  profiler_cb_idx
+#ifdef GGML_METAL_TEST_OBSERVER
+        , ggml_backend_metal_test_observer_callback observer,
+        void * observer_user_data
+#endif
+        );
 
 void ggml_metal_op_free(ggml_metal_op_t ctx);
 
@@ -56,6 +66,7 @@ int ggml_metal_op_set_rows          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_diag              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_conv_state        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_gated_delta_net   (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rwkv              (ggml_metal_op_t ctx, int idx);
@@ -72,6 +83,12 @@ int ggml_metal_op_bin               (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_l2_norm           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_group_norm        (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_norm              (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_norm_matvec       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_add_scale         (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_fuse_small        (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_conv_l2_target    (ggml_metal_op_t ctx, int from, const struct ggml_tensor * conv_out);
+int ggml_metal_op_attn_gate         (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_add_norm          (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_rope              (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_im2col            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_conv_2d           (ggml_metal_op_t ctx, int idx);

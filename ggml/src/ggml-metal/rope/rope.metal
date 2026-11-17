@@ -1,5 +1,9 @@
 #include "00-common.metal"
 
+// INTENT: apply rotations at the op-specified offset.
+// PDL: use offset-relative indices within the rotation interval.
+// Reference: ggml-org/llama.cpp 4e5116f47, kernels/rope.metal (MIT).
+
 constant bool FC_rope_is_imrope [[function_constant(FC_ROPE + 0)]];
 
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
@@ -54,8 +58,11 @@ kernel void kernel_rope_norm(
     const int i2 = tgpig[1];
     const int i1 = tgpig[0];
 
-    float corr_dims[2];
-    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    // the correction dims are read only when ext_factor != 0
+    float corr_dims[2] = { 0.0f, 0.0f };
+    if (args.ext_factor != 0.0f) {
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    }
 
     device const int32_t * pos = (device const int32_t *) src1;
 
@@ -66,14 +73,15 @@ kernel void kernel_rope_norm(
     float sin_theta;
 
     for (int i0 = 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
-        if (i0 < args.n_dims) {
-            const int ic = i0/2;
+        if (i0 >= args.n_offs && i0 < args.n_offs + args.n_dims) {
+            const int iw = i0 - args.n_offs;
+            const int ic = iw/2;
 
-            const float theta = theta_base * pow(args.freq_base, inv_ndims*i0);
+            const float theta = theta_base * pow(args.freq_base, inv_ndims*iw);
 
             const float freq_factor = args.src2 ? ((device const float *) src2)[ic] : 1.0f;
 
-            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, i0, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, iw, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
 
             device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + i0*args.nb00);
             device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + i0*args.nb0);
@@ -107,8 +115,11 @@ kernel void kernel_rope_neox(
     const int i2 = tgpig[1];
     const int i1 = tgpig[0];
 
-    float corr_dims[2];
-    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    // the correction dims are read only when ext_factor != 0
+    float corr_dims[2] = { 0.0f, 0.0f };
+    if (args.ext_factor != 0.0f) {
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    }
 
     device const int32_t * pos = (device const int32_t *) src1;
 
@@ -119,17 +130,18 @@ kernel void kernel_rope_neox(
     float sin_theta;
 
     for (int i0 = 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
-        if (i0 < args.n_dims) {
-            const int ic = i0/2;
+        if (i0 >= args.n_offs && i0 < args.n_offs + args.n_dims) {
+            const int iw = i0 - args.n_offs;
+            const int ic = iw/2;
 
-            const float theta = theta_base * pow(args.freq_base, inv_ndims*i0);
+            const float theta = theta_base * pow(args.freq_base, inv_ndims*iw);
 
             const float freq_factor = args.src2 ? ((device const float *) src2)[ic] : 1.0f;
 
-            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, i0, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, iw, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
 
-            device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + ic*args.nb00);
-            device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + ic*args.nb0);
+            device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + (args.n_offs + ic)*args.nb00);
+            device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + (args.n_offs + ic)*args.nb0);
 
             const float x0 = src[0];
             const float x1 = src[args.n_dims/2];
@@ -160,8 +172,11 @@ kernel void kernel_rope_multi(
     const int i2 = tgpig[1];
     const int i1 = tgpig[0];
 
-    float corr_dims[2];
-    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    // the correction dims are read only when ext_factor != 0
+    float corr_dims[2] = { 0.0f, 0.0f };
+    if (args.ext_factor != 0.0f) {
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    }
 
     device const int32_t * pos = (device const int32_t *) src1;
 
@@ -171,8 +186,9 @@ kernel void kernel_rope_multi(
     float sin_theta;
 
     for (int i0 = 2*tiitg; i0 < args.ne0; i0 += 2*tptg.x) {
-        if (i0 < args.n_dims) {
-            const int ic = i0/2;
+        if (i0 >= args.n_offs && i0 < args.n_offs + args.n_dims) {
+            const int iw = i0 - args.n_offs;
+            const int ic = iw/2;
 
             // mrope theta calculations
             // note: the rest is the same as kernel_rope_neox
@@ -205,14 +221,14 @@ kernel void kernel_rope_multi(
             }
             // end of mrope
 
-            const float theta = theta_base * pow(args.freq_base, inv_ndims*i0);
+            const float theta = theta_base * pow(args.freq_base, inv_ndims*iw);
 
             const float freq_factor = args.src2 ? ((device const float *) src2)[ic] : 1.0f;
 
-            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, i0, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
+            rope_yarn(theta/freq_factor, args.freq_scale, corr_dims, iw, args.ext_factor, args.attn_factor, &cos_theta, &sin_theta);
 
-            device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + ic*args.nb00);
-            device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + ic*args.nb0);
+            device const T * const src = (device T *)(src0 + i3*args.nb03 + i2*args.nb02 + i1*args.nb01 + (args.n_offs + ic)*args.nb00);
+            device       T * dst_data  = (device T *)( dst + i3*args.nb3  + i2*args.nb2  + i1*args.nb1  + (args.n_offs + ic)*args.nb0);
 
             const float x0 = src[0];
             const float x1 = src[args.n_dims/2];
@@ -243,8 +259,11 @@ kernel void kernel_rope_vision(
     const int i2 = tgpig[1];
     const int i1 = tgpig[0];
 
-    float corr_dims[2];
-    rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    // the correction dims are read only when ext_factor != 0
+    float corr_dims[2] = { 0.0f, 0.0f };
+    if (args.ext_factor != 0.0f) {
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+    }
 
     device const int32_t * pos = (device const int32_t *) src1;
 

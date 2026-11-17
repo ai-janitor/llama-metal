@@ -60,7 +60,11 @@ kernel void kernel_solve_tri_f32(
 
             for (short t = 0; t*NW < r; ++t) {
                 const short idx = t*NW + tiisg;
-                sum += sh0_cur[idx] * dst_ptr[idx*K] * (idx < r);
+                // Use branch instead of multiply-by-zero to avoid reading
+                // uninitialized dst values (NaN * 0 = NaN on discrete GPUs).
+                if (idx < r) {
+                    sum += sh0_cur[idx] * dst_ptr[idx*K];
+                }
             }
 
             sum = simd_sum(sum);

@@ -1,5 +1,8 @@
 #include "00-common.metal"
 
+// Upstream 4e5116f47 FU-MU-6 variant; existing reduction geometry retained.
+constant bool FC_norm_use_scale [[function_constant(FC_NORM + 0)]];
+
 // F == 1 : norm (no fuse)
 // F == 2 : norm + mul
 // F == 3 : norm + mul + add
@@ -149,17 +152,15 @@ kernel void kernel_rms_norm_fuse_impl(
 
     shmem_f32[tid] = sumf;
     // Pad entries beyond n_threads to 0 for non-power-of-2 sizes.
-    // Thread 0 handles padding since only a few extra slots are needed.
-    if (tid == 0) {
-        ushort np2 = 1;
-        while (np2 < n_threads) np2 <<= 1;
-        for (ushort i = n_threads; i < np2; i++) shmem_f32[i] = 0.0f;
-    }
+    // Thread 0 previously handled padding; widths such as 640 need 384 slots.
+    // Share those independent zero stores without changing the reduction tree.
+    ushort np2 = 1;
+    while (np2 < n_threads) np2 <<= 1;
+    for (ushort i = n_threads + tid; i < np2; i += n_threads) shmem_f32[i] = 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Tree reduction — round up to next power-of-2
-    ushort np2 = 1;
-    while (np2 < n_threads) np2 <<= 1;
+    // Reuse the same bound computed for padding above; additions stay identical.
     for (ushort s = np2 / 2; s > 0; s >>= 1) {
         if (tid < s) {
             shmem_f32[tid] += shmem_f32[tid + s];
@@ -177,7 +178,11 @@ kernel void kernel_rms_norm_fuse_impl(
             y[i00] = (x[i00]*scale);
         }
         if (F == 2) {
-            y[i00] = (x[i00]*scale)*f0[i00];
+            if (FC_norm_use_scale) {
+                y[i00] = (x[i00]*scale) * args.scale;
+            } else {
+                y[i00] = (x[i00]*scale)*f0[i00];
+            }
         }
         if (F == 3) {
             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];

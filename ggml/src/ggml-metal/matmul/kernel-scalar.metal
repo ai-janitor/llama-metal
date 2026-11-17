@@ -433,15 +433,16 @@ void kernel_mul_mv_t_t_impl(
     // At NW=32: 1 chunk (il has 4 values, 4 threads per block)
     // At NW=16: 2 chunks (il has 2 values, 2 threads per block)
     // At NW=8:  4 chunks (il has 1 value, 1 thread per block)
-    const short chunks_per_thread = NB / NW;  // = 32/NW
-    const short threads_per_blk   = NW / NF;  // threads sharing one block
+    const short chunks_per_thread = (NW <= NB) ? (NB / NW) : 1;
+    const short threads_per_blk   = min(NW, NB) / NF;
+    const short blocks_per_simdgroup = NW / threads_per_blk;
     const short ix = eff_tiisg / threads_per_blk;
 
-    const int ib0 = eff_sgitg*NF + ix;
+    const int ib0 = eff_sgitg*blocks_per_simdgroup + ix;
 
     T1 yl[NF];
 
-    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+    for (int ib = ib0; ib < nb; ib += NSG*blocks_per_simdgroup) {
         for (short c = 0; c < chunks_per_thread; c++) {
             const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
 
@@ -515,6 +516,7 @@ typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
 template [[host_name("kernel_mul_mv_f32_f32")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
 template [[host_name("kernel_mul_mv_f16_f32")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
 template [[host_name("kernel_mul_mv_f16_f16")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<half,  half>;
+template [[host_name("kernel_mul_mv_f32_f16")]]   kernel mul_mv_t_t kernel_mul_mv_t_t<float, half>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mv_bf16_f32")]]  kernel mul_mv_t_t kernel_mul_mv_t_t<bfloat, float>;
 template [[host_name("kernel_mul_mv_bf16_bf16")]] kernel mul_mv_t_t kernel_mul_mv_t_t<bfloat, bfloat>;
@@ -572,15 +574,17 @@ void kernel_mul_mv_t_t_4_impl(
 
     float sumf[NR0] = { 0.f };
 
-    const short chunks_per_thread = NB / NW;
-    const short threads_per_blk   = NW / NF;
+    // Split each NB-element block over the available SIMD lanes, including NW > NB.
+    const short chunks_per_thread = NB >= NW ? NB / NW : 1;
+    const short threads_per_blk   = min(NW, NB) / NF;
+    const short blocks_per_simdgroup = NW / threads_per_blk;
     const short ix = eff_tiisg / threads_per_blk;
 
-    const int ib0 = eff_sgitg*NF + ix;
+    const int ib0 = eff_sgitg*blocks_per_simdgroup + ix;
 
     T14 yl4[NF4];
 
-    for (int ib = ib0; ib < nb; ib += NSG*NF) {
+    for (int ib = ib0; ib < nb; ib += NSG*blocks_per_simdgroup) {
         for (short c = 0; c < chunks_per_thread; c++) {
             const short il = eff_tiisg % threads_per_blk * chunks_per_thread + c;
 
@@ -661,6 +665,7 @@ typedef decltype(kernel_mul_mv_t_t_4<half, half4, half, half4>) mul_mv_t_t_4;
 template [[host_name("kernel_mul_mv_f32_f32_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, float, float4>;
 template [[host_name("kernel_mul_mv_f16_f32_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  float, float4>;
 template [[host_name("kernel_mul_mv_f16_f16_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<half,  half4,  half,  half4>;
+template [[host_name("kernel_mul_mv_f32_f16_4")]]   kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<float, float4, half, half4>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mv_bf16_f32_4")]]  kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, float,  float4>;
 template [[host_name("kernel_mul_mv_bf16_bf16_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, bfloat, bfloat4>;
@@ -729,6 +734,7 @@ typedef decltype(kernel_mul_mv_t_t_short<half, half>) mul_mv_t_t_short_t;
 template [[host_name("kernel_mul_mv_f32_f32_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<float, float>;
 template [[host_name("kernel_mul_mv_f16_f32_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<half,  float>;
 template [[host_name("kernel_mul_mv_f16_f16_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<half,  half>;
+template [[host_name("kernel_mul_mv_f32_f16_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<float, half>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mv_bf16_f32_short")]]  kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<bfloat, float>;
 template [[host_name("kernel_mul_mv_bf16_bf16_short")]] kernel mul_mv_t_t_short_t kernel_mul_mv_t_t_short<bfloat, bfloat>;

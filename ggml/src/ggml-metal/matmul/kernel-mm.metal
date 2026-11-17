@@ -862,13 +862,25 @@ kernel void kernel_mul_mv_id(
         uint3  tgpig[[threadgroup_position_in_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort3 ntg[[threads_per_threadgroup]]) {
     const int iid1 = tgpig.z/args.nei0;
     const int idx  = tgpig.z%args.nei0;
 
     tgpig.z = 0;
 
     const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+
+    // Reference: ggml-org/llama.cpp 4e5116f47, kernels/mul_mv.metal:3344-3350 (MIT).
+    // Skipped experts produce zeros, without reading memory before the weight tensor.
+    if (i02 == -1) {
+        device float * out = (device float *) dst + (idx + iid1*args.ne1)*args.ne0;
+        const ushort nth = ntg.x*ntg.y*ntg.z;
+        for (int i = tiitg; i < args.ne0; i += nth) {
+            out[i] = 0.0f;
+        }
+        return;
+    }
 
     const int64_t i11 = idx % args.ne11;
     const int64_t i12 = iid1;

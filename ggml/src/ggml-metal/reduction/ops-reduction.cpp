@@ -176,7 +176,7 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
     }
 
     if (ne00 > nth) {
-        ggml_metal_op_concurrency_reset(ctx);
+        ggml_metal_op_concurrency_reset(ctx, idx);
 
         {
             ggml_metal_kargs_cumsum_blk args = {
@@ -210,7 +210,7 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, net1, net2, net3, nth, 1, 1);
         }
 
-        ggml_metal_op_concurrency_reset(ctx);
+        ggml_metal_op_concurrency_reset(ctx, idx);
 
         {
             auto pipeline_add = ggml_metal_library_get_pipeline_cumsum_add(lib, op);

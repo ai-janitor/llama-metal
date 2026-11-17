@@ -1,65 +1,69 @@
 #ifndef GGML_METAL_IMPL
 #define GGML_METAL_IMPL
 
-// kernel parameters for mat-vec threadgroups
-//
-// N_R0: number of src0 rows to process per simdgroup
-// N_SG: number of simdgroups per threadgroup
-//
-// TODO: for optimal performance, become function of the device and work size
+// =============================================================================
+// Shared conservative matvec geometry.
+// Static kernels and host tuning both read these named constants; dynamic basic
+// specializations additionally accept the pipeline's function-constant row count.
+// UNTIED: baseline rows/simdgroups are compile-time tuning constants, not device gates.
 
-#define N_R0_Q4_0 4
+#define N_R0_BASIC 2 // shared baseline specialization for basic quant kernels
+#define N_R0_Q4_0 N_R0_BASIC
 #define N_SG_Q4_0 2
 
-#define N_R0_Q4_1 4
+#define N_R0_Q4_1 N_R0_BASIC
 #define N_SG_Q4_1 2
 
-#define N_R0_Q5_0 4
+#define N_R0_Q5_0 N_R0_BASIC
 #define N_SG_Q5_0 2
 
-#define N_R0_Q5_1 4
+#define N_R0_Q5_1 N_R0_BASIC
 #define N_SG_Q5_1 2
 
-#define N_R0_Q8_0 2
-#define N_SG_Q8_0 4
+#define N_R0_Q8_0 4
+#define N_SG_Q8_0 2
 
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
-#define N_R0_Q2_K 4
+// Shared activation reuse factor for MUL_MAT_ID k-quant templates.
+// Conservative default, shared with host tuning.
+#define N_R0_KQUANT 2
+
+#define N_R0_Q2_K N_R0_KQUANT
 #define N_SG_Q2_K 2
 
-#define N_R0_Q3_K 2
+#define N_R0_Q3_K N_R0_KQUANT
 #define N_SG_Q3_K 2
 
-#define N_R0_Q4_K 2
+#define N_R0_Q4_K N_R0_KQUANT
 #define N_SG_Q4_K 2
 
-#define N_R0_Q5_K 2
+#define N_R0_Q5_K N_R0_KQUANT
 #define N_SG_Q5_K 2
 
-#define N_R0_Q6_K 2
+#define N_R0_Q6_K N_R0_KQUANT
 #define N_SG_Q6_K 2
 
-#define N_R0_IQ1_S 4
+#define N_R0_IQ1_S 2
 #define N_SG_IQ1_S 2
 
-#define N_R0_IQ1_M 4
+#define N_R0_IQ1_M 2
 #define N_SG_IQ1_M 2
 
-#define N_R0_IQ2_XXS 4
+#define N_R0_IQ2_XXS 2
 #define N_SG_IQ2_XXS 2
 
-#define N_R0_IQ2_XS 4
+#define N_R0_IQ2_XS 2
 #define N_SG_IQ2_XS 2
 
-#define N_R0_IQ2_S 4
+#define N_R0_IQ2_S 2
 #define N_SG_IQ2_S 2
 
-#define N_R0_IQ3_XXS 4
+#define N_R0_IQ3_XXS 2
 #define N_SG_IQ3_XXS 2
 
-#define N_R0_IQ3_S 4
+#define N_R0_IQ3_S 2
 #define N_SG_IQ3_S 2
 
 #define N_R0_IQ4_NL 2
@@ -75,15 +79,29 @@
 #define FC_FLASH_ATTN_EXT_VEC          400
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE   500
 #define FC_MUL_MV                      600
+// FC_MUL_MV + 0: nsg (int16)      — simdgroups per threadgroup
+// FC_MUL_MV + 1: nxpsg (int16)    — threads along K per simdgroup (ext kernels only)
+// FC_MUL_MV + 2: shmem_reduce (bool) — use barrier-based reduction (NW != 32)
+// FC_MUL_MV + 3: src1_trans (bool) — transposed src1 specialization
+// FC_MUL_MV + 4: nr0 (int16)      — rows per simdgroup (dynamic, from model/hw profile)
+// FC_MUL_MV + 10: q8_load (int16) — Q8_0 weight load width in bytes: 1 or 4 (aligned words)
+#define FC_MATVEC_LANE              (FC_MUL_MV + 5) // int16: shared faithful/fast matvec lane
+#define FC_MUL_MV_RESIDUAL          (FC_MUL_MV + 6) // bool: scalar Q4_K residual epilogue
 #define FC_MUL_MM                      700
 #define FC_ROPE                        800
+#define FC_NORM                        1700
 #define FC_SSM_CONV                    900
+#define FC_GATED_DELTA_NET             950  // +0: elements per thread (NSG); +1: vector transport
 #define FC_SOLVE_TRI                   1000
 #define FC_COUNT_EQUAL                 1100
 #define FC_UNARY                       1200
 #define FC_BIN                         1300
 #define FC_SUM_ROWS                    1400
+#define FC_MUL_MV_GROUPED              1550  // function constants for grouped matvec kernel
 #define FC_SIMD_WIDTH                  1500
+#define FC_MUL_MV_GROUP                1660  // +0: matrices in one launch (int16)
+#define FC_SMALL_ATTN_GATE             1670  // +0: elements per thread (int16)
+#define FC_NORM_MUL_MV                 1650  // +0: matrices (int16), +1: mean given (bool), +2: lanes per row (int16)
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -305,6 +323,7 @@ typedef struct {
     int32_t  sect_1;
     int32_t  sect_2;
     int32_t  sect_3;
+    int32_t  n_offs; // shared host/kernel rotation offset, op param 15
     bool     src2;
 } ggml_metal_kargs_rope;
 
@@ -451,7 +470,30 @@ typedef struct {
     int16_t  r3;
     int32_t  tg_x_offset; // grid X offset for chunked dispatch (Intel timeout avoidance)
     int32_t  tg_y_offset; // grid Y offset for 2D chunked dispatch
+    int32_t  n_tg_x;      // grid X dimension — stride for persistent threadgroup loop (0 = non-persistent)
+    int32_t  compute_units; // number of CUs on this GPU (for CU-local row clustering, 0 = disabled)
+    int32_t  grid_x;       // total threadgroups in X dimension (needed for kernel-side CU remapping)
 } ggml_metal_kargs_mul_mv;
+
+typedef struct {
+    uint64_t nb01_0;   // row stride of each matrix, a separate field each: the kernel picks one by compile-time K, never by index
+    uint64_t nb01_1;
+    uint64_t nb01_2;
+    uint64_t nb01_3;
+    int32_t  ne00;
+    float    eps;
+    int32_t  rows0;
+    int32_t  rows1;
+    int32_t  rows2;
+    int32_t  rows3;
+    int32_t  start1;   // first group of matrix 1, 2, 3 (groups walk matrix 0, then 1, ...)
+    int32_t  start2;
+    int32_t  start3;
+} ggml_metal_kargs_norm_mul_mv;
+
+typedef struct {
+    int32_t  ne0;
+} ggml_metal_kargs_add_scale;
 
 typedef struct {
     int32_t  ne00;
@@ -544,7 +586,29 @@ typedef struct {
     uint64_t nbf1[3];
     uint64_t nbf2[3];
     uint64_t nbf3[3];
+    float scale;
 } ggml_metal_kargs_norm;
+
+typedef struct {
+    int32_t ne0;
+    int32_t ne1;
+    int32_t ne2;
+    int32_t ne3;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+} ggml_metal_kargs_small_gate;
+
+typedef struct {
+    ggml_metal_kargs_norm norm[2];
+    int32_t ne[2][3];
+    uint64_t nbg1;
+    uint64_t nbg2;
+    uint64_t nbg3;
+} ggml_metal_kargs_small_norm;
 
 typedef struct {
     int32_t  ne00;
@@ -766,6 +830,25 @@ typedef struct {
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
+    int32_t  nc;        // conv width (taps); the state holds nc - 1 columns
+    int32_t  channels;
+    uint64_t nbs1;      // state channel stride (bytes)
+    uint64_t nbx1;      // input channel stride (bytes)
+    uint64_t nbw1;      // weight channel stride (bytes)
+} ggml_metal_kargs_conv_state;
+
+// conv_state + the split_l2 of its q and k heads in one launch (hw row conv_l2_fold)
+typedef struct {
+    ggml_metal_kargs_conv_state cs;
+    int32_t  head_dim;   // channels per head (one threadgroup per head)
+    int32_t  rows[2];    // q heads, k heads (k heads follow the q heads in the conv output)
+    int32_t  ne00[2];    // split_l2's ne00 (the mean's divisor)
+    float    eps[2];
+    float    scale[2];
+    uint64_t nb1[2];     // out row strides, bytes
+} ggml_metal_kargs_conv_state_l2;
+
+typedef struct {
     int64_t  d_state;
     int64_t  d_inner;
     int64_t  n_head;
@@ -799,17 +882,44 @@ typedef struct {
     uint64_t nb0;
 } ggml_metal_kargs_ssm_scan;
 
-// Fused gated delta-net recurrence kernel args.
-// Replaces 16 elementwise dispatches per SSM layer with one fused kernel.
-// State stays in GPU registers — no intermediate device memory traffic.
+// Current upstream GDN tensor/stride/snapshot contract (4e5116f47, MIT).
 typedef struct {
-    int32_t  S;              // state dimension (S_v = S_k for delta-net)
-    int32_t  H;              // number of value heads
-    int32_t  n_tokens;       // number of tokens in this batch (1 for decode)
-    int32_t  n_seqs;         // number of sequences
-    int32_t  H_k;            // number of key heads (for GQA, H_k <= H)
-    float    scale;          // 1/sqrt(S)
-    int32_t  has_state_dst;  // 1 if src[6] provides direct state write target
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    int32_t  ne20;
+    int32_t  ne21;
+    int32_t  ne22;
+    int32_t  ne23;
+    uint64_t nb20;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ns02;
+    int32_t  ns12;
+    int32_t  ns22;
+    int32_t  ne0;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    uint64_t nb0;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb3;
+    uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {

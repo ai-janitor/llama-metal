@@ -1,12 +1,14 @@
 #import "ggml-metal-context.h"
 
 #import <mach/mach_time.h>
+#import <pthread.h>
 
 #import "ggml-impl.h"
 #import "ggml-backend-impl.h"
 
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
+#import "ggml-metal-command-buffer-error.h"
 #import "ggml-metal-ops.h"
 #import "ggml-device-profile.h"
 
@@ -21,10 +23,6 @@
 
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
-
-struct ggml_metal_command_buffer {
-    id<MTLCommandBuffer> obj;
-};
 
 struct ggml_metal {
     char name[128];
@@ -42,9 +40,26 @@ struct ggml_metal {
     bool use_fusion;
     bool use_concurrency;
     bool use_graph_optimize;
-    int profile;        // GGML_METAL_PROFILE: 0=off, 1=per-graph GPU timing, 2=per-op GPU timing
-    int profile_n;      // number of graph computes left to profile at level 2 (then auto-drops to 1)
+#ifdef GGML_METAL_TEST_OBSERVER
+    ggml_backend_metal_test_observer_callback observer;
+    void * observer_user_data;
+#endif
+    int profile;        // GGML_METAL_PROFILE: 0=off, 1=per-graph GPU timing, 2=per-op GPU timing, 3=per-dispatch timestamps
+    int profile_n;      // number of graph computes left to profile at level 2/3 (then auto-drops to 1)
     uint64_t profile_cpu_start; // mach_absolute_time at graph_compute start (for CPU vs GPU comparison)
+
+    // per-dispatch profiler (profile=3): uses MTLCounterSampleBuffer for GPU timestamps
+    // in the normal async multi-CB path without serializing execution
+    ggml_metal_profiler_t profiler;
+
+    // explicit profile window (ggml_metal_profile_window). All fields are zero after calloc, which keeps
+    // the legacy GGML_METAL_PROFILE behavior byte-for-byte: window_enabled == false selects the original branches.
+    int  profile_ctor;            // profile level requested at init (before the unsupported-counter fallback to 1);
+                                  // a window may only arm a context that requested 3 AND still owns a profiler
+    bool window_enabled;          // true once armed: graphs are profiled only while window_left > 0, profile stays 3
+    int  window_left;             // graphs still to profile in the armed window; decremented once per reported graph
+    bool window_graph_active;     // true between begin_graph (graph_compute) and its report (synchronize)
+    struct ggml_metal * registry_next; // intrusive link in the g_registry list; protected by g_registry_mutex
 
     int debug_graph;
     int debug_fusion;
@@ -82,6 +97,14 @@ struct ggml_metal {
     ggml_abort_callback abort_callback;
     void *              abort_callback_data;
 };
+
+// Registry of fully initialized contexts, visited by ggml_metal_profile_window.
+// Invariant: a context is linked only between the end of ggml_metal_init (success) and the start of
+// ggml_metal_free, so the list never holds a failed/partial or freed context. The one mutex serializes
+// list changes, arming, and context lifetime (init-register / unregister-free) against each other.
+// It is NOT held across any GPU wait or dispatch; callers must quiesce the contexts before arming.
+static pthread_mutex_t g_registry_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct ggml_metal * g_registry_head = NULL;
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
@@ -139,11 +162,30 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
 
+    // P16.16 experiment flag, default off: GGML_METAL_CONCURRENCY_ALLOW_NONUMA=1 (literal "1" only; absent, "0" or
+    // anything malformed is false) lets the existing concurrent encoder path run on a non-UMA GPU. It never changes
+    // the UMA path and never overrides GGML_METAL_CONCURRENCY_DISABLE (presence of DISABLE keeps concurrency off).
+    const bool concurrency_requested = res->use_concurrency;
+    const char * allow_nonuma_env    = getenv("GGML_METAL_CONCURRENCY_ALLOW_NONUMA");
+    const bool concurrency_allow_nonuma = allow_nonuma_env != NULL && strcmp(allow_nonuma_env, "1") == 0;
+    const bool device_nonuma            = !profile->shared_memory;
+
     // MTLDispatchTypeConcurrent causes NaN on discrete (non-UMA) GPUs like AMD Radeon
-    if (res->use_concurrency && !profile->shared_memory) {
-        GGML_LOG_WARN("%s: disabling concurrent dispatch (not supported on non-UMA devices)\n", __func__);
-        res->use_concurrency = false;
+    // The fence below is kept as is; only the explicit opt-in above steps past it.
+    if (res->use_concurrency && device_nonuma) {
+        if (concurrency_allow_nonuma) {
+            GGML_LOG_WARN("%s: EXPERIMENTAL: GGML_METAL_CONCURRENCY_ALLOW_NONUMA=1 overrides the non-UMA concurrent dispatch "
+                          "safety fence (known NaN on discrete GPUs); no hardware correctness or support is claimed\n", __func__);
+        } else {
+            GGML_LOG_WARN("%s: disabling concurrent dispatch (not supported on non-UMA devices)\n", __func__);
+            res->use_concurrency = false;
+        }
     }
+
+    // One-shot trace so a runner can prove the override was (or was not) applied before generation
+    GGML_LOG_INFO("%s: concurrency requested = %d, effective = %d, device_nonuma = %d, disable = %d, allow_nonuma = %d\n",
+            __func__, concurrency_requested, res->use_concurrency, device_nonuma,
+            getenv("GGML_METAL_CONCURRENCY_DISABLE") != NULL, concurrency_allow_nonuma);
 
     {
         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
@@ -157,13 +199,25 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->use_graph_optimize = true;
 
-    // GGML_METAL_PROFILE: 0=off (default), 1=per-graph GPU wall time, 2=per-op GPU timing breakdown
+    // GGML_METAL_PROFILE: 0=off (default), 1=per-graph GPU wall time, 2=per-op GPU timing breakdown,
+    // 3=per-dispatch timestamp sampling (async, uses MTLCounterSampleBuffer)
     // Setting the env var without a value (or empty) defaults to 1 for backward compatibility
-    // Profile=2 runs for 2 graph computes (prompt + first decode), then drops to level 1
+    // Profile=2/3 runs for 2 graph computes (prompt + first decode), then drops to level 1
     {
         const char * val = getenv("GGML_METAL_PROFILE");
         res->profile   = val ? (val[0] ? atoi(val) : 1) : 0;
         res->profile_n = (res->profile >= 2) ? 2 : 0;
+        res->profile_ctor = res->profile; // remember the request: the fallback below must not make a window arm this context
+    }
+
+    // init per-dispatch profiler for profile=3
+    // if counter sampling is unsupported, profiler_init returns NULL and we fall back to profile=1
+    res->profiler = NULL;
+    if (res->profile == 3) {
+        res->profiler = ggml_metal_profiler_init(dev, 3);
+        if (!res->profiler) {
+            res->profile = 1; // fallback
+        }
     }
 
     if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
@@ -192,11 +246,29 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->pipelines_ext = ggml_metal_pipelines_init();
 
+    // register only now: every earlier return path left the context unregistered
+    pthread_mutex_lock(&g_registry_mutex);
+    res->registry_next = g_registry_head;
+    g_registry_head = res;
+    pthread_mutex_unlock(&g_registry_mutex);
+
     return res;
 }
 
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+
+    // unregister before the profiler/context are freed so ggml_metal_profile_window never sees a dangling context
+    pthread_mutex_lock(&g_registry_mutex);
+    for (struct ggml_metal ** link = &g_registry_head; *link; link = &(*link)->registry_next) {
+        if (*link == ctx) {
+            *link = ctx->registry_next;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_registry_mutex);
+
+    ggml_metal_profiler_free(ctx->profiler);
 
     ggml_metal_transfer_stats_report();
 
@@ -251,10 +323,37 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
-void ggml_metal_synchronize(ggml_metal_t ctx) {
+static enum ggml_status ggml_metal_synchronize_checked(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
+        const bool l0_trace = ggml_l0_enabled();
+        const double l0_wait_start = l0_trace ? ggml_l0_now() : 0;
         [ctx->cmd_buf_last waitUntilCompleted];
+        if (l0_trace) {
+            ggml_l0_event("host_wait", l0_wait_start, ggml_l0_now(), 0);
+            for (int cb_idx = 0; cb_idx <= ctx->n_cb; ++cb_idx) {
+                id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
+                if (cmd_buf) {
+                    const double start = [cmd_buf GPUStartTime];
+                    const double end = [cmd_buf GPUEndTime];
+                    ggml_l0_event(start == 0 || end == 0 || end < start ? "gpu_graph_cb_invalid" : "gpu_graph_cb", start, end, cb_idx);
+                }
+            }
+        }
+
+        // GGML_METAL_PROFILE=3: resolve counter sample buffers and print per-dispatch report.
+        // Must happen after waitUntilCompleted but before cmd_buf_last is cleared.
+        if (ctx->profile == 3 && ctx->profiler) {
+            if (!ctx->window_enabled) {
+                ggml_metal_profiler_end_graph(ctx->profiler);
+            } else if (ctx->window_graph_active) {
+                // explicit window: report only a graph that began under the window, and consume exactly one
+                // unit of the budget for it; a repeated synchronize or an unrelated command finds active == false
+                ggml_metal_profiler_end_graph(ctx->profiler);
+                ctx->window_graph_active = false;
+                ctx->window_left--;
+            }
+        }
 
         // GGML_METAL_PROFILE=1: read GPU timestamps immediately after completion,
         // before cmd_buf_last is cleared. GPUStartTime/GPUEndTime are only
@@ -292,54 +391,49 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
                 mach_timebase_info(&tb);
                 double cpu_ms = (double)(mach_absolute_time() - ctx->profile_cpu_start) * tb.numer / tb.denom / 1e6;
 
-                fprintf(stderr, "[METAL_PROFILE] graph: %d cmd_bufs, GPU wall=%.2f ms, CPU wall=%.2f ms, gap=%.2f ms (%d nodes)\n",
-                    n_active, wall_ms, cpu_ms, cpu_ms - wall_ms, ctx->gf->n_nodes);
+                // Print absolute GPU start/end times for cross-device overlap analysis.
+                // GPUStartTime/GPUEndTime are CFAbsoluteTime (seconds since 2001-01-01),
+                // so differences between devices are directly comparable.
+                // We print modulo 1000s to keep the numbers readable while preserving
+                // sub-millisecond precision for overlap calculation.
+                fprintf(stderr, "[METAL_PROFILE] %s: %d cmd_bufs, GPU wall=%.2f ms, CPU wall=%.2f ms, gap=%.2f ms "
+                    "(abs start=%.6f end=%.6f, %d nodes)\n",
+                    ctx->name, n_active, wall_ms, cpu_ms, cpu_ms - wall_ms,
+                    fmod(gpu_min_start, 1000.0), fmod(gpu_max_end, 1000.0),
+                    ctx->gf->n_nodes);
             }
         }
 
         ctx->cmd_buf_last = nil;
     }
 
-    // check status of all command buffers
-    {
-        const int n_cb = ctx->n_cb;
-
-        for (int cb_idx = 0; cb_idx <= n_cb; ++cb_idx) {
-            id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
-            if (!cmd_buf) {
-                continue;
-            }
-
-            MTLCommandBufferStatus status = [cmd_buf status];
-            if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: command buffer %d failed with status %d\n", __func__, cb_idx, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
-                }
-                GGML_ABORT("fatal error");
-            }
-        }
-    }
-
-    // release any completed extra command buffers
-    if (ctx->cmd_bufs_ext.count > 0) {
+    if (ggml_l0_enabled()) {
         for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
             id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs_ext[i];
-
-            MTLCommandBufferStatus status = [cmd_buf status];
-            if (status != MTLCommandBufferStatusCompleted) {
-                GGML_LOG_ERROR("%s: error: ext command buffer %d failed with status %d\n", __func__, (int) i, (int) status);
-                if (status == MTLCommandBufferStatusError) {
-                    GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
-                }
-                GGML_ABORT("fatal error");
-            }
-
-            [cmd_buf release];
+            const double start = [cmd_buf GPUStartTime];
+            const double end = [cmd_buf GPUEndTime];
+            ggml_l0_event(start == 0 || end == 0 || end < start ? "gpu_ext_cb_invalid" : "gpu_ext_cb", start, end, i);
         }
-
-        [ctx->cmd_bufs_ext removeAllObjects];
     }
+
+    // Final status/drain is the shared policy in the error module: with a registered handler every buffer is
+    // waited/checked/released before FAILED returns; without one the first failure aborts as before.
+    return ggml_metal_complete_command_buffers(ctx->cmd_bufs, (size_t) ctx->n_cb + 1, ctx->cmd_bufs_ext);
+}
+
+// Failure of a synchronous profile/capture command buffer: shared nonfatal policy (reports to the hook if any,
+// FAILED either way). With a hook, pending main/extra buffers are drained of references before returning.
+static enum ggml_status ggml_metal_graph_failed(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf, int index) {
+    const enum ggml_status status = ggml_metal_check_command_buffer(cmd_buf, index, false, false);
+    if (ggml_metal_gpu_error_callback_registered()) {
+        ctx->cmd_buf_last = nil;
+        ggml_metal_discard_command_buffers(ctx->cmd_bufs, (size_t) ctx->n_cb + 1, ctx->cmd_bufs_ext);
+    }
+    return status;
+}
+
+void ggml_metal_synchronize(ggml_metal_t ctx) {
+    (void) ggml_metal_synchronize_checked(ctx);
 }
 
 static struct ggml_metal_buffer_id ggml_metal_get_buffer_id(const struct ggml_tensor * t) {
@@ -374,7 +468,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        id<MTLCommandBuffer> cmd_buf = ggml_metal_new_command_buffer(queue, false);
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
         [encoder copyFromBuffer:buf_src
@@ -407,12 +501,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
     @autoreleasepool {
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
-        id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
-                                                          length:size
-                                                         options:MTLResourceStorageModeShared
-                                                     deallocator:nil];
-
-        GGML_ASSERT(buf_dst);
+        const struct ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
 
         struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
         if (bid_src.metal == nil) {
@@ -421,30 +510,67 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         bid_src.offs += offset;
 
-        // queue the copy operation into the queue of the Metal context
-        // this will be queued at the end, after any currently ongoing GPU operations
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        id<MTLCommandBuffer> cmd_buf = ggml_metal_new_command_buffer(queue, false);
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
-        [encoder copyFromBuffer:bid_src.metal
-                   sourceOffset:bid_src.offs
-                       toBuffer:buf_dst
-              destinationOffset:0
-                           size:size];
+        if (props_dev->use_shared_buffers) {
+            // UMA: wrap the destination pointer directly — zero-copy readback
+            id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
+                                                              length:size
+                                                             options:MTLResourceStorageModeShared
+                                                         deallocator:nil];
+            GGML_ASSERT(buf_dst);
 
-        [encoder endEncoding];
-        [cmd_buf commit];
-        [buf_dst release];
+            [encoder copyFromBuffer:bid_src.metal
+                       sourceOffset:bid_src.offs
+                           toBuffer:buf_dst
+                  destinationOffset:0
+                               size:size];
 
-        // do not wait here for completion
-        //[cmd_buf waitUntilCompleted];
+            [encoder endEncoding];
+            [cmd_buf commit];
+            [buf_dst release];
 
-        // instead, remember a reference to the command buffer and wait for it later if needed
-        [ctx->cmd_bufs_ext addObject:cmd_buf];
-        ctx->cmd_buf_last = cmd_buf;
+            // do not wait here for completion
+            //[cmd_buf waitUntilCompleted];
 
-        [cmd_buf retain];
+            // instead, remember a reference to the command buffer and wait for it later if needed
+            [ctx->cmd_bufs_ext addObject:cmd_buf];
+            ctx->cmd_buf_last = cmd_buf;
+
+            [cmd_buf retain];
+        } else {
+            // Discrete GPU: allocate a shared staging buffer, blit, wait, then memcpy
+            id<MTLBuffer> buf_staging = [device newBufferWithLength:size
+                                                            options:MTLResourceStorageModeShared];
+            GGML_ASSERT(buf_staging);
+
+            [encoder copyFromBuffer:bid_src.metal
+                       sourceOffset:bid_src.offs
+                           toBuffer:buf_staging
+                  destinationOffset:0
+                               size:size];
+
+            [encoder endEncoding];
+            [cmd_buf commit];
+            const bool l0_trace = ggml_l0_enabled();
+            const double l0_wait_start = l0_trace ? ggml_l0_now() : 0;
+            [cmd_buf waitUntilCompleted];
+            if (l0_trace) {
+                const double start = [cmd_buf GPUStartTime];
+                const double end = [cmd_buf GPUEndTime];
+                ggml_l0_event(start == 0 || end == 0 || end < start ? "gpu_d2h_cb_invalid" : "gpu_d2h_cb", start, end, size);
+                ggml_l0_event("d2h_wait", l0_wait_start, ggml_l0_now(), size);
+            }
+
+            const double l0_memcpy_start = l0_trace ? ggml_l0_now() : 0;
+            memcpy(data, [buf_staging contents], size);
+            if (l0_trace) {
+                ggml_l0_event("d2h_memcpy", l0_memcpy_start, ggml_l0_now(), size);
+            }
+            [buf_staging release];
+        }
     }
 
     ggml_metal_xfer_stats.d2h_bytes   += (int64_t)size;
@@ -464,7 +590,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
         // queue the copy operation into the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx_src->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        id<MTLCommandBuffer> cmd_buf = ggml_metal_new_command_buffer(queue, false);
         id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
 
         [encoder copyFromBuffer:bid_src.metal
@@ -496,6 +622,12 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    // INTENT/PDL: delimit actual graph encodes for debug-only fusion firing counts.
+    if (ctx->debug_fusion > 1) {
+        GGML_LOG_DEBUG("FUSION_GRAPH · graph=%p · nodes=%d · fusion=%d\n",
+                (void *) gf, gf->n_nodes, (int) ctx->use_fusion);
+    }
+
     // number of nodes encoded by the main thread (empirically determined)
     const int n_main = MAX(64, 0.1*gf->n_nodes);
 
@@ -520,10 +652,30 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             ctx->profile_cpu_start = mach_absolute_time();
         }
 
+        // GGML_METAL_PROFILE=3: per-dispatch timestamp sampling in async path
+        // runs for profile_n graphs, then drops to profile=1
+        if (ctx->profile == 3 && ctx->profiler && ctx->window_enabled) {
+            // explicit window: profile (and mark active) only while budget remains; outside the budget the context
+            // stays at profile 3 (no drop to 1) and attaches no profiler. window_left is decremented in synchronize.
+            if (ctx->window_left > 0) {
+                ggml_metal_profiler_begin_graph(ctx->profiler, gf->n_nodes);
+                ctx->window_graph_active = true;
+            }
+        } else if (ctx->profile == 3 && ctx->profiler) {
+            if (ctx->profile_n > 0) {
+                ggml_metal_profiler_begin_graph(ctx->profiler, gf->n_nodes);
+                // profile_n is decremented in synchronize after the report prints
+            } else {
+                // done profiling — drop to profile=1 for ongoing graph timing
+                ctx->profile = 1;
+            }
+        }
+
         // GGML_METAL_PROFILE=2: per-op GPU timing breakdown
         // Encodes and completes one command buffer per op, measuring GPU time for each.
         // This serializes all GPU work — runs for profile_n graph computes, then drops to level 1.
-        if (ctx->profile >= 2 && ctx->profile_n > 0) {
+        // Note: profile=3 uses a different path (async counter sampling), so only enter here for exactly level 2.
+        if (ctx->profile == 2 && ctx->profile_n > 0) {
             ctx->profile_n--;
             id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
@@ -554,7 +706,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                 }
 
                 // create a fresh command buffer for this single op
-                id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+                id<MTLCommandBuffer> cmd_buf = ggml_metal_new_command_buffer(queue, true);
 
                 // encode this single node: idx_start=i, idx_end=i+1, no fusion, no concurrency
                 ggml_metal_op_t ctx_op = ggml_metal_op_init(
@@ -566,7 +718,13 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     /*use_concurrency=*/false,
                     /*use_capture=*/false,
                     ctx->debug_graph,
-                    ctx->debug_fusion);
+                    ctx->debug_fusion,
+                    /*profiler=*/NULL,
+                    /*profiler_cb_idx=*/-1
+#ifdef GGML_METAL_TEST_OBSERVER
+                    , ctx->observer, ctx->observer_user_data
+#endif
+                    );
 
                 for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
                     const int res = ggml_metal_op_encode(ctx_op, idx);
@@ -589,7 +747,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     if ([cmd_buf status] == MTLCommandBufferStatusError) {
                         GGML_LOG_ERROR("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
-                    return GGML_STATUS_FAILED;
+                    return ggml_metal_graph_failed(ctx, cmd_buf, i);
                 }
 
                 // read GPU timestamps and accumulate per-op-type timing
@@ -684,7 +842,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
-            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+            id<MTLCommandBuffer> cmd_buf = ggml_metal_new_command_buffer(queue, true);
             [cmd_buf retain];
 
             if (ctx->cmd_bufs[n_cb].obj) {
@@ -703,7 +861,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // prepare the rest of the command buffers asynchronously (optional)
         // cmd_buf[0.. n_cb)
         for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
-            id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+            id<MTLCommandBuffer> cmd_buf = ggml_metal_new_command_buffer(queue, true);
             [cmd_buf retain];
 
             if (ctx->cmd_bufs[cb_idx].obj) {
@@ -722,7 +880,14 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
         }
 
-        dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        if (ggml_metal_device_get_profile(ctx->dev)->cb_seq > 0) {
+            // the hw row asks for the buffers in order on this thread: each is committed as soon as it is encoded
+            for (int cb_idx = 0; cb_idx < n_cb; ++cb_idx) {
+                ctx->encode_async(cb_idx);
+            }
+        } else {
+            dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -742,8 +907,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     if (status == MTLCommandBufferStatusError) {
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
-
-                    return GGML_STATUS_FAILED;
+                    return ggml_metal_graph_failed(ctx, cmd_buf, n_cb);
                 }
             }
 
@@ -757,8 +921,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     if (status == MTLCommandBufferStatusError) {
                         GGML_LOG_INFO("error: %s\n", [[cmd_buf error].localizedDescription UTF8String]);
                     }
-
-                    return GGML_STATUS_FAILED;
+                    return ggml_metal_graph_failed(ctx, cmd_buf, i);
                 }
 
                 id<MTLCommandBuffer> next_buffer = (i + 1 < n_cb ? ctx->cmd_bufs[i + 1].obj : nil);
@@ -784,6 +947,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
     }
 
+    // Registration opts into a checked synchronous graph boundary so that a failed command
+    // buffer reaches the backend status path; no registration retains the legacy async path.
+    if (ggml_metal_gpu_error_callback_registered()) {
+        return ggml_metal_synchronize_checked(ctx);
+    }
     return GGML_STATUS_SUCCESS;
 }
 
@@ -793,7 +961,8 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     // skip graph optimization when profiling per-op (profile>=2) — fusion would merge
     // nodes and prevent individual op timing measurement
     if (ctx->use_graph_optimize && ctx->profile < 2) {
-        ggml_graph_optimize(gf);
+        const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
+        ggml_graph_optimize(gf, profile->mv_group == 1, profile->attn_gate_fuse == 1);
     }
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);
@@ -802,7 +971,7 @@ void ggml_metal_graph_optimize(ggml_metal_t ctx, struct ggml_cgraph * gf) {
 void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        id<MTLCommandBuffer> cmd_buf = ggml_metal_new_command_buffer(queue, false);
 
         ggml_metal_event_encode_signal(ev, cmd_buf);
 
@@ -818,7 +987,7 @@ void ggml_metal_event_record(ggml_metal_t ctx, ggml_metal_event_t ev) {
 void ggml_metal_event_wait(ggml_metal_t ctx, ggml_metal_event_t ev) {
     @autoreleasepool {
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
-        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        id<MTLCommandBuffer> cmd_buf = ggml_metal_new_command_buffer(queue, false);
 
         ggml_metal_event_encode_wait(ev, cmd_buf);
 
@@ -836,10 +1005,15 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 }
 
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+    // a hw row with cb_seq sets the number of command buffers after the first
+    const int cb_seq = (int) ggml_metal_device_get_profile(ctx->dev)->cb_seq;
+    if (cb_seq > 0) {
+        n_cb = cb_seq;
+    }
     if (ctx->n_cb != n_cb) {
         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
 
-        if (ctx->n_cb > 2) {
+        if (ctx->n_cb > 2 && cb_seq == 0) {
             GGML_LOG_WARN("%s: n_cb = %d, using n_cb > 2 is not recommended and can degrade the performance in some cases\n", __func__, n_cb);
         }
     }
@@ -867,6 +1041,13 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         id<MTLCommandBuffer> cmd_buf = ctx->cmd_bufs[cb_idx].obj;
 
+        // pass profiler and cb_idx to op encoding context for profile=3 dispatch sampling
+        // explicit window: only the graph that began profiling under the window gets the profiler
+        ggml_metal_profiler_t prof = (ctx->profile == 3 && (!ctx->window_enabled || ctx->window_graph_active)) ? ctx->profiler : NULL;
+
+        const bool l0_trace = ggml_l0_enabled();
+        const double l0_encode_start = l0_trace ? ggml_l0_now() : 0;
+
         ggml_metal_op_t ctx_op = ggml_metal_op_init(
             ctx->dev,
             cmd_buf,
@@ -877,7 +1058,13 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->use_concurrency,
             ctx->capture_next_compute,
             ctx->debug_graph,
-            ctx->debug_fusion);
+            ctx->debug_fusion,
+            prof,
+            cb_idx
+#ifdef GGML_METAL_TEST_OBSERVER
+            , ctx->observer, ctx->observer_user_data
+#endif
+            );
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);
@@ -890,8 +1077,16 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 
         ggml_metal_op_free(ctx_op);
 
+        if (l0_trace) {
+            ggml_l0_event("encode", l0_encode_start, ggml_l0_now(), cb_idx);
+        }
+
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
+            const double l0_commit_start = l0_trace ? ggml_l0_now() : 0;
             [cmd_buf commit];
+            if (l0_trace) {
+                ggml_l0_event("commit", l0_commit_start, ggml_l0_now(), cb_idx);
+            }
         }
     });
 }
@@ -899,6 +1094,10 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
 void ggml_metal_set_abort_callback(ggml_metal_t ctx, ggml_abort_callback abort_callback, void * user_data) {
     ctx->abort_callback = abort_callback;
     ctx->abort_callback_data = user_data;
+}
+
+ggml_metal_device_t ggml_metal_get_dev(ggml_metal_t ctx) {
+    return ctx->dev;
 }
 
 bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
@@ -911,4 +1110,38 @@ bool ggml_metal_supports_family(ggml_metal_t ctx, int family) {
 
 void ggml_metal_capture_next_compute(ggml_metal_t ctx) {
     ctx->capture_next_compute = true;
+}
+
+#ifdef GGML_METAL_TEST_OBSERVER
+void ggml_metal_test_set_observer(ggml_metal_t ctx,
+        ggml_backend_metal_test_observer_callback observer, void * user_data) {
+    ctx->observer = observer;
+    ctx->observer_user_data = user_data;
+}
+#endif
+
+// Arm every eligible registered context for an explicit n_graphs profile window; see ggml-metal.h for the contract.
+// Eligible: the context requested profile 3 at init and actually owns a profiler (unsupported-counter fallback
+// contexts and profile 0/1/2 contexts are left untouched), and has no graph in flight. No GPU work is done here.
+int ggml_metal_profile_window(int n_graphs) {
+    if (n_graphs <= 0) {
+        return 0;
+    }
+
+    int n_armed = 0;
+
+    pthread_mutex_lock(&g_registry_mutex);
+    for (struct ggml_metal * ctx = g_registry_head; ctx; ctx = ctx->registry_next) {
+        if (ctx->profile_ctor != 3 || ctx->profiler == NULL || ctx->window_graph_active) {
+            continue;
+        }
+        ctx->window_enabled      = true;
+        ctx->window_left         = n_graphs;
+        ctx->window_graph_active = false;
+        ctx->profile             = 3;
+        n_armed++;
+    }
+    pthread_mutex_unlock(&g_registry_mutex);
+
+    return n_armed;
 }

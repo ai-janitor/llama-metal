@@ -1,0 +1,250 @@
+// Grouped q4_K/q6_K fusion dispatch — fuses 2-8 consecutive matvec ops into
+// a single Metal dispatch with more threadgroups to improve GPU occupancy.
+// Extracted from dispatch.cpp to keep each dispatch strategy in its own file.
+#include "dispatch.h"
+#include "tuning.h"
+#include "lane-policy.h"
+
+#include <cstdlib>
+#include <cstring>
+
+
+static bool read_grouped_env() {
+    const char * value = std::getenv("GGML_METAL_MV_GROUPED");
+    return value == nullptr || std::strcmp(value, "0") != 0;
+}
+
+// GGML_METAL_MV_GROUPED=0 disables grouped matvec dispatch.
+static bool grouped_enabled() {
+    static const bool on = read_grouped_env();
+    return on;
+}
+
+int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
+    if (!grouped_enabled()) { return 0; }
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
+    const struct ggml_model_profile  * model   = ggml_metal_device_get_model_profile(ctx->dev);
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb1, op->src[1], nb);
+    GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
+
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
+
+    const int16_t r2 = ne12/ne02;
+    const int16_t r3 = ne13/ne03;
+
+    // =========================================================================
+    // Grouped mul_mv dispatch — fuse consecutive matmuls into one dispatch.
+    // =========================================================================
+    // On both GCN (D700, NW=64) and RDNA (5500M, NW=32), individual matmul
+    // dispatches have too few threadgroups to fully occupy the GPU. This scans
+    // forward through the compute graph and fuses up to 8 consecutive q4_K/q6_K
+    // matvec operations into a single dispatch with more threadgroups.
+    //
+    // Requirements for fusion:
+    //   - Same ne00 (K dimension / inner dimension must match)
+    //   - Matvec only (ne11 == 1, i.e., single token generation)
+    //   - Same Metal buffer for src0 and dst (offsets within the buffer differ)
+    //   - q4_K or q6_K quant type (both use THREADS_PER_BLOCK=16)
+    //   - All types must share the same N_R0_KQUANT for correct grid computation
+    //
+    // Returns the number of ops consumed (>1 if fusion happened).
+    if (ne11 != 1 ||
+        (op->src[0]->type != GGML_TYPE_Q4_K && op->src[0]->type != GGML_TYPE_Q6_K) ||
+        op->src[1]->type != GGML_TYPE_F32) {
+        return 0;
+    }
+
+    // Group descriptor — MUST match the Metal kernel's mv_group struct layout
+    // exactly (same field order, sizes, alignment). Any mismatch causes
+    // silent data corruption in the kernel.
+    struct mv_group_host {
+        uint64_t src0_off;    // byte offset of this group's weights from base
+        uint64_t dst_off;     // byte offset of this group's output from base
+        int32_t  ne01;        // number of output rows for this group
+        int32_t  nb01;        // byte stride between weight rows
+        uint64_t nb02;        // byte stride for 3rd dim (attention heads)
+        uint64_t nb03;        // byte stride for 4th dim (batch)
+        int32_t  tg_start;    // first threadgroup index for this group
+        int32_t  quant_type;  // 0=q4_K, 1=q6_K (matches MV_GROUP_TYPE_* in kernel)
+    };
+
+    // Kernel arguments — MUST match ggml_metal_kargs_mul_mv_grouped in the
+    // Metal kernel exactly. Contains shared parameters + per-group descriptors.
+    struct kargs_grouped {
+        int32_t  ne00;        // K dimension (shared across all groups)
+        int32_t  ne02;        // number of attention heads (src0)
+        int32_t  ne10;        // src1 row length (== ne00)
+        int32_t  ne11;        // src1 rows (1 for matvec)
+        int32_t  ne12;        // src1 heads (broadcast dimension)
+        uint64_t nb10;        // src1 byte strides
+        uint64_t nb11;
+        uint64_t nb12;
+        uint64_t nb13;
+        int32_t  ne0;         // output row length
+        int32_t  ne1;         // output rows
+        int16_t  r2;          // GQA broadcast ratio (ne12/ne02)
+        int16_t  r3;          // batch broadcast ratio
+        int32_t  n_groups;    // number of fused groups (2..8)
+        int32_t  compute_units;   // CU count from hardware profile
+        int32_t  l1_cache_per_cu; // L1 cache bytes per CU from hardware profile
+        mv_group_host groups[8];  // per-group descriptors (MAX_MV_GROUPS=8)
+    };
+
+    // Always use shmem reduction for the grouped kernel — it's the safe
+    // path on all devices. GCN needs it (simd_sum broken at NW=64),
+    // RDNA doesn't need it but it works fine and keeps the kernel uniform.
+    const bool use_shmem_reduce = true;
+    // Grouped kernels retain their existing output path; FC606 is scalar Q4_K-only.
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, false, 0, false);
+
+    if (!pipeline.pipeline) {
+        return 0;
+    }
+
+    const int nsg = pipeline.nsg;  // simdgroups per threadgroup (N_SG_Q4_K)
+    // NR0 selected from model+hardware profiles via tuning function.
+    // The grouped kernel is compiled with this NR0 as a function constant.
+    const int nr0 = ggml_metal_compute_nr0(profile, model, ne00);
+    const int mv_simd_w = ggml_metal_pipeline_thread_execution_width(pipeline);  // 64 on GCN
+
+    // Base buffer IDs — all groups must be in the same Metal buffer.
+    // We store byte offsets relative to these base pointers.
+    struct ggml_metal_buffer_id bid_src0_base = ggml_metal_get_buffer_id(op->src[0]);
+    struct ggml_metal_buffer_id bid_dst_base  = ggml_metal_get_buffer_id(op);
+
+    // Scan forward through the compute graph, collecting compatible ops.
+    kargs_grouped gargs = {};
+    int n_groups = 0;
+    int total_tg = 0;     // cumulative threadgroup count across all groups
+    int n_consumed = 0;   // how many ops from the graph we consumed
+
+    for (int g = 0; g < 8 && (idx + g) < ctx->n_nodes(); g++) {
+        ggml_tensor * gop = ctx->node(idx + g);
+        if (gop->op != GGML_OP_MUL_MAT) break;
+
+        // Only fuse q4_K and q6_K — they share THREADS_PER_BLOCK=16
+        // and N_R0_KQUANT, so threadgroup geometry is identical.
+        const bool is_q4k = (gop->src[0]->type == GGML_TYPE_Q4_K);
+        const bool is_q6k = (gop->src[0]->type == GGML_TYPE_Q6_K);
+        if (!is_q4k && !is_q6k) break;
+        if (gop->src[0]->ne[0] != ne00) break;  // K dimension must match
+        if (gop->src[1]->ne[1] != 1) break;     // must be matvec (batch=1)
+        if (g > 0 && !(gop->flags & GGML_TENSOR_FLAG_COMPUTE)) break;
+
+        // One activation buffer is bound for the entire group. Exact tensor
+        // identity also prevents a later group's activation consuming an earlier
+        // group's output: every group must read the same pre-existing input.
+        if (gop->src[1] != op->src[1]) break;
+
+        // All groups must share the same underlying Metal buffer
+        // (we pass one buffer binding and use byte offsets).
+        struct ggml_metal_buffer_id bid_src0_g = ggml_metal_get_buffer_id(gop->src[0]);
+        struct ggml_metal_buffer_id bid_dst_g  = ggml_metal_get_buffer_id(gop);
+        if (bid_src0_g.metal != bid_src0_base.metal) break;
+        if (bid_dst_g.metal != bid_dst_base.metal) break;
+
+        // Compute how many threadgroups this group needs.
+        // Each TG covers nr0 * nsg rows = N_R0_KQUANT * N_SG_Q4_K rows.
+        int gne01 = (int32_t)gop->src[0]->ne[1];
+        int tg_count = (gne01 + nr0 * nsg - 1) / (nr0 * nsg);
+
+        // Collect absolute offsets first: graph order need not match allocation
+        // order. A later member can precede the first in either Metal buffer.
+        gargs.groups[n_groups].src0_off    = bid_src0_g.offs;
+        gargs.groups[n_groups].dst_off     = bid_dst_g.offs;
+        // Metal buffer bindings must precede every accessed member. Subtracting
+        // a later binding underflows uint64 offsets and can discard GPU stores.
+        if (bid_src0_g.offs < bid_src0_base.offs) bid_src0_base.offs = bid_src0_g.offs;
+        if (bid_dst_g.offs  < bid_dst_base.offs)  bid_dst_base.offs  = bid_dst_g.offs;
+        gargs.groups[n_groups].ne01        = gne01;
+        gargs.groups[n_groups].nb01        = (int32_t)gop->src[0]->nb[1];
+        gargs.groups[n_groups].nb02        = gop->src[0]->nb[2];
+        gargs.groups[n_groups].nb03        = gop->src[0]->nb[3];
+        gargs.groups[n_groups].tg_start    = total_tg;
+        gargs.groups[n_groups].quant_type  = is_q4k ? 0 : 1;
+
+        total_tg += tg_count;
+        n_groups++;
+        n_consumed++;
+    }
+
+    // Only use grouped dispatch if we found 2+ ops to fuse.
+    // With 1 op, the overhead of the group lookup isn't worth it.
+    if (n_groups < 2) {
+        return 0;
+    }
+
+    // Rebase every descriptor against the minimum binding, keeping all accesses
+    // nonnegative even when weights or outputs were allocated out of graph order.
+    for (int group = 0; group < n_groups; ++group) {
+        gargs.groups[group].src0_off -= bid_src0_base.offs;
+        gargs.groups[group].dst_off  -= bid_dst_base.offs;
+    }
+
+    // Fill in the shared parameters (same for all groups).
+    gargs.ne00 = ne00;
+    gargs.ne02 = ne02;
+    gargs.ne10 = ne10;
+    gargs.ne11 = ne11;
+    gargs.ne12 = ne12;
+    gargs.nb10 = nb10;
+    gargs.nb11 = nb11;
+    gargs.nb12 = nb12;
+    gargs.nb13 = nb13;
+    gargs.ne0  = ne0;
+    gargs.ne1  = ne1;
+    gargs.r2   = r2;
+    gargs.r3   = r3;
+    gargs.n_groups = n_groups;
+    gargs.compute_units   = (int32_t)profile->compute_units;
+    gargs.l1_cache_per_cu = (int32_t)profile->l1_cache_per_cu;
+
+    // The grouped kernel is compiled with NR0 as a function constant
+    // (FC_grouped_nr0), allowing different NR0 per model. Pipeline is
+    // cached by name (includes NR0), so each variant compiles only once.
+    char gpipeline_name[128];
+    const int16_t selected_lane = ggml_metal_select_matvec_lane(
+        lib, op->src[0]->type, GGML_METAL_MATVEC_ROUTE_GROUPED);
+    snprintf(gpipeline_name, sizeof(gpipeline_name),
+        "kernel_mul_mv_grouped_kquant_f32_nr0=%d_lane=%d", nr0, selected_lane);
+
+    auto gpipeline = ggml_metal_library_get_pipeline(lib, gpipeline_name);
+    if (!gpipeline.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, (int16_t)nr0, FC_MUL_MV_GROUPED + 0);
+        ggml_metal_cv_set_int16(cv, selected_lane, FC_MATVEC_LANE);
+        gpipeline = ggml_metal_library_compile_pipeline(lib,
+            "kernel_mul_mv_grouped_kquant_f32", gpipeline_name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    if (!gpipeline.pipeline) {
+        return 0;
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, gpipeline);
+    ggml_metal_encoder_set_bytes   (enc, &gargs, sizeof(gargs), 0);
+    ggml_metal_encoder_set_buffer  (enc, bid_src0_base, 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, bid_dst_base, 3);
+    // Shared memory for cross-lane reduction: NSG x NW x NR0 x sizeof(float)
+    // Use nr0 (from tuning) not pipeline.smem (which used hardcoded NR0)
+    const size_t grouped_smem = (size_t)nsg * mv_simd_w * nr0 * sizeof(float);
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, grouped_smem, 0);
+    // Dispatch all fused groups as one grid: total_tg threadgroups.
+    // Each TG has mv_simd_w x nsg threads (= 64 x 2 = 128 on GCN).
+    ggml_metal_encoder_dispatch_threadgroups(enc, total_tg, 1, ne12 * ne13, mv_simd_w, nsg, 1);
+
+    return n_consumed;  // tell caller we consumed multiple ops
+}

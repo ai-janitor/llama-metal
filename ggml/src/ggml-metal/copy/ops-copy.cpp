@@ -61,7 +61,7 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 
-        ggml_metal_op_concurrency_reset(ctx);
+        ggml_metal_op_concurrency_reset(ctx, idx);
     }
 
     auto pipeline = ggml_metal_library_get_pipeline_cpy(lib, op->src[1]->type, op->type);
@@ -150,7 +150,7 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
         nk0 = ne00/ggml_blck_size(op->type);
     }
 
-    int nth = std::min<int>(nk0, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    int nth = std::min<int>(nk0*ne01, 256);
 
     // when rows are small, we can batch them together in a single threadgroup
     int nrptg = 1;

@@ -278,7 +278,7 @@ int ggml_metal_op_argsort(ggml_metal_op_t ctx, int idx) {
     int len = nth;
 
     while (len < ne00) {
-        ggml_metal_op_concurrency_reset(ctx);
+        ggml_metal_op_concurrency_reset(ctx, idx);
 
         ggml_metal_kargs_argsort_merge args_merge = {
             /*.ne00  =*/ ne00,
@@ -390,7 +390,7 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     int len = args.top_k;
 
     while (len < args.ne0) {
-        ggml_metal_op_concurrency_reset(ctx);
+        ggml_metal_op_concurrency_reset(ctx, idx);
 
         // merges per row
         const int nm = (args.ne0 + 2*len - 1) / (2*len);

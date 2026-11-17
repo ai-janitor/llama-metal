@@ -247,7 +247,15 @@ struct tiled_loader_mxfp4 {
 // Adding a new quant type = add one loader struct + one instantiation line.
 // ---------------------------------------------------------------------------
 
-template <typename LoadA>
+// PackedMul (P17.12): compile-time packed-fp16 multiply stage. false (default) = the exact
+// float FMA body below, unchanged for every existing instance. true = operands narrowed to
+// half4, multiplied as packed half4, products widened to float4 BEFORE any add, then added
+// into the float sums in the original w,z,y,x order (fp32 accumulation). Loader geometry,
+// shared-memory float2 layout, barriers and stores are identical in both modes. Narrowing
+// operands to half is lossy and a half product can overflow (|a*b| > 65504 -> inf): numerical
+// behaviour is unproven until the parent's runtime sweep. To undo: delete the PackedMul param,
+// the `if (PackedMul)` arm and the *_v3 instantiation.
+template <typename LoadA, bool PackedMul = false>
 kernel void kernel_mul_mat_tiled_impl(
     constant ggml_metal_kargs_mul_mm & args [[buffer(0)]],
     device const char * src0 [[buffer(1)]],
@@ -357,20 +365,37 @@ kernel void kernel_mul_mat_tiled_impl(
                     cache_b.xy = buf_b[col * SHMEM_STRIDE + 2*i    ];
                     cache_b.zw = buf_b[col * SHMEM_STRIDE + 2*i + 1];
 
-                    // FMA accumulation (from Vulkan lines 326-334)
-                    for (uint wsir = 0; wsir < WMITER; wsir++) {
-                        for (uint cr = 0; cr < TM / 2; cr++) {
-                            const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+                    if (PackedMul) {
+                        // Packed multiply stage: half4 * half4, widen each product to float4,
+                        // then accumulate in fp32 in the original w,z,y,x order.
+                        const half4 hb = half4(cache_b);
+                        for (uint wsir = 0; wsir < WMITER; wsir++) {
+                            for (uint cr = 0; cr < TM / 2; cr++) {
+                                const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
 
-                            sums[sums_idx].x = fma(cache_a[wsir * TM + 2*cr    ].x, cache_b.x,
-                                               fma(cache_a[wsir * TM + 2*cr    ].y, cache_b.y,
-                                               fma(cache_a[wsir * TM + 2*cr    ].z, cache_b.z,
-                                               fma(cache_a[wsir * TM + 2*cr    ].w, cache_b.w, sums[sums_idx].x))));
+                                const float4 p0 = float4(half4(cache_a[wsir * TM + 2*cr    ]) * hb);
+                                const float4 p1 = float4(half4(cache_a[wsir * TM + 2*cr + 1]) * hb);
 
-                            sums[sums_idx].y = fma(cache_a[wsir * TM + 2*cr + 1].x, cache_b.x,
-                                               fma(cache_a[wsir * TM + 2*cr + 1].y, cache_b.y,
-                                               fma(cache_a[wsir * TM + 2*cr + 1].z, cache_b.z,
-                                               fma(cache_a[wsir * TM + 2*cr + 1].w, cache_b.w, sums[sums_idx].y))));
+                                sums[sums_idx].x = (((sums[sums_idx].x + p0.w) + p0.z) + p0.y) + p0.x;
+                                sums[sums_idx].y = (((sums[sums_idx].y + p1.w) + p1.z) + p1.y) + p1.x;
+                            }
+                        }
+                    } else {
+                        // FMA accumulation (from Vulkan lines 326-334)
+                        for (uint wsir = 0; wsir < WMITER; wsir++) {
+                            for (uint cr = 0; cr < TM / 2; cr++) {
+                                const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+
+                                sums[sums_idx].x = fma(cache_a[wsir * TM + 2*cr    ].x, cache_b.x,
+                                                   fma(cache_a[wsir * TM + 2*cr    ].y, cache_b.y,
+                                                   fma(cache_a[wsir * TM + 2*cr    ].z, cache_b.z,
+                                                   fma(cache_a[wsir * TM + 2*cr    ].w, cache_b.w, sums[sums_idx].x))));
+
+                                sums[sums_idx].y = fma(cache_a[wsir * TM + 2*cr + 1].x, cache_b.x,
+                                                   fma(cache_a[wsir * TM + 2*cr + 1].y, cache_b.y,
+                                                   fma(cache_a[wsir * TM + 2*cr + 1].z, cache_b.z,
+                                                   fma(cache_a[wsir * TM + 2*cr + 1].w, cache_b.w, sums[sums_idx].y))));
+                            }
                         }
                     }
                 }
@@ -467,6 +492,14 @@ kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq4_nl>(
 
 template [[host_name("kernel_mul_mat_tiled_q4_K")]]
 kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_K>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+// P17.12: Q4_K with the packed-fp16 multiply stage (fp32 accumulation). Opt-in only via
+// GGML_METAL_TILED_FP16_MUL=1 in dispatch-matmul.cpp; the plain q4_K entry above is untouched.
+// Other formats have no _v3 tiled entry (explicitly unimplemented, not claimed).
+template [[host_name("kernel_mul_mat_tiled_q4_K_v3")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_K, true>(
     constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort);
 

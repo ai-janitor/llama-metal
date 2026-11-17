@@ -75,6 +75,7 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
         /* sect_1      =*/ sect_1,
         /* sect_2      =*/ sect_2,
         /* sect_3      =*/ sect_3,
+        /* n_offs      =*/ ggml_get_op_params_i32(op, 15),
         /* src2        =*/ op->src[2] != nullptr,
     };
 

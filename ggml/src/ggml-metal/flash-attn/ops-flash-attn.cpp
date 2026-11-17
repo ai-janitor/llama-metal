@@ -559,7 +559,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
 
         if (need_sync) {
-            ggml_metal_op_concurrency_reset(ctx);
+            ggml_metal_op_concurrency_reset(ctx, idx);
         }
 
         const int is_q = ggml_is_quantized(op->src[1]->type) ? 1 : 0;
@@ -698,7 +698,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         }
 
         if (need_sync) {
-            ggml_metal_op_concurrency_reset(ctx);
+            ggml_metal_op_concurrency_reset(ctx, idx);
         }
 
         // note: for simplicity assume the K is larger or equal than V
@@ -808,7 +808,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nqptg - 1)/nqptg, (ne02 + nhptg - 1)/nhptg, ne03*nwg, 32, nsg, 1);
 
             // sync the 2 kernels
-            ggml_metal_op_concurrency_reset(ctx);
+            ggml_metal_op_concurrency_reset(ctx, idx);
 
             // reduce the results from the workgroups
             {

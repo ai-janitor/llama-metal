@@ -10,7 +10,14 @@ ggml_metal_op_t ggml_metal_op_init(
         bool use_concurrency,
         bool use_capture,
         int debug_graph,
-        int debug_fusion) {
+        int debug_fusion,
+        ggml_metal_profiler_t profiler,
+        int profiler_cb_idx
+#ifdef GGML_METAL_TEST_OBSERVER
+        , ggml_backend_metal_test_observer_callback observer,
+        void * observer_user_data
+#endif
+        ) {
     ggml_metal_op_t res = new ggml_metal_op(
         dev,
         cmd_buf,
@@ -21,7 +28,13 @@ ggml_metal_op_t ggml_metal_op_init(
         use_concurrency,
         use_capture,
         debug_graph,
-        debug_fusion);
+        debug_fusion,
+        profiler,
+        profiler_cb_idx
+#ifdef GGML_METAL_TEST_OBSERVER
+        , observer, observer_user_data
+#endif
+        );
 
     return res;
 }
@@ -80,10 +93,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     // otherwise, we add the new ranges to the encoding context and process the node concurrently
     //
     {
-        const bool is_concurrent = ggml_metal_op_concurrency_check(ctx, node);
+        const bool is_concurrent = ggml_metal_op_concurrency_check(ctx, node, idx);
 
         if (!is_concurrent) {
-            ggml_metal_op_concurrency_reset(ctx);
+            ggml_metal_op_concurrency_reset(ctx, idx);
         }
 
         if (ctx->debug_graph > 0) {
@@ -124,17 +137,47 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    if (ctx->use_fusion && ggml_metal_fuse_small_enabled()) {
+        const int count = ggml_metal_op_fuse_small(ctx, idx);
+        if (count > 1) {
+            n_fuse = count;
+            goto update_ranges;
+        }
+    }
+
+    if (ctx->use_fusion && node->op == GGML_OP_CONT && ggml_metal_device_get_profile(ctx->dev)->attn_gate_fuse == 1) {
+        const int count = ggml_metal_op_attn_gate(ctx, idx);
+        if (count > 1) {
+            n_fuse = count;
+            goto update_ranges;
+        }
+    }
+
+    if (ctx->use_fusion && node->op == GGML_OP_ADD && ggml_metal_device_get_profile(ctx->dev)->add_norm_fuse == 1) {
+        const int count = ggml_metal_op_add_norm(ctx, idx);
+        if (count > 1) {
+            n_fuse = count;
+            goto update_ranges;
+        }
+    }
+
     switch (node->op) {
         case GGML_OP_CONCAT:
             {
-                n_fuse = ggml_metal_op_concat(ctx, idx);
+                n_fuse = ggml_metal_state_in_place() ? ggml_metal_op_conv_state(ctx, idx) : 0;
+                if (n_fuse == 0) {
+                    n_fuse = ggml_metal_op_concat(ctx, idx);
+                }
             } break;
         case GGML_OP_ADD:
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
             {
-                n_fuse = ggml_metal_op_bin(ctx, idx);
+                n_fuse = ggml_metal_norm_matvec_add_scale() && ggml_metal_add_scale_applies(node) ? ggml_metal_op_add_scale(ctx, idx) : 0;
+                if (n_fuse == 0) {
+                    n_fuse = ggml_metal_op_bin(ctx, idx);
+                }
             } break;
         case GGML_OP_ADD_ID:
             {
@@ -234,7 +277,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             {
-                n_fuse = ggml_metal_op_norm(ctx, idx);
+                n_fuse = ggml_metal_norm_matvec_enabled() ? ggml_metal_op_norm_matvec(ctx, idx) : 0;
+                if (n_fuse == 0) {
+                    n_fuse = ggml_metal_op_norm(ctx, idx);
+                }
             } break;
         case GGML_OP_ROPE:
             {
@@ -341,6 +387,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             }
     }
 
+update_ranges:
     if (ctx->debug_graph > 0) {
         if (n_fuse > 1) {
             GGML_LOG_DEBUG("%s:               fuse %d ops\n", __func__, n_fuse);
@@ -349,8 +396,8 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 
     // update the mem ranges in the encoding context
     for (int i = 0; i < n_fuse; ++i) {
-        if (!ggml_metal_op_concurrency_add(ctx, ctx->node(idx + i))) {
-            ggml_metal_op_concurrency_reset(ctx);
+        if (!ggml_metal_op_concurrency_add(ctx, ctx->node(idx + i), idx + i)) {
+            ggml_metal_op_concurrency_reset(ctx, idx + i);
         }
     }
 
@@ -358,6 +405,9 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+    // set op name on encoder for profiler labeling (no-op when profiling is off)
+    ggml_metal_encoder_set_op_name(ctx->enc, ggml_op_name(ctx->node(idx)->op));
+
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
@@ -367,6 +417,8 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
         GGML_ABORT("fusion error: nodes spanning multiple encoders have been fused. this indicates a bug in the fusion logic %s",
                 "https://github.com/ggml-org/llama.cpp/pull/14849");
     }
+
+    ctx->trace_fusion(idx, res);
 
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_pop(ctx->enc);

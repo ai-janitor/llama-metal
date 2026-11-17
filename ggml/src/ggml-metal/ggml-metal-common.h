@@ -45,7 +45,24 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * ten
 //
 // note: this implementation is generic and not specific to metal
 //       if it proves to work well, we can start using it for other backends in the future
-void ggml_graph_optimize(struct ggml_cgraph * gf);
+//       pack_matvecs keeps the Q8_0 matvecs that read one normed activation adjacent, for the grouped launch
+//       attn_gate keeps the attention gate copy, sigmoid, output copy and multiply adjacent, for their one launch
+void ggml_graph_optimize(struct ggml_cgraph * gf, bool pack_matvecs, bool attn_gate);
+
+// Fusion GGML_METAL_NORM_MATVEC (off unless set): rms_norm + its weight + 1-4 Q8_0 matvecs in one launch, and the
+// residual add that leaves the mean of squares of its output in a device-owned slot for that norm.
+// debug values: pack = optimizer packing only, nm-self = fused launch with every norm computing its own mean,
+// 1 or full = fused launch and residual adds storing the means; 0 or unset = off
+int  ggml_metal_norm_matvec_mode(void);
+bool ggml_metal_norm_matvec_enabled(void);
+bool ggml_metal_norm_matvec_add_scale(void);
+// GGML_METAL_STATE_IN_PLACE (on unless 0): decode conv reads and shifts its state in the cache cell (one launch)
+bool ggml_metal_state_in_place(void);
+bool ggml_metal_add_scale_applies(const struct ggml_tensor * add);
+// Gate copy, its sigmoid, attention output copy and their multiply: the match fills the three inner nodes.
+bool ggml_metal_attn_gate_match(const struct ggml_tensor * mul, const struct ggml_tensor ** cont_gate,
+                                const struct ggml_tensor ** sigmoid, const struct ggml_tensor ** cont_out);
+bool ggml_metal_norm_matvec_mm_ok(const struct ggml_tensor * mm, const struct ggml_tensor * act);
 
 #ifdef __cplusplus
 }

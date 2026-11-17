@@ -658,6 +658,118 @@ static void signal_handler(int) {
     g_running = 0;
 }
 
+//
+// Parakeet daemon-v2 socket mode (TTS_DAEMON_SOCK=<unix socket path>)
+//
+// Speaks the same wire protocol as parakeet's gpu_stream_test --serve so the
+// Parakeet app, say-gpu, and TTSDaemonManager work unchanged when this daemon
+// owns /tmp/tts-daemon.sock instead of the Kokoro one:
+//   client:  {"cmd":"ping"}\n | {"cmd":"synth","text":"..."}\n
+//   server:  {"event":"pong","state":"ready","voice":...,"device":...}\n
+//            {"event":"pcm","n":N,"phrase":0}\n + N raw float32 samples
+//            {"event":"done","ttfb_ms":...,"synth_ms":...,"samples":...,
+//             "chunks":...,"phrases":1,"device":...,"gpu_engaged":1}\n
+//            {"event":"error","msg":"..."}\n
+// A dead client must never kill the daemon (send failures are per-connection).
+
+#include <sys/socket.h>
+#include <sys/un.h>
+
+static bool send_all(int fd, const void * data, size_t n) {
+    const char * p = static_cast<const char *>(data);
+    while (n > 0) {
+        ssize_t w = ::send(fd, p, n, 0);
+        if (w <= 0) return false;
+        p += w;
+        n -= (size_t) w;
+    }
+    return true;
+}
+
+static bool send_json_line(int fd, const json & j) {
+    std::string s = j.dump() + "\n";
+    return send_all(fd, s.data(), s.size());
+}
+
+template <typename SynthFn>
+static int run_socket_server(const std::string & sock_path, const std::string & device,
+                             bool gpu_engaged, SynthFn synth) {
+    unlink(sock_path.c_str());
+    int srv = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (srv < 0) { LOG_ERR("socket() failed\n"); return 1; }
+    sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path.c_str());
+    if (::bind(srv, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0 ||
+        ::listen(srv, 4) != 0) {
+        LOG_ERR("bind/listen failed on %s\n", sock_path.c_str());
+        ::close(srv);
+        return 1;
+    }
+    LOG_INF("TTS daemon ready (parakeet v2). Socket: %s device: %s\n",
+            sock_path.c_str(), device.c_str());
+
+    const int n_sr = 24000;
+    while (g_running) {
+        int conn = ::accept(srv, nullptr, nullptr);
+        if (conn < 0) continue;
+        std::string line;
+        char c;
+        while (::recv(conn, &c, 1, 0) == 1 && c != '\n') line += c;
+        // strip whitespace
+        line.erase(0, line.find_first_not_of(" \t\r"));
+        line.erase(line.find_last_not_of(" \t\r") + 1);
+        if (line.empty()) { ::close(conn); continue; }
+        try {
+            json req = json::parse(line);
+            const std::string cmd = req.value("cmd", "");
+            if (cmd == "ping") {
+                send_json_line(conn, {{"event", "pong"}, {"state", "ready"},
+                                      {"voice", "en_male_1"}, {"device", device}});
+            } else if (cmd == "synth" && !req.value("text", std::string()).empty()) {
+                const std::string text = req["text"];
+                LOG_INF("synth: \"%.80s\"\n", text.c_str());
+                const auto t0 = ggml_time_us();
+                std::vector<float> audio = synth(text);
+                const double ms = (ggml_time_us() - t0) / 1000.0;
+                if (audio.empty()) {
+                    send_json_line(conn, {{"event", "error"}, {"msg", "no audio generated"}});
+                } else {
+                    // stream in ~1s chunks for protocol parity with the Kokoro daemon
+                    size_t off = 0;
+                    int chunks = 0;
+                    bool ok = true;
+                    while (ok && off < audio.size()) {
+                        const size_t n = std::min(audio.size() - off, (size_t) n_sr);
+                        ok = send_json_line(conn, {{"event", "pcm"}, {"n", (int) n}, {"phrase", 0}})
+                          && send_all(conn, audio.data() + off, n * sizeof(float));
+                        off += n;
+                        chunks++;
+                    }
+                    if (ok) {
+                        send_json_line(conn, {{"event", "done"},
+                            {"ttfb_ms", ms}, {"synth_ms", ms},
+                            {"samples", (int) audio.size()}, {"chunks", chunks},
+                            {"phrases", 1}, {"device", device},
+                            {"gpu_engaged", gpu_engaged ? 1 : 0}});
+                    }
+                    LOG_INF("done: synth_ms=%.0f samples=%d\n", ms, (int) audio.size());
+                }
+            } else {
+                send_json_line(conn, {{"event", "error"}, {"msg", "bad request"}});
+            }
+        } catch (const std::exception & e) {
+            LOG_ERR("request error: %s\n", e.what());
+            send_json_line(conn, {{"event", "error"}, {"msg", e.what()}});
+        }
+        ::shutdown(conn, SHUT_WR);
+        ::close(conn);
+    }
+    ::close(srv);
+    unlink(sock_path.c_str());
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     common_params params;
 
@@ -797,32 +909,9 @@ lovely<|t_0.56|><|code_start|><|634|><|596|><|1766|><|1556|><|1306|><|1285|><|14
     }
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
-    LOG_INF("TTS daemon ready. Listening on %s\n", g_fifo_path.c_str());
-    LOG_INF("Usage: echo \"your text\" > %s\n", g_fifo_path.c_str());
-
-    // Main daemon loop
-    while (g_running) {
-        // Open FIFO for reading (blocks until a writer connects)
-        std::ifstream fifo(g_fifo_path);
-        if (!fifo.is_open()) {
-            if (!g_running) break;
-            usleep(100000);
-            continue;
-        }
-
-        std::string line;
-        while (std::getline(fifo, line)) {
-            // Trim whitespace
-            line.erase(0, line.find_first_not_of(" \t\r\n"));
-            line.erase(line.find_last_not_of(" \t\r\n") + 1);
-
-            if (line.empty()) continue;
-            if (line == "quit" || line == "exit") {
-                g_running = 0;
-                break;
-            }
-
-            LOG_INF("\n--- Processing: \"%s\" ---\n", line.c_str());
+    // One utterance: text -> codes (LLM) -> embeddings (vocoder) -> PCM float32 @24kHz.
+    // Shared by the FIFO loop (plays locally) and the parakeet socket mode (returns PCM).
+    auto synth_utterance = [&](const std::string & line) -> std::vector<float> {
             const auto t_start = ggml_time_us();
 
             // === Generate codes ===
@@ -881,7 +970,8 @@ lovely<|t_0.56|><|code_start|><|634|><|596|><|1766|><|1556|><|1306|><|1285|><|14
 
                 if (llama_decode(ctx_ttc, batch) != 0) {
                     LOG_ERR("%s: llama_decode() failed\n", __func__);
-                    continue;
+                    llama_batch_free(batch);
+                    return {};
                 }
 
                 llama_synchronize(ctx_ttc);
@@ -960,7 +1050,7 @@ lovely<|t_0.56|><|code_start|><|634|><|596|><|1766|><|1556|><|1306|><|1285|><|14
 
             if (codes.empty()) {
                 LOG_ERR("No audio codes generated\n");
-                continue;
+                return {};
             }
 
             for (auto & token : codes) {
@@ -977,7 +1067,7 @@ lovely<|t_0.56|><|code_start|><|634|><|596|><|1766|><|1556|><|1306|><|1285|><|14
             if (llama_encode(ctx_cts, batch) != 0) {
                 LOG_ERR("llama_encode() failed\n");
                 llama_batch_free(batch);
-                continue;
+                return {};
             }
             llama_synchronize(ctx_cts);
             llama_batch_free(batch);
@@ -995,12 +1085,66 @@ lovely<|t_0.56|><|code_start|><|634|><|596|><|1766|><|1556|><|1306|><|1285|><|14
             // add 0.3s silence at end so last word doesn't clip
             audio.resize(audio.size() + n_sr * 3 / 10, 0.0f);
 
-            LOG_INF("time total: %.3f ms, playing %d samples (%.2f s)\n",
+            LOG_INF("time total: %.3f ms, %d samples (%.2f s)\n",
                 (ggml_time_us() - t_start) / 1000.0f,
                 (int)audio.size(), (float)audio.size() / n_sr);
 
-            // === Play audio ===
-            play_audio(audio, n_sr);
+            return audio;
+    };
+
+    // Parakeet socket mode: TTS_DAEMON_SOCK set → serve the daemon-v2 protocol
+    // (PCM returned to the client) instead of FIFO + local playback.
+    if (const char * sock_env = getenv("TTS_DAEMON_SOCK")) {
+        std::string device = "Metal GPU";
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                device = ggml_backend_dev_description(dev);
+                break;
+            }
+        }
+        const bool gpu_engaged = params.n_gpu_layers > 0;
+        if (!gpu_engaged) {
+            LOG_ERR("FATAL: socket mode requires GPU offload (-ngl > 0) — refusing CPU fallback\n");
+            return 1;
+        }
+        const int rc = run_socket_server(sock_env, device, gpu_engaged, synth_utterance);
+        ggml_backend_free(backend_spectral);
+        for (auto * s : smpl) { common_sampler_free(s); }
+        llama_backend_free();
+        return rc;
+    }
+
+    LOG_INF("TTS daemon ready. Listening on %s\n", g_fifo_path.c_str());
+    LOG_INF("Usage: echo \"your text\" > %s\n", g_fifo_path.c_str());
+
+    // Main daemon loop (FIFO + local playback)
+    while (g_running) {
+        // Open FIFO for reading (blocks until a writer connects)
+        std::ifstream fifo(g_fifo_path);
+        if (!fifo.is_open()) {
+            if (!g_running) break;
+            usleep(100000);
+            continue;
+        }
+
+        std::string line;
+        while (std::getline(fifo, line)) {
+            // Trim whitespace
+            line.erase(0, line.find_first_not_of(" \t\r\n"));
+            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+
+            if (line.empty()) continue;
+            if (line == "quit" || line == "exit") {
+                g_running = 0;
+                break;
+            }
+
+            LOG_INF("\n--- Processing: \"%s\" ---\n", line.c_str());
+            std::vector<float> audio = synth_utterance(line);
+            if (!audio.empty()) {
+                play_audio(audio, 24000);
+            }
         }
         fifo.close();
     }
