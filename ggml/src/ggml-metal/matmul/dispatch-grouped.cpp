@@ -106,7 +106,7 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     // RDNA doesn't need it but it works fine and keeps the kernel uniform.
     const bool use_shmem_reduce = true;
     // Grouped kernels retain their existing output path; FC606 is scalar Q4_K-only.
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, false, 0, false);
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, false, 0, false, false, 0, 0);
 
     if (!pipeline.pipeline) {
         return 0;
@@ -115,7 +115,7 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     const int nsg = pipeline.nsg;  // simdgroups per threadgroup (N_SG_Q4_K)
     // NR0 selected from model+hardware profiles via tuning function.
     // The grouped kernel is compiled with this NR0 as a function constant.
-    const int nr0 = ggml_metal_compute_nr0(profile, model, ne00);
+    int nr0 = ggml_metal_compute_nr0(profile, model, ne00);
     const int mv_simd_w = ggml_metal_pipeline_thread_execution_width(pipeline);  // 64 on GCN
 
     // Base buffer IDs — all groups must be in the same Metal buffer.
@@ -128,6 +128,19 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     int n_groups = 0;
     int total_tg = 0;     // cumulative threadgroup count across all groups
     int n_consumed = 0;   // how many ops from the graph we consumed
+
+    // Per-shape group row of this card: members of the row's type and shape run at its rows per simdgroup
+    // (a prep row needs every member's prepared headers in one run); the scan repeats with that value.
+    bool kq_prep = false;
+    ggml_metal_buffer_id bid_kq_prep = { nullptr, 0 };
+    const ggml_tensor * member_src0[8] = {};
+    for (int pass = 0; pass < 2; pass++) {
+    gargs = {};
+    n_groups = 0;
+    total_tg = 0;
+    n_consumed = 0;
+    bid_src0_base = ggml_metal_get_buffer_id(op->src[0]);
+    bid_dst_base  = ggml_metal_get_buffer_id(op);
 
     for (int g = 0; g < 8 && (idx + g) < ctx->n_nodes(); g++) {
         ggml_tensor * gop = ctx->node(idx + g);
@@ -173,10 +186,45 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
         gargs.groups[n_groups].nb03        = gop->src[0]->nb[3];
         gargs.groups[n_groups].tg_start    = total_tg;
         gargs.groups[n_groups].quant_type  = is_q4k ? 0 : 1;
+        member_src0[n_groups] = gop->src[0];
 
         total_tg += tg_count;
         n_groups++;
         n_consumed++;
+    }
+
+    if (pass == 0 && n_groups >= 2 && profile->n_mv_rows > 0 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+        // same type and shape on every member; headers prepared for all, in one run of one buffer
+        bool same = true;
+        bool prep_ok = profile->kq_prep == 1 && op->src[0]->type == GGML_TYPE_Q4_K;
+        int first = 0; // the member with the lowest weight offset: the bindings start there
+        ggml_metal_buffer_id member_prep[8] = {};
+        for (int group = 0; group < n_groups; ++group) {
+            same = same && member_src0[group]->type == op->src[0]->type && member_src0[group]->ne[1] == op->src[0]->ne[1];
+            if (gargs.groups[group].src0_off < gargs.groups[first].src0_off) {
+                first = group;
+            }
+            member_prep[group] = prep_ok ? ggml_metal_get_kq_prep_id(member_src0[group]) : ggml_metal_buffer_id{ nullptr, 0 };
+            prep_ok = prep_ok && member_prep[group].metal != nullptr && member_prep[group].metal == member_prep[0].metal;
+        }
+        for (int group = 0; group < n_groups && prep_ok; ++group) {
+            const uint64_t woff = gargs.groups[group].src0_off - gargs.groups[first].src0_off;
+            prep_ok = woff % 144 == 0 && member_prep[group].offs >= member_prep[first].offs &&
+                      member_prep[group].offs - member_prep[first].offs == woff / 144 * 32;
+        }
+        const struct ggml_device_mv_row * row = same ? ggml_metal_mv_hw_row(profile, 1, op->src[0]->type, ne00, op->src[0]->ne[1], 1, prep_ok) : nullptr;
+        if (row != nullptr) {
+            kq_prep = row->prep == 1;
+            if (kq_prep) {
+                bid_kq_prep = member_prep[first];
+            }
+            if (row->nr0 != nr0) {
+                nr0 = row->nr0;
+                continue;
+            }
+        }
+    }
+    break;
     }
 
     // Only use grouped dispatch if we found 2+ ops to fuse.
@@ -216,8 +264,12 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     char gpipeline_name[128];
     const int16_t selected_lane = ggml_metal_select_matvec_lane(
         lib, op->src[0]->type, GGML_METAL_MATVEC_ROUTE_GROUPED);
+    // The card's hw row picks the reduce: every row stored before the row sums, or one row at a time.
+    const bool g_red = profile->mv_group_red == 1;
+    const char * gbase = kq_prep ? (g_red ? "kernel_mul_mv_grouped_q4k_prep_red_f32" : "kernel_mul_mv_grouped_q4k_prep_f32")
+                                 : (g_red ? "kernel_mul_mv_grouped_kquant_red_f32" : "kernel_mul_mv_grouped_kquant_f32");
     snprintf(gpipeline_name, sizeof(gpipeline_name),
-        "kernel_mul_mv_grouped_kquant_f32_nr0=%d_lane=%d", nr0, selected_lane);
+        "%s_nr0=%d_lane=%d", gbase, nr0, selected_lane);
 
     auto gpipeline = ggml_metal_library_get_pipeline(lib, gpipeline_name);
     if (!gpipeline.pipeline) {
@@ -225,7 +277,7 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
         ggml_metal_cv_set_int16(cv, (int16_t)nr0, FC_MUL_MV_GROUPED + 0);
         ggml_metal_cv_set_int16(cv, selected_lane, FC_MATVEC_LANE);
         gpipeline = ggml_metal_library_compile_pipeline(lib,
-            "kernel_mul_mv_grouped_kquant_f32", gpipeline_name, cv);
+            gbase, gpipeline_name, cv);
         ggml_metal_cv_free(cv);
     }
 
@@ -238,6 +290,9 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer  (enc, bid_src0_base, 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
     ggml_metal_encoder_set_buffer  (enc, bid_dst_base, 3);
+    if (kq_prep) {
+        ggml_metal_encoder_set_buffer(enc, bid_kq_prep, 5);
+    }
     // Shared memory for cross-lane reduction: NSG x NW x NR0 x sizeof(float)
     // Use nr0 (from tuning) not pipeline.smem (which used hardcoded NR0)
     const size_t grouped_smem = (size_t)nsg * mv_simd_w * nr0 * sizeof(float);

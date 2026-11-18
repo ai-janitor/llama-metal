@@ -81,6 +81,71 @@ struct block_dot_q6_k_scalar_swar {
         const float superblock_scale = float(d_ptr[0]);
         acc += superblock_scale * (sums[0] * scale_ptr[0] + sums[1] * scale_ptr[2] + sums[2] * scale_ptr[4] + sums[3] * scale_ptr[6]);
     }
+
+    // A block's weights as one lane holds them for several activation columns (load_weights once, accumulate_weights
+    // per column); the products and their order are those of accumulate() on the fp32 lane.
+    struct weights { float4 q0; float4 q1; float4 q2; float4 q3; float s0; float s1; float s2; float s3; float d; };
+    static inline weights load_weights(device const block_q6_K * block, thread const block_dot_q6_k_fragment & f) {
+        device const uint8_t * low_ptr = block->ql + f.q_offset_l;
+        device const uint8_t * low_hi_ptr = low_ptr + 32;
+        device const uint8_t * high_ptr = block->qh + f.q_offset_h;
+        device const int8_t * scale_ptr = block->scales + f.scale_index;
+        device const half * d_ptr = &block->d;
+        device const ushort * low_halves_a = (device const ushort *) low_ptr;
+        device const ushort * low_halves_b = (device const ushort *) low_hi_ptr;
+        device const ushort * high_halves = (device const ushort *) high_ptr;
+        constexpr uint HALF_WORD_BITS = 16;
+        const uint low_word_a = uint(low_halves_a[0]) | (uint(low_halves_a[1]) << HALF_WORD_BITS);
+        const uint low_word_b = uint(low_halves_b[0]) | (uint(low_halves_b[1]) << HALF_WORD_BITS);
+        const uint high_word = uint(high_halves[0]) | (uint(high_halves[1]) << HALF_WORD_BITS);
+        constexpr uint LOW_NIBBLES = 0x0F0F0F0F;
+        constexpr uint HIGH_PAIR_0 = 0x03030303;
+        constexpr uint HIGH_PAIR_1 = 0x0C0C0C0C;
+        constexpr uint HIGH_PAIR_2 = 0x30303030;
+        const uint q_g0 = (low_word_a & LOW_NIBBLES) | ((high_word & HIGH_PAIR_0) << 4);
+        const uint q_g1 = (low_word_b & LOW_NIBBLES) | ((high_word & HIGH_PAIR_1) << 2);
+        const uint q_g2 = ((low_word_a >> 4) & LOW_NIBBLES) | (high_word & HIGH_PAIR_2);
+        const uint q_g3 = ((low_word_b >> 4) & LOW_NIBBLES) | ((high_word >> 2) & HIGH_PAIR_2);
+        return { float4(as_type<uchar4>(q_g0)), float4(as_type<uchar4>(q_g1)), float4(as_type<uchar4>(q_g2)), float4(as_type<uchar4>(q_g3)),
+                 float(scale_ptr[0]), float(scale_ptr[2]), float(scale_ptr[4]), float(scale_ptr[6]), float(d_ptr[0]) };
+    }
+    static inline void accumulate_weights(thread const weights & w, thread const block_dot_q6_k_activation & a, thread float & acc) {
+        const float4 unsigned_dots = float4(dot(w.q0, a.act0), dot(w.q1, a.act1), dot(w.q2, a.act2), dot(w.q3, a.act3));
+        constexpr float QUANT_CENTER = 32.f;
+        const float4 sums = unsigned_dots - QUANT_CENTER * a.act_sums;
+        acc += w.d * (sums[0] * w.s0 + sums[1] * w.s1 + sums[2] * w.s2 + sums[3] * w.s3);
+    }
+
+    // A block's weights kept packed (6 values per lane) for several activation columns; accumulate_raw unpacks per column.
+    struct raw { uint q_g0; uint q_g1; uint q_g2; uint q_g3; uint scales; float d; };
+    static inline raw load_raw(device const block_q6_K * block, thread const block_dot_q6_k_fragment & f) {
+        device const uint8_t * low_ptr = block->ql + f.q_offset_l;
+        device const uint8_t * low_hi_ptr = low_ptr + 32;
+        device const uint8_t * high_ptr = block->qh + f.q_offset_h;
+        device const uint8_t * scale_ptr = (device const uint8_t *) block->scales + f.scale_index;
+        device const half * d_ptr = &block->d;
+        device const ushort * low_halves_a = (device const ushort *) low_ptr;
+        device const ushort * low_halves_b = (device const ushort *) low_hi_ptr;
+        device const ushort * high_halves = (device const ushort *) high_ptr;
+        constexpr uint HALF_WORD_BITS = 16;
+        const uint low_word_a = uint(low_halves_a[0]) | (uint(low_halves_a[1]) << HALF_WORD_BITS);
+        const uint low_word_b = uint(low_halves_b[0]) | (uint(low_halves_b[1]) << HALF_WORD_BITS);
+        const uint high_word = uint(high_halves[0]) | (uint(high_halves[1]) << HALF_WORD_BITS);
+        constexpr uint LOW_NIBBLES = 0x0F0F0F0F;
+        constexpr uint HIGH_PAIR_0 = 0x03030303;
+        constexpr uint HIGH_PAIR_1 = 0x0C0C0C0C;
+        constexpr uint HIGH_PAIR_2 = 0x30303030;
+        return { (low_word_a & LOW_NIBBLES) | ((high_word & HIGH_PAIR_0) << 4), (low_word_b & LOW_NIBBLES) | ((high_word & HIGH_PAIR_1) << 2),
+                 ((low_word_a >> 4) & LOW_NIBBLES) | (high_word & HIGH_PAIR_2), ((low_word_b >> 4) & LOW_NIBBLES) | ((high_word >> 2) & HIGH_PAIR_2),
+                 uint(scale_ptr[0]) | (uint(scale_ptr[2]) << 8) | (uint(scale_ptr[4]) << 16) | (uint(scale_ptr[6]) << 24), float(d_ptr[0]) };
+    }
+    static inline void accumulate_raw(thread const raw & r, thread const block_dot_q6_k_activation & a, thread float & acc) {
+        const char4 sc = as_type<char4>(r.scales);
+        const float4 unsigned_dots = float4(dot(float4(as_type<uchar4>(r.q_g0)), a.act0), dot(float4(as_type<uchar4>(r.q_g1)), a.act1), dot(float4(as_type<uchar4>(r.q_g2)), a.act2), dot(float4(as_type<uchar4>(r.q_g3)), a.act3));
+        constexpr float QUANT_CENTER = 32.f;
+        const float4 sums = unsigned_dots - QUANT_CENTER * a.act_sums;
+        acc += r.d * (sums[0] * sc.x + sums[1] * sc.y + sums[2] * sc.z + sums[3] * sc.w);
+    }
 };
 
 // Scalar Q5_K block-dot adapter. It owns the scalar lane map and exact SWAR

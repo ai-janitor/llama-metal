@@ -25,6 +25,12 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
         nth *= 2;
     }
 
+    // a single aligned f32 row is read as 16-byte values by one threadgroup
+    if (op->src[0]->type == GGML_TYPE_F32 && nrows == 1 && ne00 % 4 == 0 && ggml_metal_get_buffer_id(op->src[0]).offs % 16 == 0) {
+        pipeline = ggml_metal_library_get_pipeline_argmax_w4(lib);
+        nth = std::min(1024, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    }
+
     const size_t smem = pipeline.smem;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);

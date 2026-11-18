@@ -85,6 +85,7 @@
 // FC_MUL_MV + 3: src1_trans (bool) — transposed src1 specialization
 // FC_MUL_MV + 4: nr0 (int16)      — rows per simdgroup (dynamic, from model/hw profile)
 // FC_MUL_MV + 10: q8_load (int16) — Q8_0 weight load width in bytes: 1 or 4 (aligned words)
+// FC_MUL_MV + 11: q8_act (int16) — Q8_0 activation load width in bytes: 4 or 16 (two aligned loads per lane)
 #define FC_MATVEC_LANE              (FC_MUL_MV + 5) // int16: shared faithful/fast matvec lane
 #define FC_MUL_MV_RESIDUAL          (FC_MUL_MV + 6) // bool: scalar Q4_K residual epilogue
 #define FC_MUL_MM                      700

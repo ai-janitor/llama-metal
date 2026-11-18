@@ -27,6 +27,30 @@ enum ggml_gpu_connection {
     GGML_GPU_CONNECTION_NETWORK    = 3,  // remote GPU over network
 };
 
+// Per-shape matvec row of a card: a K-quant weight of this type and shape runs nr0 rows per simdgroup.
+// kind 0 = single matvec, 1 = grouped launch of such members; prep 1 = only with headers prepared at load;
+// cols 1 = one activation column, 2-4 = a decode batch of that many columns in one launch, in loop form "form".
+struct ggml_device_mv_row {
+    uint32_t pci_vendor;
+    uint32_t pci_device;
+    int32_t  kind;
+    int32_t  type; // ggml_type
+    int64_t  ne00;
+    int64_t  ne01;
+    int32_t  nr0;
+    int32_t  prep;
+    int32_t  cols;
+    int32_t  form; // bit 0 = weights held (activations reloaded per row), bit 1 = weights kept packed
+};
+
+// Column count from which a K-quant weight type takes the small-batch kernel (mul_mv_ext) on a card.
+struct ggml_device_mv_ext_min {
+    uint32_t pci_vendor;
+    uint32_t pci_device;
+    int32_t  type; // ggml_type
+    int32_t  ext_min;
+};
+
 struct ggml_device_profile {
     // Identity
     enum ggml_gpu_vendor vendor;
@@ -79,6 +103,32 @@ struct ggml_device_profile {
 
     // Smallest row count of a single Q8_0 matvec that runs 8 whole rows per simdgroup (from the hw row); 0 = never.
     uint32_t q8_rows8_min;
+
+    // Q8_0 matvec activation load width in bytes (from the hw row): 4 single values, 16 two aligned loads per lane.
+    uint32_t q8_act_load_bytes;
+
+    // Discrete card: 1 commits each input upload without waiting for it (the graph runs after it on the same queue), 0 waits (from the hw row).
+    uint32_t set_nowait;
+
+    // Discrete card: 1 keeps one logits staging buffer per context and reuses it every token, 0 makes a new one per read (from the hw row).
+    uint32_t staging_keep;
+
+    // 1 = the grouped K-quant matvec stores every row before the row sums, lane k sums row k (from the hw row).
+    uint32_t mv_group_red;
+
+    // Per-shape matvec rows of this card (generated hw mv rows): rows per simdgroup per K-quant weight shape; none = defaults.
+    const struct ggml_device_mv_row * mv_rows;
+    uint32_t n_mv_rows;
+
+    // 1 = Q4_K weight tensors named by a prep row get their block headers unpacked once at load.
+    uint32_t kq_prep;
+
+    // 1 = the rows with cols 2-4 apply (a decode batch of 2-4 columns in one launch).
+    uint32_t kq_cols;
+
+    // Per-type column count where K-quants take mul_mv_ext on this card (generated rows); none = 4.
+    const struct ggml_device_mv_ext_min * mv_ext_min;
+    uint32_t n_mv_ext_min;
 };
 
 #ifdef __cplusplus

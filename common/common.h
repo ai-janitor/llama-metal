@@ -301,6 +301,7 @@ struct common_params_sampling {
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
+    bool gpu_pick = false; // greedy pick on the GPU: one argmax node, one token read back (--gpu-pick)
 
     // print the parameters into a string
     std::string print() const;

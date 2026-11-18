@@ -82,16 +82,21 @@ struct ggml_metal_kargs_mul_mv_grouped {
 
 // Mixed-type grouped matvec: q4_K and q6_K in one dispatch.
 // Both types use THREADS_PER_BLOCK=16, so threadgroup geometry is identical.
-kernel void kernel_mul_mv_grouped_kquant_f32(
-        constant ggml_metal_kargs_mul_mv_grouped & args [[buffer(0)]],
-        device const char * src0 [[buffer(1)]],   // weight data (base pointer, groups offset from here)
-        device const char * src1 [[buffer(2)]],   // input activation vector (shared across all groups)
-        device       char * dst  [[buffer(3)]],   // output buffer (base pointer, groups offset from here)
-        threadgroup  char * shmem [[threadgroup(0)]],  // shared memory for cross-lane reduction
-        uint3  tgpig [[threadgroup_position_in_grid]],
-        ushort tiisg [[thread_index_in_simdgroup]],
-        ushort sgitg [[simdgroup_index_in_threadgroup]],
-        ushort tidx  [[thread_index_in_threadgroup]]) {
+// PREP: every member is Q4_K and its block headers come from entries unpacked once at load (prep, 32 bytes per
+// block; a member's first entry is its weight offset / 144 from the binding); false never reads prep.
+// RED: every row stored first, then lane k sums row k (same lane order per row).
+template<bool PREP, bool RED>
+void kernel_mul_mv_grouped_kquant_f32_impl(
+        constant ggml_metal_kargs_mul_mv_grouped & args,
+        device const char * src0,   // weight data (base pointer, groups offset from here)
+        device const char * src1,   // input activation vector (shared across all groups)
+        device       char * dst,    // output buffer (base pointer, groups offset from here)
+        device const char * prep,
+        threadgroup  char * shmem,  // shared memory for cross-lane reduction
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
 
     // -------------------------------------------------------------------------
     // Hardware constants — adapted to any SIMD width via function constant.
@@ -257,7 +262,12 @@ kernel void kernel_mul_mv_grouped_kquant_f32(
                 // half pointer: advance by nb01 bytes / 2
                 // Preserve the original byte row stride before restoring the Q4 block type.
                 device const block_q4_K * block = (device const block_q4_K *) ((device const char *) (x + ib) + row*grp.nb01);
-                block_dot_q4_k_swar::accumulate<block_dot_lane_fp32>(block, owned, prepared, sumf[row]);
+                if (PREP) {
+                    device const uint * header = (device const uint *) (prep + (grp.src0_off / 144 + (uint64_t) ((first_row + row) * nb + ib)) * 32);
+                    block_dot_q4_k_swar::accumulate_prepared<block_dot_lane_fp32>(block, owned, prepared, sumf[row], header);
+                } else {
+                    block_dot_q4_k_swar::accumulate<block_dot_lane_fp32>(block, owned, prepared, sumf[row]);
+                }
             }
         }
     } else {
@@ -315,6 +325,19 @@ kernel void kernel_mul_mv_grouped_kquant_f32(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const ushort ltid = tidx % NW;
     threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * NR0;
+    if (RED) {
+        for (int row = 0; row < NR0; ++row) {
+            buf[NW * row + ltid] = sumf[row];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ltid < NR0 && first_row + ltid < grp.ne01) {
+            float tot = 0.0f;
+            for (short i = 0; i < NW; i++) { tot += buf[NW * ltid + i]; }
+            dst_f32[first_row + ltid] = tot;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        return;
+    }
     for (int row = 0; row < NR0; ++row) {
         // All threads write their partial sum for this row.
         buf[NW * row + ltid] = sumf[row];
@@ -330,4 +353,61 @@ kernel void kernel_mul_mv_grouped_kquant_f32(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+kernel void kernel_mul_mv_grouped_kquant_f32(
+        constant ggml_metal_kargs_mul_mv_grouped & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device       char * dst  [[buffer(3)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tidx  [[thread_index_in_threadgroup]]) {
+    kernel_mul_mv_grouped_kquant_f32_impl<false, false>(args, src0, src1, dst, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
+}
+
+// The grouped launch whose members are all Q4_K weights with prepared block headers (hw mv rows, kind group, prep):
+// the headers at buffer 5.
+kernel void kernel_mul_mv_grouped_q4k_prep_f32(
+        constant ggml_metal_kargs_mul_mv_grouped & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device       char * dst  [[buffer(3)]],
+        device const char * prep [[buffer(5)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tidx  [[thread_index_in_threadgroup]]) {
+    kernel_mul_mv_grouped_kquant_f32_impl<true, false>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+}
+
+// The grouped launches with every row stored before the row sums.
+kernel void kernel_mul_mv_grouped_kquant_red_f32(
+        constant ggml_metal_kargs_mul_mv_grouped & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device       char * dst  [[buffer(3)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tidx  [[thread_index_in_threadgroup]]) {
+    kernel_mul_mv_grouped_kquant_f32_impl<false, true>(args, src0, src1, dst, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
+}
+
+kernel void kernel_mul_mv_grouped_q4k_prep_red_f32(
+        constant ggml_metal_kargs_mul_mv_grouped & args [[buffer(0)]],
+        device const char * src0 [[buffer(1)]],
+        device const char * src1 [[buffer(2)]],
+        device       char * dst  [[buffer(3)]],
+        device const char * prep [[buffer(5)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tidx  [[thread_index_in_threadgroup]]) {
+    kernel_mul_mv_grouped_kquant_f32_impl<true, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
 }

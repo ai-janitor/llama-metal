@@ -62,14 +62,10 @@ int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q4_K ||
            op->src[0]->type == GGML_TYPE_Q5_K ||
            op->src[0]->type == GGML_TYPE_Q6_K ||
-           // NOTE: ne11 >= 4 is intentional for kquant types, NOT a bug.
-           // Tested 2026-03-28: changing to ne11 >= 2 regresses pp2 from 39.4 to 28.9 (-27%).
-           // The ext kernel uses generic dequant functions (dequantize_q4_K per 16 elements)
-           // which are much slower than the specialized kquant scalar kernel's hand-optimized
-           // bitmask/scale unpacking. At batch=2-3, the scalar kernel runs 2-3 independent
-           // matvecs which is faster than ext's weight-sharing with slow dequant.
-           // The ext kernel only wins at batch >= 4 where weight reuse overcomes the dequant cost.
-           false) && (ne11 >= 4 && (ne11 <= 8 || !profile->has_matrix_hw))
+           // K-quants take ext from a per-card column count (hw rows, default 4): its generic dequant is slow, so below
+           // it the scalar kernel runs once per column, or a cols row of the card takes the whole batch in one launch.
+           false) && (ne11 >= ggml_metal_kq_ext_min(profile, op->src[0]->type) && (ne11 <= 8 || !profile->has_matrix_hw)) &&
+          (ne11 > 4 || (ggml_metal_mv_hw_row(profile, 0, op->src[0]->type, ne00, ne01, ne11, true) == nullptr && !ggml_metal_kq_cols_test(nullptr, nullptr)))
          )
         )
        ) {

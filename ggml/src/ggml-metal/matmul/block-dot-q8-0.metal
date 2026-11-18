@@ -31,7 +31,8 @@ struct block_dot_q8_0_scalar {
     template<short ARITHMETIC_LANE = block_dot_lane_fp32>
     static inline block_dot_q8_0_activation prepare_activation(
             thread const block_dot_q8_0_fragment & owned,
-            device const float * block_y) {
+            device const float * block_y,
+            const short act_load = 4) {
         static_assert(
                 ARITHMETIC_LANE == block_dot_lane_fp32 ||
                 ARITHMETIC_LANE == block_dot_lane_packed_fp16,
@@ -39,8 +40,17 @@ struct block_dot_q8_0_scalar {
         block_dot_q8_0_activation prepared;
         device const float * lane_y = block_y + owned.element_offset;
 
-        for (short i = 0; i < elements_per_lane; ++i) {
-            prepared.values[i] = lane_y[i];
+        if (act_load == 16) {
+            // The same eight values as two 16-byte loads; lane_y is 16-byte aligned when the host passes 16.
+            device const float4 * lane_y4 = (device const float4 *) lane_y;
+            const float4 y0 = lane_y4[0];
+            const float4 y1 = lane_y4[1];
+            prepared.values[0] = y0.x; prepared.values[1] = y0.y; prepared.values[2] = y0.z; prepared.values[3] = y0.w;
+            prepared.values[4] = y1.x; prepared.values[5] = y1.y; prepared.values[6] = y1.z; prepared.values[7] = y1.w;
+        } else {
+            for (short i = 0; i < elements_per_lane; ++i) {
+                prepared.values[i] = lane_y[i];
+            }
         }
 
         if (ARITHMETIC_LANE == block_dot_lane_packed_fp16) {

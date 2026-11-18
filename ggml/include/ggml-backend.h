@@ -161,6 +161,8 @@ extern "C" {
         bool events;
         // mmap is supported for loading
         bool mmap_support;
+        // work committed by any backend of this device runs in commit order on one queue
+        bool queue_in_order;
     };
 
     // all the device properties

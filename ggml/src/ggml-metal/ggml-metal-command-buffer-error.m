@@ -24,7 +24,80 @@ bool ggml_metal_gpu_error_callback_registered(void) {
     return registered;
 }
 
+// Input uploads that nobody waits for share one blit command buffer and one staging buffer per queue; the next
+// creator of a command buffer on that queue commits them first. GGML_METAL_UP_BATCH=0 switches the batch off.
+#define GGML_METAL_UP_QUEUES 8
+struct ggml_metal_up {
+    id<MTLCommandQueue>       queue;
+    id<MTLCommandBuffer>      cmd;
+    id<MTLBlitCommandEncoder> enc;
+    id<MTLBuffer>             stage;
+    size_t                    used;
+};
+static struct ggml_metal_up g_up[GGML_METAL_UP_QUEUES];
+static int                  g_up_n  = 0;
+static int                  g_up_on = -1;
+static pthread_mutex_t      g_up_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void ggml_metal_upload_flush(id<MTLCommandQueue> queue) {
+    pthread_mutex_lock(&g_up_mutex);
+    for (int i = 0; i < g_up_n; ++i) {
+        struct ggml_metal_up * up = &g_up[i];
+        if (up->queue == queue && up->cmd) {
+            [up->enc endEncoding];
+            [up->cmd commit];
+            [up->enc release];
+            [up->cmd release];
+            [up->stage release];
+            up->enc = nil; up->cmd = nil; up->stage = nil; up->used = 0;
+        }
+    }
+    pthread_mutex_unlock(&g_up_mutex);
+}
+
+bool ggml_metal_upload_add(id<MTLCommandQueue> queue, id<MTLDevice> device, const void * data, size_t size, id<MTLBuffer> dst, size_t dst_offs) {
+    pthread_mutex_lock(&g_up_mutex);
+    if (g_up_on < 0) {
+        const char * v = getenv("GGML_METAL_UP_BATCH");
+        g_up_on = (v && strcmp(v, "0") == 0) ? 0 : 1;
+    }
+    struct ggml_metal_up * up = NULL;
+    for (int i = 0; i < g_up_n; ++i) {
+        if (g_up[i].queue == queue) {
+            up = &g_up[i];
+        }
+    }
+    if (g_up_on == 0 || (!up && g_up_n == GGML_METAL_UP_QUEUES)) {
+        pthread_mutex_unlock(&g_up_mutex);
+        return false;
+    }
+    if (!up) {
+        up = &g_up[g_up_n++];
+        memset(up, 0, sizeof(*up));
+        up->queue = queue;
+    }
+    @autoreleasepool {
+        if (!up->cmd) {
+            up->cmd = [[queue commandBuffer] retain];
+            up->enc = [[up->cmd blitCommandEncoder] retain];
+        }
+        // the command buffer keeps a full staging buffer alive until its copies ran
+        const size_t cap = 256*1024;
+        if (up->stage == nil || up->used + size > [up->stage length]) {
+            [up->stage release];
+            up->stage = [device newBufferWithLength:(size > cap ? size : cap) options:MTLResourceStorageModeShared];
+            up->used  = 0;
+        }
+        memcpy((char *) [up->stage contents] + up->used, data, size);
+        [up->enc copyFromBuffer:up->stage sourceOffset:up->used toBuffer:dst destinationOffset:dst_offs size:size];
+        up->used += (size + 15) & ~(size_t) 15;
+    }
+    pthread_mutex_unlock(&g_up_mutex);
+    return true;
+}
+
 id<MTLCommandBuffer> ggml_metal_new_command_buffer(id<MTLCommandQueue> queue, bool unretained) {
+    ggml_metal_upload_flush(queue);
     if (!ggml_metal_gpu_error_callback_registered()) {
         return unretained ? [queue commandBufferWithUnretainedReferences] : [queue commandBuffer];
     }

@@ -351,13 +351,16 @@ constant bool FC_mul_mv_residual [[function_constant(FC_MUL_MV_RESIDUAL)]];
 // and plane index, so the host only enables it for one-column, one-plane decode.
 // Specializations that never set FC606 (e.g. kernel_mul_mv_id_q4_K_f32) take the
 // plain-store path via is_function_constant_defined.
-template<int nr0, typename args_t>
+// PREP: the block headers come from entries unpacked once at load (prep, 32 bytes per block, block ordinal =
+// row * blocks per row + block); false never reads prep.
+template<int nr0, typename args_t, bool PREP = false>
 void kernel_mul_mv_q4_K_f32_residual_impl(
         args_t args,
         device const char * src0,
         device const char * src1,
         device       char * dst,
         device const float * residual,
+        device const char * prep,
         threadgroup  char * shmem,
         uint3  tgpig,
         ushort tiisg,
@@ -486,7 +489,12 @@ void kernel_mul_mv_q4_K_f32_residual_impl(
             // half pointer
             // Preserve the original byte row stride before restoring the Q4 block type.
             device const block_q4_K * block = (device const block_q4_K *) ((device const char *) (x + ib) + row*args.nb01);
-            block_dot_q4_k_swar::accumulate<block_dot_lane_fp32>(block, owned, prepared, sumf[row]);
+            if (PREP) {
+                device const uint * header = (device const uint *) (prep + (uint64_t) ((first_row + row) * nb + ib) * 32);
+                block_dot_q4_k_swar::accumulate_prepared<block_dot_lane_fp32>(block, owned, prepared, sumf[row], header);
+            } else {
+                block_dot_q4_k_swar::accumulate<block_dot_lane_fp32>(block, owned, prepared, sumf[row]);
+            }
         }
     }
 
@@ -538,7 +546,7 @@ void kernel_mul_mv_q4_K_f32_impl(
         ushort tiisg,
         ushort sgitg,
         ushort tidx) {
-    kernel_mul_mv_q4_K_f32_residual_impl<nr0, args_t>(args, src0, src1, dst, (device const float *) dst, shmem, tgpig, tiisg, sgitg, tidx);
+    kernel_mul_mv_q4_K_f32_residual_impl<nr0, args_t>(args, src0, src1, dst, (device const float *) dst, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
 }
 
 [[host_name("kernel_mul_mv_q4_K_f32")]]
@@ -555,13 +563,39 @@ kernel void kernel_mul_mv_q4_K_f32(
         ushort tidx [[thread_index_in_threadgroup]]) {
 
     if (FC_mul_mv_nr0 == 1) {
-        kernel_mul_mv_q4_K_f32_residual_impl<1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, residual, shmem, tgpig, tiisg, sgitg, tidx);
+        kernel_mul_mv_q4_K_f32_residual_impl<1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, residual, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
     } else if (FC_mul_mv_nr0 == 4) {
-        kernel_mul_mv_q4_K_f32_residual_impl<4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, residual, shmem, tgpig, tiisg, sgitg, tidx);
+        kernel_mul_mv_q4_K_f32_residual_impl<4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, residual, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
     } else if (FC_mul_mv_nr0 == 8) {
-        kernel_mul_mv_q4_K_f32_residual_impl<8, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, residual, shmem, tgpig, tiisg, sgitg, tidx);
+        kernel_mul_mv_q4_K_f32_residual_impl<8, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, residual, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
     } else {
-        kernel_mul_mv_q4_K_f32_residual_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, residual, shmem, tgpig, tiisg, sgitg, tidx);
+        kernel_mul_mv_q4_K_f32_residual_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, residual, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
+
+// Q4_K matvec of a weight whose block headers were unpacked once at load (hw mv rows with prep): the headers at
+// buffer 5; one plane, one column, no residual.
+[[host_name("kernel_mul_mv_q4_K_prep_f32")]]
+kernel void kernel_mul_mv_q4_K_prep_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep [[buffer(5)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tidx [[thread_index_in_threadgroup]]) {
+
+    if (FC_mul_mv_nr0 == 1) {
+        kernel_mul_mv_q4_K_f32_residual_impl<1, constant ggml_metal_kargs_mul_mv &, true>(args, src0, src1, dst, (device const float *) dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_nr0 == 4) {
+        kernel_mul_mv_q4_K_f32_residual_impl<4, constant ggml_metal_kargs_mul_mv &, true>(args, src0, src1, dst, (device const float *) dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_nr0 == 8) {
+        kernel_mul_mv_q4_K_f32_residual_impl<8, constant ggml_metal_kargs_mul_mv &, true>(args, src0, src1, dst, (device const float *) dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q4_K_f32_residual_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &, true>(args, src0, src1, dst, (device const float *) dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
     }
 }
 
@@ -833,6 +867,701 @@ kernel void kernel_mul_mv_q6_K_f32_v3(
 }
 
 // ======================= "True" 2-bit
+
+
+// Columns per launch of the *_cols entry points (2, 3 or 4) and their loop form (bit 0 = weights held, bit 1 = packed,
+// bit 2 = paired halves at 2 or 3 columns).
+constant short FC_mul_mv_ncols_raw [[function_constant(FC_MUL_MV + 12)]];
+constant short FC_mul_mv_ncols = is_function_constant_defined(FC_mul_mv_ncols_raw) ? FC_mul_mv_ncols_raw : 2;
+constant short FC_mul_mv_col_form_raw [[function_constant(FC_MUL_MV + 13)]];
+constant short FC_mul_mv_col_form = is_function_constant_defined(FC_mul_mv_col_form_raw) ? FC_mul_mv_col_form_raw : 0;
+
+// Q4_K matvec over NC activation columns in one launch: a lane loads each block's weights once for all columns.
+// HOLD_W reloads the activations per row instead of keeping them; PACK keeps the weights packed and unpacks per column.
+template<int nr0, int NC, typename args_t, bool PREP, bool HOLD_W, bool PACK>
+void kernel_mul_mv_q4_K_f32_cols_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    const short NSG = FC_mul_mv_nsg;
+    const short NW = N_SIMDWIDTH;
+    const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
+    const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
+
+    constexpr short THREADS_PER_BLOCK = block_dot_q4_k_swar::threads_per_block;
+    const short CONCURRENT_BLOCKS = NW / THREADS_PER_BLOCK;
+    const short block_id      = eff_tiisg / THREADS_PER_BLOCK;
+    const short lane_in_block = eff_tiisg % THREADS_PER_BLOCK;
+
+    const int nb = args.ne00/QK_K;
+    const int r1 = (tgpig.y + args.tg_y_offset) * NC;
+    const int im = tgpig.z;
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    const int first_row = (((int) tgpig.x + args.tg_x_offset) * NSG + eff_sgitg) * nr0;
+    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+
+    float sumf[nr0*NC] = {0.f};
+
+    const block_dot_q4_k_fragment owned = block_dot_q4_k_swar::owned_fragment(lane_in_block);
+    for (int ib = block_id; ib < nb; ib += CONCURRENT_BLOCKS) {
+        block_dot_q4_k_activation held[NC];
+        if (!HOLD_W) {
+            for (short c = 0; c < NC; ++c) {
+                held[c] = block_dot_q4_k_swar::prepare_activation<block_dot_lane_fp32>(owned, (device const float *) (src1 + offset1 + c*args.nb11) + ib*QK_K);
+            }
+        }
+        for (short row = 0; row < nr0; ++row) {
+            device const block_q4_K * block = (device const block_q4_K *) ((device const char *) (x + ib) + row*args.nb01);
+            device const uint * header = (device const uint *) (prep + (uint64_t) ((first_row + row) * nb + ib) * 32);
+            if (PACK) {
+                block_dot_q4_k_swar::raw w;
+                if (PREP) {
+                    w = block_dot_q4_k_swar::load_raw_prepared(block, owned, header);
+                } else {
+                    w = block_dot_q4_k_swar::load_raw(block, owned);
+                }
+                for (short c = 0; c < NC; ++c) {
+                    if (HOLD_W) {
+                        const block_dot_q4_k_activation act = block_dot_q4_k_swar::prepare_activation<block_dot_lane_fp32>(owned, (device const float *) (src1 + offset1 + c*args.nb11) + ib*QK_K);
+                        block_dot_q4_k_swar::accumulate_raw(w, act, sumf[row*NC + c]);
+                    } else {
+                        block_dot_q4_k_swar::accumulate_raw(w, held[c], sumf[row*NC + c]);
+                    }
+                }
+            } else {
+                block_dot_q4_k_swar::weights w;
+                if (PREP) {
+                    w = block_dot_q4_k_swar::load_weights_prepared(block, owned, header);
+                } else {
+                    w = block_dot_q4_k_swar::load_weights(block, owned);
+                }
+                for (short c = 0; c < NC; ++c) {
+                    if (HOLD_W) {
+                        const block_dot_q4_k_activation act = block_dot_q4_k_swar::prepare_activation<block_dot_lane_fp32>(owned, (device const float *) (src1 + offset1 + c*args.nb11) + ib*QK_K);
+                        block_dot_q4_k_swar::accumulate_weights(w, act, sumf[row*NC + c]);
+                    } else {
+                        block_dot_q4_k_swar::accumulate_weights(w, held[c], sumf[row*NC + c]);
+                    }
+                }
+            }
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    if (FC_mul_mv_shmem_reduce) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const ushort ltid = tidx % NW;
+        threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0 * NC;
+        for (int k = 0; k < nr0*NC; ++k) {
+            buf[NW * k + ltid] = sumf[k];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Lane k sums accumulator k (row k / NC, column k % NC) in lane order, as the one-column kernel does.
+        for (int k = ltid; k < nr0*NC; k += NW) {
+            const int row = k / NC;
+            const int c = k % NC;
+            if (first_row + row < args.ne0 && r1 + c < args.ne11) {
+                float tot = 0.0f;
+                for (short i = 0; i < NW; i++) { tot += buf[NW * k + i]; }
+                dst_f32[(int64_t) c*args.ne0 + first_row + row] = tot;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (int k = 0; k < nr0*NC; ++k) {
+            sumf[k] = simd_sum(sumf[k]);
+        }
+        if (tiisg == 0) {
+            for (int k = 0; k < nr0*NC; ++k) {
+                if (first_row + k / NC < args.ne0 && r1 + k % NC < args.ne11) {
+                    dst_f32[(int64_t) (k % NC)*args.ne0 + first_row + k / NC] = sumf[k];
+                }
+            }
+        }
+    }
+}
+
+template<int NC, typename args_t, bool PREP, bool HOLD_W, bool PACK>
+void kernel_mul_mv_q4_K_f32_cols_rows(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    if (FC_mul_mv_nr0 == 1) {
+        kernel_mul_mv_q4_K_f32_cols_impl<1, NC, args_t, PREP, HOLD_W, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_nr0 == 2) {
+        kernel_mul_mv_q4_K_f32_cols_impl<2, NC, args_t, PREP, HOLD_W, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_nr0 == 4) {
+        kernel_mul_mv_q4_K_f32_cols_impl<4, NC, args_t, PREP, HOLD_W, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q4_K_f32_cols_impl<8, NC, args_t, PREP, HOLD_W, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
+
+template<int NC, typename args_t, bool PREP>
+void kernel_mul_mv_q4_K_f32_cols_form(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    if (FC_mul_mv_col_form == 0) {
+        kernel_mul_mv_q4_K_f32_cols_rows<NC, args_t, PREP, false, false>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_col_form == 1) {
+        kernel_mul_mv_q4_K_f32_cols_rows<NC, args_t, PREP, true, false>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_col_form == 2) {
+        kernel_mul_mv_q4_K_f32_cols_rows<NC, args_t, PREP, false, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q4_K_f32_cols_rows<NC, args_t, PREP, true, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
+
+// One pass of a half wave: block ib of RH rows for NC columns, activations loaded once per pass.
+template<int RH, int NC, typename args_t, bool PREP, bool PACK>
+static inline void kernel_mul_mv_q4_K_f32_half_pass(
+        args_t args,
+        device const block_q4_K * x,
+        device const char * src1,
+        device const char * prep,
+        uint64_t offset1,
+        int first_row,
+        int nb,
+        thread const block_dot_q4_k_fragment & owned,
+        int ib,
+        short h,
+        thread float * s) {
+    block_dot_q4_k_activation held[NC];
+    for (short c = 0; c < NC; ++c) {
+        held[c] = block_dot_q4_k_swar::prepare_activation<block_dot_lane_fp32>(owned, (device const float *) (src1 + offset1 + c*args.nb11) + ib*QK_K);
+    }
+    for (short rr = 0; rr < RH; ++rr) {
+        const int row = RH*h + rr;
+        device const block_q4_K * block = (device const block_q4_K *) ((device const char *) (x + ib) + row*args.nb01);
+        if (PACK) {
+            block_dot_q4_k_swar::raw w;
+            if (PREP) {
+                w = block_dot_q4_k_swar::load_raw_prepared(block, owned, (device const uint *) (prep + (uint64_t) ((first_row + row) * nb + ib) * 32));
+            } else {
+                w = block_dot_q4_k_swar::load_raw(block, owned);
+            }
+            for (short c = 0; c < NC; ++c) {
+                block_dot_q4_k_swar::accumulate_raw(w, held[c], s[rr*NC + c]);
+            }
+        } else {
+            block_dot_q4_k_swar::weights w;
+            if (PREP) {
+                w = block_dot_q4_k_swar::load_weights_prepared(block, owned, (device const uint *) (prep + (uint64_t) ((first_row + row) * nb + ib) * 32));
+            } else {
+                w = block_dot_q4_k_swar::load_weights(block, owned);
+            }
+            for (short c = 0; c < NC; ++c) {
+                block_dot_q4_k_swar::accumulate_weights(w, held[c], s[rr*NC + c]);
+            }
+        }
+    }
+}
+
+// Q4_K matvec with paired halves (64-lane waves, shared-memory reduce): each half of a wave works RH rows and
+// two blocks per pass; a lane's two banks land in the one-column kernel's lane slots, so the row sum order is unchanged.
+template<int RH, int NC, typename args_t, bool PREP, bool PACK>
+void kernel_mul_mv_q4_K_f32_half_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    constexpr int nr0 = 2*RH;
+    const short NSG = FC_mul_mv_nsg;
+    const short NW = N_SIMDWIDTH;
+    const ushort ltid = tidx % NW;
+    const ushort eff_sgitg = tidx / NW;
+    const short h = ltid / 32;
+    const short t = ltid % 32;
+    const short b = t / 16;
+
+    const int nb = args.ne00/QK_K;
+    const int r1 = (tgpig.y + args.tg_y_offset) * NC;
+    const int im = tgpig.z;
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    const int first_row = (((int) tgpig.x + args.tg_x_offset) * NSG + eff_sgitg) * nr0;
+    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+    device const block_q4_K * x = (device const block_q4_K *) (src0 + offset0);
+
+    const block_dot_q4_k_fragment owned = block_dot_q4_k_swar::owned_fragment(t % 16);
+    float bank0[RH*NC] = {0.f};
+    float bank1[RH*NC] = {0.f};
+    for (int ib = b; ib < nb; ib += 4) {
+        kernel_mul_mv_q4_K_f32_half_pass<RH, NC, args_t, PREP, PACK>(args, x, src1, prep, offset1, first_row, nb, owned, ib, h, bank0);
+        if (ib + 2 < nb) {
+            kernel_mul_mv_q4_K_f32_half_pass<RH, NC, args_t, PREP, PACK>(args, x, src1, prep, offset1, first_row, nb, owned, ib + 2, h, bank1);
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0 * NC;
+    for (short rr = 0; rr < RH; ++rr) {
+        for (short c = 0; c < NC; ++c) {
+            const int k = (RH*h + rr)*NC + c;
+            buf[NW * k + t] = bank0[rr*NC + c];
+            buf[NW * k + t + 32] = bank1[rr*NC + c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k = ltid; k < nr0*NC; k += NW) {
+        const int row = k / NC;
+        const int c = k % NC;
+        if (first_row + row < args.ne0 && r1 + c < args.ne11) {
+            float tot = 0.0f;
+            for (short i = 0; i < NW; i++) { tot += buf[NW * k + i]; }
+            dst_f32[(int64_t) c*args.ne0 + first_row + row] = tot;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template<int NC, typename args_t, bool PREP, bool PACK>
+void kernel_mul_mv_q4_K_f32_half_rows(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    if (FC_mul_mv_nr0 == 2) {
+        kernel_mul_mv_q4_K_f32_half_impl<1, NC, args_t, PREP, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_nr0 == 4) {
+        kernel_mul_mv_q4_K_f32_half_impl<2, NC, args_t, PREP, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q4_K_f32_half_impl<4, NC, args_t, PREP, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
+
+template<typename args_t, bool PREP>
+void kernel_mul_mv_q4_K_f32_half_cols(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    const bool pack = (FC_mul_mv_col_form & 2) != 0;
+    if (FC_mul_mv_ncols == 2) {
+        if (pack) { kernel_mul_mv_q4_K_f32_half_rows<2, args_t, PREP, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx); } else { kernel_mul_mv_q4_K_f32_half_rows<2, args_t, PREP, false>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx); }
+    } else {
+        if (pack) { kernel_mul_mv_q4_K_f32_half_rows<3, args_t, PREP, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx); } else { kernel_mul_mv_q4_K_f32_half_rows<3, args_t, PREP, false>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx); }
+    }
+}
+
+[[host_name("kernel_mul_mv_q4_K_cols_f32")]]
+kernel void kernel_mul_mv_q4_K_cols_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tidx [[thread_index_in_threadgroup]]) {
+    if ((FC_mul_mv_col_form & 4) != 0) {
+        kernel_mul_mv_q4_K_f32_half_cols<constant ggml_metal_kargs_mul_mv &, false>(args, src0, src1, dst, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
+        return;
+    }
+    if (FC_mul_mv_ncols == 2) {
+        kernel_mul_mv_q4_K_f32_cols_form<2, constant ggml_metal_kargs_mul_mv &, false>(args, src0, src1, dst, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_ncols == 3) {
+        kernel_mul_mv_q4_K_f32_cols_form<3, constant ggml_metal_kargs_mul_mv &, false>(args, src0, src1, dst, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q4_K_f32_cols_form<4, constant ggml_metal_kargs_mul_mv &, false>(args, src0, src1, dst, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
+
+[[host_name("kernel_mul_mv_q4_K_prep_cols_f32")]]
+kernel void kernel_mul_mv_q4_K_prep_cols_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep [[buffer(5)]],
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tidx [[thread_index_in_threadgroup]]) {
+    if ((FC_mul_mv_col_form & 4) != 0) {
+        kernel_mul_mv_q4_K_f32_half_cols<constant ggml_metal_kargs_mul_mv &, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+        return;
+    }
+    if (FC_mul_mv_ncols == 2) {
+        kernel_mul_mv_q4_K_f32_cols_form<2, constant ggml_metal_kargs_mul_mv &, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_ncols == 3) {
+        kernel_mul_mv_q4_K_f32_cols_form<3, constant ggml_metal_kargs_mul_mv &, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q4_K_f32_cols_form<4, constant ggml_metal_kargs_mul_mv &, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
+
+// Q6_K matvec over NC activation columns in one launch: a lane loads each block's weights once for all columns.
+// HOLD_W reloads the activations per row instead of keeping them; PACK keeps the weights packed and unpacks per column.
+template<int nr0, int NC, typename args_t, bool HOLD_W, bool PACK>
+void kernel_mul_mv_q6_K_f32_cols_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    const short NSG = FC_mul_mv_nsg;
+    const short NW = N_SIMDWIDTH;
+    const ushort eff_tiisg = FC_mul_mv_shmem_reduce ? (tidx % NW) : tiisg;
+    const ushort eff_sgitg = FC_mul_mv_shmem_reduce ? (tidx / NW) : sgitg;
+
+    constexpr short THREADS_PER_BLOCK = block_dot_q6_k_scalar_swar::threads_per_block;
+    const short CONCURRENT_BLOCKS = NW / THREADS_PER_BLOCK;
+    const short block_id      = eff_tiisg / THREADS_PER_BLOCK;
+    const short lane_in_block = eff_tiisg % THREADS_PER_BLOCK;
+
+    const int nb = args.ne00/QK_K;
+    const int r1 = (tgpig.y + args.tg_y_offset) * NC;
+    const int im = tgpig.z;
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    const int first_row = (((int) tgpig.x + args.tg_x_offset) * NSG + eff_sgitg) * nr0;
+    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+    device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
+
+    float sumf[nr0*NC] = {0.f};
+
+    const block_dot_q6_k_fragment owned = block_dot_q6_k_scalar_swar::owned_fragment(lane_in_block);
+    for (int ib = block_id; ib < nb; ib += CONCURRENT_BLOCKS) {
+        block_dot_q6_k_activation held[NC];
+        if (!HOLD_W) {
+            for (short c = 0; c < NC; ++c) {
+                held[c] = block_dot_q6_k_scalar_swar::prepare_activation<block_dot_lane_fp32>(owned, (device const float *) (src1 + offset1 + c*args.nb11) + ib*QK_K);
+            }
+        }
+        for (short row = 0; row < nr0; ++row) {
+            device const block_q6_K * block = (device const block_q6_K *) ((device const char *) (x + ib) + row*args.nb01);
+            if (PACK) {
+                const block_dot_q6_k_scalar_swar::raw w = block_dot_q6_k_scalar_swar::load_raw(block, owned);
+                for (short c = 0; c < NC; ++c) {
+                    if (HOLD_W) {
+                        const block_dot_q6_k_activation act = block_dot_q6_k_scalar_swar::prepare_activation<block_dot_lane_fp32>(owned, (device const float *) (src1 + offset1 + c*args.nb11) + ib*QK_K);
+                        block_dot_q6_k_scalar_swar::accumulate_raw(w, act, sumf[row*NC + c]);
+                    } else {
+                        block_dot_q6_k_scalar_swar::accumulate_raw(w, held[c], sumf[row*NC + c]);
+                    }
+                }
+            } else {
+                const block_dot_q6_k_scalar_swar::weights w = block_dot_q6_k_scalar_swar::load_weights(block, owned);
+                for (short c = 0; c < NC; ++c) {
+                    if (HOLD_W) {
+                        const block_dot_q6_k_activation act = block_dot_q6_k_scalar_swar::prepare_activation<block_dot_lane_fp32>(owned, (device const float *) (src1 + offset1 + c*args.nb11) + ib*QK_K);
+                        block_dot_q6_k_scalar_swar::accumulate_weights(w, act, sumf[row*NC + c]);
+                    } else {
+                        block_dot_q6_k_scalar_swar::accumulate_weights(w, held[c], sumf[row*NC + c]);
+                    }
+                }
+            }
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    if (FC_mul_mv_shmem_reduce) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const ushort ltid = tidx % NW;
+        threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0 * NC;
+        for (int k = 0; k < nr0*NC; ++k) {
+            buf[NW * k + ltid] = sumf[k];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // Lane k sums accumulator k (row k / NC, column k % NC) in lane order, as the one-column kernel does.
+        for (int k = ltid; k < nr0*NC; k += NW) {
+            const int row = k / NC;
+            const int c = k % NC;
+            if (first_row + row < args.ne0 && r1 + c < args.ne11) {
+                float tot = 0.0f;
+                for (short i = 0; i < NW; i++) { tot += buf[NW * k + i]; }
+                dst_f32[(int64_t) c*args.ne0 + first_row + row] = tot;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    } else {
+        for (int k = 0; k < nr0*NC; ++k) {
+            sumf[k] = simd_sum(sumf[k]);
+        }
+        if (tiisg == 0) {
+            for (int k = 0; k < nr0*NC; ++k) {
+                if (first_row + k / NC < args.ne0 && r1 + k % NC < args.ne11) {
+                    dst_f32[(int64_t) (k % NC)*args.ne0 + first_row + k / NC] = sumf[k];
+                }
+            }
+        }
+    }
+}
+
+template<int NC, typename args_t, bool HOLD_W, bool PACK>
+void kernel_mul_mv_q6_K_f32_cols_rows(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    if (FC_mul_mv_nr0 == 1) {
+        kernel_mul_mv_q6_K_f32_cols_impl<1, NC, args_t, HOLD_W, PACK>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_nr0 == 2) {
+        kernel_mul_mv_q6_K_f32_cols_impl<2, NC, args_t, HOLD_W, PACK>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_nr0 == 4) {
+        kernel_mul_mv_q6_K_f32_cols_impl<4, NC, args_t, HOLD_W, PACK>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q6_K_f32_cols_impl<8, NC, args_t, HOLD_W, PACK>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
+
+template<int NC, typename args_t>
+void kernel_mul_mv_q6_K_f32_cols_form(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    if (FC_mul_mv_col_form == 0) {
+        kernel_mul_mv_q6_K_f32_cols_rows<NC, args_t, false, false>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_col_form == 1) {
+        kernel_mul_mv_q6_K_f32_cols_rows<NC, args_t, true, false>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_col_form == 2) {
+        kernel_mul_mv_q6_K_f32_cols_rows<NC, args_t, false, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q6_K_f32_cols_rows<NC, args_t, true, true>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
+
+// One pass of a half wave: block ib of RH rows for NC columns, activations loaded once per pass.
+template<int RH, int NC, typename args_t, bool PACK>
+static inline void kernel_mul_mv_q6_K_f32_half_pass(
+        args_t args,
+        device const block_q6_K * x,
+        device const char * src1,
+        device const char * prep,
+        uint64_t offset1,
+        int first_row,
+        int nb,
+        thread const block_dot_q6_k_fragment & owned,
+        int ib,
+        short h,
+        thread float * s) {
+    block_dot_q6_k_activation held[NC];
+    for (short c = 0; c < NC; ++c) {
+        held[c] = block_dot_q6_k_scalar_swar::prepare_activation<block_dot_lane_fp32>(owned, (device const float *) (src1 + offset1 + c*args.nb11) + ib*QK_K);
+    }
+    for (short rr = 0; rr < RH; ++rr) {
+        const int row = RH*h + rr;
+        device const block_q6_K * block = (device const block_q6_K *) ((device const char *) (x + ib) + row*args.nb01);
+        if (PACK) {
+            const block_dot_q6_k_scalar_swar::raw w = block_dot_q6_k_scalar_swar::load_raw(block, owned);
+            for (short c = 0; c < NC; ++c) {
+                block_dot_q6_k_scalar_swar::accumulate_raw(w, held[c], s[rr*NC + c]);
+            }
+        } else {
+            const block_dot_q6_k_scalar_swar::weights w = block_dot_q6_k_scalar_swar::load_weights(block, owned);
+            for (short c = 0; c < NC; ++c) {
+                block_dot_q6_k_scalar_swar::accumulate_weights(w, held[c], s[rr*NC + c]);
+            }
+        }
+    }
+}
+
+// Q6_K matvec with paired halves (64-lane waves, shared-memory reduce): each half of a wave works RH rows and
+// two blocks per pass; a lane's two banks land in the one-column kernel's lane slots, so the row sum order is unchanged.
+template<int RH, int NC, typename args_t, bool PACK>
+void kernel_mul_mv_q6_K_f32_half_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    constexpr int nr0 = 2*RH;
+    const short NSG = FC_mul_mv_nsg;
+    const short NW = N_SIMDWIDTH;
+    const ushort ltid = tidx % NW;
+    const ushort eff_sgitg = tidx / NW;
+    const short h = ltid / 32;
+    const short t = ltid % 32;
+    const short b = t / 16;
+
+    const int nb = args.ne00/QK_K;
+    const int r1 = (tgpig.y + args.tg_y_offset) * NC;
+    const int im = tgpig.z;
+    const uint i12 = im%args.ne12;
+    const uint i13 = im/args.ne12;
+    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
+
+    const int first_row = (((int) tgpig.x + args.tg_x_offset) * NSG + eff_sgitg) * nr0;
+    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+    device const block_q6_K * x = (device const block_q6_K *) (src0 + offset0);
+
+    const block_dot_q6_k_fragment owned = block_dot_q6_k_scalar_swar::owned_fragment(t % 16);
+    float bank0[RH*NC] = {0.f};
+    float bank1[RH*NC] = {0.f};
+    for (int ib = b; ib < nb; ib += 4) {
+        kernel_mul_mv_q6_K_f32_half_pass<RH, NC, args_t, PACK>(args, x, src1, prep, offset1, first_row, nb, owned, ib, h, bank0);
+        if (ib + 2 < nb) {
+            kernel_mul_mv_q6_K_f32_half_pass<RH, NC, args_t, PACK>(args, x, src1, prep, offset1, first_row, nb, owned, ib + 2, h, bank1);
+        }
+    }
+
+    device float * dst_f32 = (device float *) dst + (int64_t)im*args.ne0*args.ne1 + (int64_t)r1*args.ne0;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW * nr0 * NC;
+    for (short rr = 0; rr < RH; ++rr) {
+        for (short c = 0; c < NC; ++c) {
+            const int k = (RH*h + rr)*NC + c;
+            buf[NW * k + t] = bank0[rr*NC + c];
+            buf[NW * k + t + 32] = bank1[rr*NC + c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int k = ltid; k < nr0*NC; k += NW) {
+        const int row = k / NC;
+        const int c = k % NC;
+        if (first_row + row < args.ne0 && r1 + c < args.ne11) {
+            float tot = 0.0f;
+            for (short i = 0; i < NW; i++) { tot += buf[NW * k + i]; }
+            dst_f32[(int64_t) c*args.ne0 + first_row + row] = tot;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+template<int NC, typename args_t, bool PACK>
+void kernel_mul_mv_q6_K_f32_half_rows(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    if (FC_mul_mv_nr0 == 2) {
+        kernel_mul_mv_q6_K_f32_half_impl<1, NC, args_t, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_nr0 == 4) {
+        kernel_mul_mv_q6_K_f32_half_impl<2, NC, args_t, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q6_K_f32_half_impl<4, NC, args_t, PACK>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
+
+template<typename args_t>
+void kernel_mul_mv_q6_K_f32_half_cols(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        device const char * prep,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg,
+        ushort tidx) {
+    const bool pack = (FC_mul_mv_col_form & 2) != 0;
+    if (FC_mul_mv_ncols == 2) {
+        if (pack) { kernel_mul_mv_q6_K_f32_half_rows<2, args_t, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx); } else { kernel_mul_mv_q6_K_f32_half_rows<2, args_t, false>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx); }
+    } else {
+        if (pack) { kernel_mul_mv_q6_K_f32_half_rows<3, args_t, true>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx); } else { kernel_mul_mv_q6_K_f32_half_rows<3, args_t, false>(args, src0, src1, dst, prep, shmem, tgpig, tiisg, sgitg, tidx); }
+    }
+}
+
+[[host_name("kernel_mul_mv_q6_K_cols_f32")]]
+kernel void kernel_mul_mv_q6_K_cols_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tidx [[thread_index_in_threadgroup]]) {
+    if ((FC_mul_mv_col_form & 4) != 0) {
+        kernel_mul_mv_q6_K_f32_half_cols<constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, (device const char *) dst, shmem, tgpig, tiisg, sgitg, tidx);
+        return;
+    }
+    if (FC_mul_mv_ncols == 2) {
+        kernel_mul_mv_q6_K_f32_cols_form<2, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_ncols == 3) {
+        kernel_mul_mv_q6_K_f32_cols_form<3, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else {
+        kernel_mul_mv_q6_K_f32_cols_form<4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    }
+}
 
 template<int nr0, typename args_t>
 void kernel_mul_mv_iq2_xxs_f32_impl(

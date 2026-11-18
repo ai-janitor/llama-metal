@@ -1832,6 +1832,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // target decode in place, and row n_batch_tgt + seq_id for the first token of seq_id, uploaded from pending_h
     // pending_h stays on the host: process() and accept() fetch it before the next target decode overwrites the rows
     bool    dev_rows    = false;
+    // late_row (llama_ctx_state_src_in_order): process() leaves the pending row on the device, so the catch-up decode is
+    // committed behind the target decode; accept(), or the next draft() or begin(), reads the row and uploads it
+    bool    late_row    = false;
+    std::vector<bool> row_owed; // [n_seq] the pending row was not read yet
+    std::vector<bool> row_up;   // [n_seq] the pending row is already in its device row
     int32_t n_batch_tgt = 0;
     std::vector<int32_t> verify_row0; // [n_seq] device row of the first verify row, see verify_h_rows
 
@@ -1912,6 +1917,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
         verify_row0.assign(n_seq, -1);
+        row_owed.assign(n_seq, false);
+        row_up.assign(n_seq, false);
 
         // shared memory and chained heads keep the host rows
         if (!is_mem_shared && !chain_heads) {
@@ -1920,8 +1927,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_ctx_state_src(ctx_dft, nullptr);
                 llama_set_embeddings_nextn_dev(ctx_tgt, false);
             }
+            late_row = dev_rows && llama_ctx_state_src_in_order(ctx_dft);
         }
-        SPC_TRC("- target h rows on the device: %s\n", dev_rows ? "yes" : "no");
+        SPC_TRC("- target h rows on the device: %s, catch-up behind the target decode: %s\n", dev_rows ? "yes" : "no", late_row ? "yes" : "no");
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1945,6 +1953,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+        settle_row(seq_id);
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -2007,9 +2016,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dev_rows) {
                 GGML_ASSERT(n_tokens <= n_batch_tgt && "the target batch exceeds the h_nextn device buffer");
                 for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                    if (i_batch_beg[seq_id] >= 0) {
+                    if (i_batch_beg[seq_id] >= 0 && !row_up[seq_id]) {
                         llama_set_embeddings_nextn_rows(ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
                     }
+                    row_up[seq_id] = false;
                 }
             }
 
@@ -2092,6 +2102,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (dev_rows) {
                 // the rows stay on the device until the next target decode, only the pending row comes to the host
                 verify_row0[seq_id] = h_offset;
+                if (late_row) {
+                    row_owed[seq_id] = true;
+                    continue;
+                }
                 llama_get_embeddings_nextn_rows(ctx_tgt, h_offset + h_rows - 1, 1, pending_h[seq_id].data());
                 continue;
             }
@@ -2110,8 +2124,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    // no accept came after the last process(): the pending row is the last verify row
+    void settle_row(llama_seq_id seq_id) {
+        if (!row_owed[seq_id]) {
+            return;
+        }
+        row_owed[seq_id] = false;
+        llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + verify_h_rows[seq_id] - 1, 1, pending_h[seq_id].data());
+        row_up[seq_id] = llama_set_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            settle_row(seq_id);
+        }
 
         batch.clear();
 
@@ -2288,9 +2315,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         if (dev_rows) {
-            // process() already fetched the last row
-            if (i_h != n_rows - 1) {
+            // process() already fetched the last row unless it left the row owed
+            if (i_h != n_rows - 1 || row_owed[seq_id]) {
+                row_owed[seq_id] = false;
                 llama_get_embeddings_nextn_rows(params.ctx_tgt, verify_row0[seq_id] + i_h, 1, pending_h[seq_id].data());
+                if (late_row) {
+                    // uploaded now, so the next process() has no upload that waits behind the target decode
+                    row_up[seq_id] = llama_set_embeddings_nextn_rows(params.ctx_tgt, n_batch_tgt + seq_id, 1, pending_h[seq_id].data());
+                }
             }
             return;
         }

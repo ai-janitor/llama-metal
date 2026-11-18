@@ -1723,6 +1723,26 @@ bool llama_context::set_ctx_state_src(llama_context * ctx_src) {
     return supports_state_row();
 }
 
+bool llama_context::state_rows_in_queue_order() const {
+    const llama_context * src = cparams.ctx_state_src;
+    // an abort callback lets a graph compute return before all of its work is committed
+    if (src == nullptr || src->h_nextn_dev_dev == nullptr || abort_callback != nullptr || src->abort_callback != nullptr) {
+        return false;
+    }
+    // writer and reader run on the device of the rows and on no other device
+    for (const llama_context * ctx : { this, src }) {
+        for (const auto & backend : ctx->backends) {
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+            if (dev != src->h_nextn_dev_dev && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                return false;
+            }
+        }
+    }
+    ggml_backend_dev_props props;
+    ggml_backend_dev_get_props(src->h_nextn_dev_dev, &props);
+    return props.caps.queue_in_order;
+}
+
 bool llama_context::supports_state_row() const {
     // the MTP graphs read the rows, see llm_graph_context::build_inp_embd_state()
     if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
@@ -2585,7 +2605,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     ggml_backend_t  state_backend = nullptr;
     if (state_src) {
         state_backend = backend_from_dev(state_src->h_nextn_dev_dev);
-        if (state_src->ev_h_nextn_written_recorded) {
+        if (state_src->ev_h_nextn_written_recorded && state_backend && state_rows_in_queue_order()) {
+            // the rows are written before this graph reads them: both are committed to one in-order queue
+        } else if (state_src->ev_h_nextn_written_recorded) {
             ggml_backend_event_synchronize(state_src->ev_h_nextn_written.get());
         } else {
             state_src->synchronize();
@@ -5010,6 +5032,10 @@ bool llama_set_embeddings_nextn_rows(llama_context * ctx, int64_t row0, int64_t 
 
 bool llama_set_ctx_state_src(llama_context * ctx, llama_context * ctx_src) {
     return ctx->set_ctx_state_src(ctx_src);
+}
+
+bool llama_ctx_state_src_in_order(const llama_context * ctx) {
+    return ctx->state_rows_in_queue_order();
 }
 
 void llama_set_embeddings_layer_inp_dev(llama_context * ctx, bool value) {

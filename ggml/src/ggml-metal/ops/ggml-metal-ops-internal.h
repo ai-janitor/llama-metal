@@ -198,6 +198,15 @@ static inline ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * 
     return ggml_metal_buffer_get_id(ctx, t);
 }
 
+// Prepared Q4_K block headers of a weight tensor (nil buffer when it has none)
+static inline ggml_metal_buffer_id ggml_metal_get_kq_prep_id(const ggml_tensor * t) {
+    if (!t || t->view_src || !t->buffer) {
+        return { nullptr, 0 };
+    }
+
+    return ggml_metal_buffer_kq_prep_id((ggml_metal_buffer_t) t->buffer->context, t);
+}
+
 // Concurrency helpers used by multiple op files
 static inline bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx, int idx) {
     if (!ctx->mem_ranges) {

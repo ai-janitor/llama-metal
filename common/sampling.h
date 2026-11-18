@@ -55,6 +55,12 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 // get the underlying llama_sampler_chain
 struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 
+// true when the chain can only pick the highest logit
+bool common_sampler_is_greedy_only(const struct common_sampler * gsmpl);
+
+// take the token from the context (picked on the GPU) instead of the logits
+void common_sampler_set_gpu_pick(struct common_sampler * gsmpl, bool on);
+
 // extended sampling implementation:
 //
 // - set logits

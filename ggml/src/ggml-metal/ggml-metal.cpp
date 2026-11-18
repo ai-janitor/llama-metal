@@ -10,6 +10,8 @@
 #include "ggml-metal-test-observer-helpers.h"
 #include "ggml-metal-test-override.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -121,6 +123,15 @@ static void * ggml_backend_metal_buffer_private_get_base(ggml_backend_buffer_t b
     return ggml_metal_buffer_get_base(ctx);
 }
 
+static enum ggml_status ggml_backend_metal_buffer_private_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
+
+    // a Q4_K weight named by a prep row of this card gets a place for its prepared block headers
+    ggml_metal_buffer_kq_register(ctx, tensor);
+
+    return GGML_STATUS_SUCCESS;
+}
+
 static void ggml_backend_metal_buffer_private_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
@@ -133,6 +144,12 @@ static void ggml_backend_metal_buffer_private_set_tensor(ggml_backend_buffer_t b
     ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
 
     GGML_ASSERT(!ggml_metal_buffer_is_shared(ctx));
+
+    // per-token inputs (not weights) go up without a wait on cards whose hw row says set_nowait
+    if (ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS && ggml_metal_buffer_set_nowait(ctx)) {
+        ggml_metal_buffer_set_tensor_nowait(ctx, tensor, data, offset, size);
+        return;
+    }
 
     ggml_metal_buffer_set_tensor(ctx, tensor, data, offset, size);
 }
@@ -168,7 +185,7 @@ static void ggml_backend_metal_buffer_private_clear(ggml_backend_buffer_t buffer
 static ggml_backend_buffer_i ggml_backend_metal_buffer_private_i = {
     /* .free_buffer     = */ ggml_backend_metal_buffer_private_free_buffer,
     /* .get_base        = */ ggml_backend_metal_buffer_private_get_base,
-    /* .init_tensor     = */ NULL,
+    /* .init_tensor     = */ ggml_backend_metal_buffer_private_init_tensor,
     /* .memset_tensor   = */ ggml_backend_metal_buffer_private_memset_tensor,
     /* .set_tensor      = */ ggml_backend_metal_buffer_private_set_tensor,
     /* .get_tensor      = */ ggml_backend_metal_buffer_private_get_tensor,
@@ -787,6 +804,10 @@ static void ggml_backend_metal_device_get_props(ggml_backend_dev_t dev, ggml_bac
         /* .buffer_from_host_ptr = */ allow_host_ptr,
         /* .events               = */ true,
     };
+
+    // one command queue per device; GGML_METAL_QUEUE_ORDER=0 withholds the statement (callers keep their host waits)
+    const char * order_env = getenv("GGML_METAL_QUEUE_ORDER");
+    props->caps.queue_in_order = !(order_env && strcmp(order_env, "0") == 0);
 }
 
 static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t dev, const char * params) {

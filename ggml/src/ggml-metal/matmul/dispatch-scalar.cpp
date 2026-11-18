@@ -502,6 +502,12 @@ static int dispatch_mul_mat_q8_group(ggml_metal_op_t ctx, int idx) {
         const size_t used = strlen(name);
         snprintf(name + used, sizeof(name) - used, "_q8load=%d", q8_load);
     }
+    // the matrices of a group share one activation
+    const int q8_act = ggml_metal_q8_act_load_bytes(profile, mm[0]->src[1]);
+    if (q8_act != 4) {
+        const size_t used = strlen(name);
+        snprintf(name + used, sizeof(name) - used, "_q8act=%d", q8_act);
+    }
     ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline(ctx->lib, name);
     if (!pipeline.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
@@ -511,6 +517,9 @@ static int dispatch_mul_mat_q8_group(ggml_metal_op_t ctx, int idx) {
         ggml_metal_cv_set_int16(cv, (int16_t) nmat, FC_MUL_MV_GROUP + 0);
         if (q8_load != 1) {
             ggml_metal_cv_set_int16(cv, (int16_t) q8_load, FC_MUL_MV + 10);
+        }
+        if (q8_act != 4) {
+            ggml_metal_cv_set_int16(cv, (int16_t) q8_act, FC_MUL_MV + 11);
         }
         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, "kernel_mul_mvg_q8_0_f32", name, cv);
         ggml_metal_cv_free(cv);
@@ -620,13 +629,59 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
     // template parameter (NR0 override requires changing all k-quant entry points too).
     const ggml_type type = op->src[0]->type;
     const bool kquant_rows = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
-    const int nr0_dynamic = kquant_rows ? ggml_metal_mv_nr0_from_rows(type, ne00, ne01) : ggml_metal_compute_nr0_basic(profile, model, ne00);
+    int nr0_dynamic = kquant_rows ? ggml_metal_mv_nr0_from_rows(type, ne00, ne01) : ggml_metal_compute_nr0_basic(profile, model, ne00);
 
     const bool use_shmem_reduce = (profile->simd_width != 32);
     const bool src1_trans_mv = ggml_is_transposed(op->src[1]);
     ggml_tensor * residual = ggml_metal_match_q4_k_residual_add(ctx, idx, op);
     const bool use_residual = residual != nullptr;
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, src1_trans_mv, nr0_dynamic, use_residual);
+
+    // Per-shape row of this card (hw mv rows); a row of the rows file above wins. A Q4_K weight with headers prepared
+    // at load (one plane, one f32 column, no residual epilogue) may take a prep row: its entry point reads them at 5.
+    bool kq_prep = false;
+    ggml_metal_buffer_id bid_kq_prep = { nullptr, 0 };
+    if (kquant_rows) {
+        const bool kq_prep_test = ggml_metal_kq_prep_test_requested();
+        if (type == GGML_TYPE_Q4_K && !use_residual && !src1_trans_mv && op->src[1]->type == GGML_TYPE_F32 &&
+            ne02 == 1 && ne03 == 1 && ne11 == 1 && ne12 == 1 && ne13 == 1 && (profile->kq_prep == 1 || kq_prep_test)) {
+            bid_kq_prep = ggml_metal_get_kq_prep_id(op->src[0]);
+        }
+        if (nr0_dynamic == 0) {
+            const struct ggml_device_mv_row * row = ggml_metal_mv_hw_row(profile, 0, type, ne00, ne01, 1, bid_kq_prep.metal != nullptr);
+            if (row != nullptr) {
+                nr0_dynamic = row->nr0;
+                kq_prep = row->prep == 1;
+            }
+        }
+        if (kq_prep_test && bid_kq_prep.metal != nullptr) {
+            kq_prep = true;
+        }
+    }
+    // A cols row of this card takes a 2-4 column decode batch of this weight in one launch (grid 1 in y).
+    int ncols = 0;
+    int col_form = 0;
+    if (kquant_rows && type != GGML_TYPE_Q5_K && ne11 >= 2 && ne11 <= 4 && !use_residual && !src1_trans_mv && op->src[1]->type == GGML_TYPE_F32 &&
+        ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+        int test_nr0 = 0;
+        int test_form = 0;
+        const bool cols_test = ggml_metal_kq_cols_test(&test_nr0, &test_form);
+        ggml_metal_buffer_id bid_cols = { nullptr, 0 };
+        if (type == GGML_TYPE_Q4_K && (profile->kq_prep == 1 || ggml_metal_kq_prep_test_requested())) {
+            bid_cols = ggml_metal_get_kq_prep_id(op->src[0]);
+        }
+        const struct ggml_device_mv_row * cols_row = ggml_metal_mv_hw_row(profile, 0, type, ne00, ne01, ne11, bid_cols.metal != nullptr);
+        if (cols_row != nullptr || cols_test) {
+            ncols = ne11;
+            col_form = cols_row != nullptr ? cols_row->form : test_form;
+            if (ne11 == 4) {
+                col_form &= 3; // paired halves take 2 or 3 columns
+            }
+            nr0_dynamic = cols_row != nullptr ? cols_row->nr0 : test_nr0;
+            kq_prep = cols_row != nullptr ? cols_row->prep == 1 : bid_cols.metal != nullptr;
+            bid_kq_prep = bid_cols;
+        }
+    }
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, src1_trans_mv, nr0_dynamic, use_residual, kq_prep, ncols, col_form);
 
     if (!pipeline.pipeline) {
         return 0;
@@ -676,6 +731,9 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
     if (use_residual) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(residual), 4);
     }
+    if (kq_prep) {
+        ggml_metal_encoder_set_buffer(enc, bid_kq_prep, 5);
+    }
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
     // shape attribution for profile=3: bucket dispatches by ne00 x ne01
@@ -692,7 +750,7 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
                             op->src[0]->type == GGML_TYPE_Q8_0)
                            ? ((ne01 + nr0 - 1) / nr0)
                            : ((ne01 + nr0*nsg - 1) / (nr0*nsg));
-    const int32_t grid_y = ((ne11 + nr1 - 1) / nr1);
+    const int32_t grid_y = ncols > 0 ? 1 : ((ne11 + nr1 - 1) / nr1);
     const int32_t grid_z = ne12 * ne13;
 
     // Pass grid_x to kernel for CU-local row clustering remapping.

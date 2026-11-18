@@ -2290,6 +2290,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sampling().set_env("LLAMA_ARG_BACKEND_SAMPLING"));
     add_opt(common_arg(
+        {"--gpu-pick"},
+        "pick greedy tokens on the GPU (one argmax in the graph, one token read back); only for greedy sampling (--temp 0), else off with a warning (default: off)",
+        [](common_params & params) {
+            params.sampling.gpu_pick = true;
+        }
+    ).set_sampling().set_env("LLAMA_ARG_GPU_PICK"));
+    add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",
         [](common_params & params, const std::string & value) {

@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-command-buffer-error.h"
 #import "ggml-metal-impl.h"
 #import "ggml-metal-ops.h"
 #import "ggml-metal-test-override.h"
@@ -2007,6 +2008,16 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->profile.cb_seq              = 0;
             dev->profile.q8_load_bytes       = 1;
             dev->profile.q8_rows8_min        = 0;
+            dev->profile.q8_act_load_bytes   = 4;
+            dev->profile.set_nowait          = 0;
+            dev->profile.staging_keep        = 0;
+            dev->profile.mv_group_red        = 0;
+            dev->profile.mv_rows             = NULL;
+            dev->profile.n_mv_rows           = 0;
+            dev->profile.kq_prep             = 0;
+            dev->profile.kq_cols             = 0;
+            dev->profile.mv_ext_min          = NULL;
+            dev->profile.n_mv_ext_min        = 0;
 
             // =========================================================================
             // Hardware constants lookup table.
@@ -2171,11 +2182,62 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 if (row->cb_seq          >= 0) dev->profile.cb_seq          = (uint32_t) row->cb_seq;
                 if (row->q8_load_bytes   >= 0) dev->profile.q8_load_bytes   = (uint32_t) row->q8_load_bytes;
                 if (row->q8_rows8_min    >= 0) dev->profile.q8_rows8_min    = (uint32_t) row->q8_rows8_min;
-                GGML_LOG_INFO("%s: hw row 0x%04x:0x%04x %s: CUs=%u, L1=%u KB/CU, L2=%u KB, BW=%.0f GB/s, mv_reduce=%u, f_scalar_w64=%u, mv_group=%u, attn_gate_fuse=%u, conv_l2_fold=%u, add_norm_fuse=%u, cb_seq=%u, q8_load_bytes=%u, q8_rows8_min=%u\n",
+                if (row->q8_act_load_bytes >= 0) dev->profile.q8_act_load_bytes = (uint32_t) row->q8_act_load_bytes;
+                if (row->set_nowait      >= 0) dev->profile.set_nowait      = (uint32_t) row->set_nowait;
+                if (row->staging_keep    >= 0) dev->profile.staging_keep    = (uint32_t) row->staging_keep;
+                // GGML_METAL_GROUP_RED=0 keeps the grouped K-quant matvec on the row-at-a-time sums.
+                if (row->mv_group_red    >= 0) dev->profile.mv_group_red    = (uint32_t) row->mv_group_red;
+                {
+                    const char * red_env = getenv("GGML_METAL_GROUP_RED");
+                    if (red_env && strcmp(red_env, "0") == 0) {
+                        dev->profile.mv_group_red = 0;
+                    }
+                }
+                GGML_LOG_INFO("%s: hw row 0x%04x:0x%04x %s: CUs=%u, L1=%u KB/CU, L2=%u KB, BW=%.0f GB/s, mv_reduce=%u, f_scalar_w64=%u, mv_group=%u, attn_gate_fuse=%u, conv_l2_fold=%u, add_norm_fuse=%u, cb_seq=%u, q8_load_bytes=%u, q8_rows8_min=%u, q8_act_load_bytes=%u, set_nowait=%u, staging_keep=%u, mv_group_red=%u\n",
                     __func__, pci_vendor, pci_device, row->chip,
                     dev->profile.compute_units, dev->profile.l1_cache_per_cu / 1024,
-                    dev->profile.l2_cache_total / 1024, dev->profile.local_bandwidth / 1e9, dev->profile.mv_reduce, dev->profile.f_scalar_w64, dev->profile.mv_group, dev->profile.attn_gate_fuse, dev->profile.conv_l2_fold, dev->profile.add_norm_fuse, dev->profile.cb_seq, dev->profile.q8_load_bytes, dev->profile.q8_rows8_min);
+                    dev->profile.l2_cache_total / 1024, dev->profile.local_bandwidth / 1e9, dev->profile.mv_reduce, dev->profile.f_scalar_w64, dev->profile.mv_group, dev->profile.attn_gate_fuse, dev->profile.conv_l2_fold, dev->profile.add_norm_fuse, dev->profile.cb_seq, dev->profile.q8_load_bytes, dev->profile.q8_rows8_min, dev->profile.q8_act_load_bytes, dev->profile.set_nowait, dev->profile.staging_keep, dev->profile.mv_group_red);
                 break;
+            }
+
+            // Per-shape matvec rows of this card (generated header; the rows of one card are contiguous).
+            // GGML_METAL_KQ_HW_ROWS=0 ignores them; GGML_METAL_KQ_PREP=0, GGML_METAL_KQ_COLS=0, GGML_METAL_KQ_EXT_ROWS=0 switch one part off.
+            {
+                const char * rows_env = getenv("GGML_METAL_KQ_HW_ROWS");
+                const char * prep_env = getenv("GGML_METAL_KQ_PREP");
+                const char * cols_env = getenv("GGML_METAL_KQ_COLS");
+                const char * ext_env  = getenv("GGML_METAL_KQ_EXT_ROWS");
+                if (!(rows_env && strcmp(rows_env, "0") == 0)) {
+                    for (int i = 0; i < ggml_metal_hw_mv_rows_n; i++) {
+                        const struct ggml_device_mv_row * row = &ggml_metal_hw_mv_rows[i];
+                        if (row->pci_vendor != pci_vendor || row->pci_device != pci_device) {
+                            continue;
+                        }
+                        if (dev->profile.mv_rows == NULL) {
+                            dev->profile.mv_rows = row;
+                        }
+                        dev->profile.n_mv_rows++;
+                        if (row->prep == 1 && !(prep_env && strcmp(prep_env, "0") == 0)) {
+                            dev->profile.kq_prep = 1;
+                        }
+                        if (row->cols > 1 && !(cols_env && strcmp(cols_env, "0") == 0)) {
+                            dev->profile.kq_cols = 1;
+                        }
+                    }
+                    for (int i = 0; i < ggml_metal_hw_mv_ext_min_n && !(ext_env && strcmp(ext_env, "0") == 0); i++) {
+                        const struct ggml_device_mv_ext_min * row = &ggml_metal_hw_mv_ext_min[i];
+                        if (row->pci_vendor != pci_vendor || row->pci_device != pci_device) {
+                            continue;
+                        }
+                        if (dev->profile.mv_ext_min == NULL) {
+                            dev->profile.mv_ext_min = row;
+                        }
+                        dev->profile.n_mv_ext_min++;
+                    }
+                }
+                if (dev->profile.n_mv_rows > 0) {
+                    GGML_LOG_INFO("%s: hw mv rows 0x%04x:0x%04x: %u rows, kq_prep=%u, kq_cols=%u, ext_min rows=%u\n", __func__, pci_vendor, pci_device, dev->profile.n_mv_rows, dev->profile.kq_prep, dev->profile.kq_cols, dev->profile.n_mv_ext_min);
+                }
             }
 
             // Model profile: initialized to defaults (populated=false).
@@ -2449,6 +2511,7 @@ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_eve
     @autoreleasepool {
         id<MTLEvent> event = ev->obj;
 
+        ggml_metal_upload_flush(dev->mtl_queue);
         id<MTLCommandBuffer> cmd_buf = [dev->mtl_queue commandBuffer];
         [cmd_buf encodeWaitForEvent:event value:atomic_load_explicit(&ev->value, memory_order_relaxed)];
         [cmd_buf commit];
@@ -2867,6 +2930,34 @@ struct ggml_metal_buffer {
 
     // pointers to global device
     ggml_metal_device_t dev;
+
+    // Q4_K block headers of this buffer's weight tensors, unpacked once at load (hw mv rows with prep):
+    // one record per tensor, all in one private buffer made when the first tensor's bytes arrive
+    struct ggml_metal_kq_prep_rec * kq_recs;
+    int    kq_n;
+    int    kq_cap;
+    int    kq_ready;      // records whose every block was written
+    size_t kq_total;      // bytes of prepared headers registered
+    size_t kq_run_wbase;  // current run: weight offset and prepared offset of its first tensor, weight end of its last
+    size_t kq_run_abase;
+    size_t kq_run_wend;
+    id<MTLBuffer> kq_arena;
+};
+
+// Prepared entry: 32 bytes per 144-byte Q4_K block (2 x 8 unpacked scale bytes, d, dmin, 12 unused).
+// Inside a run of nearby tensors: prepared offset = (weight offset - run start) / 144 * 32.
+#define GGML_METAL_KQ_BLOCK   144
+#define GGML_METAL_KQ_ENTRY    32
+#define GGML_METAL_KQ_RUN_GAP  65536
+#define GGML_METAL_KQ_SLACK    65536 // rows past the last one are read (and not stored) by the kernels, as with the weights
+
+struct ggml_metal_kq_prep_rec {
+    const void * data;    // the tensor's data pointer: the key
+    size_t woff;          // weight offset in the buffer
+    size_t aoff;          // offset of its entries in kq_arena
+    size_t n_blocks;
+    size_t n_written;
+    bool   bad;           // bytes arrived in a form that is not whole blocks: the tensor keeps the unprepared path
 };
 
 static void ggml_metal_log_allocated_size(id<MTLDevice> device, size_t size_aligned) {
@@ -3135,6 +3226,9 @@ ggml_metal_buffer_t ggml_metal_buffer_map(ggml_metal_device_t dev, void * ptr, s
 void ggml_metal_buffer_free(ggml_metal_buffer_t buf) {
     ggml_metal_device_rsets_rm(buf->dev, buf->rset);
 
+    [buf->kq_arena release];
+    free(buf->kq_recs);
+
     for (int i = 0; i < buf->n_buffers; i++) {
         [buf->buffers[i].metal release];
     }
@@ -3156,6 +3250,154 @@ void * ggml_metal_buffer_get_base(ggml_metal_buffer_t buf) {
     return buf->all_data;
 }
 
+static bool ggml_metal_kq_prep_test(void) {
+    const char * v = getenv("GGML_METAL_KQ_PREP_TEST");
+    return v != NULL && strcmp(v, "1") == 0;
+}
+
+static struct ggml_metal_kq_prep_rec * ggml_metal_buffer_kq_find(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
+    for (int i = 0; i < buf->kq_n; i++) {
+        if (buf->kq_recs[i].data == t->data) {
+            return &buf->kq_recs[i];
+        }
+    }
+    return NULL;
+}
+
+// Called for every tensor placed in the buffer, before any bytes arrive: a Q4_K weight whose shape has a prep row
+// on this card gets a place for its prepared block headers. GGML_METAL_KQ_PREP_TEST=1 takes every Q4_K tensor.
+void ggml_metal_buffer_kq_register(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
+    const struct ggml_device_profile * profile = &buf->dev->profile;
+    const bool test = ggml_metal_kq_prep_test();
+    if (buf->is_shared || buf->n_buffers != 1 || buf->kq_arena != nil || (profile->kq_prep != 1 && !test)) {
+        return;
+    }
+    if (t->type != GGML_TYPE_Q4_K || t->view_src != NULL || t->data == NULL || t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] % 256 != 0) {
+        return;
+    }
+    const size_t n_blocks = (size_t) (t->ne[0] / 256) * (size_t) t->ne[1];
+    if (ggml_nbytes(t) != n_blocks * GGML_METAL_KQ_BLOCK) {
+        return;
+    }
+    bool wanted = test;
+    for (uint32_t i = 0; i < profile->n_mv_rows && !wanted; i++) {
+        const struct ggml_device_mv_row * row = &profile->mv_rows[i];
+        wanted = row->prep == 1 && row->type == (int32_t) t->type && row->ne00 == t->ne[0] && row->ne01 == t->ne[1];
+    }
+    if (!wanted || ggml_metal_buffer_kq_find(buf, t) != NULL) {
+        return;
+    }
+    if (buf->kq_n == buf->kq_cap) {
+        const int cap = buf->kq_cap == 0 ? 64 : 2 * buf->kq_cap;
+        struct ggml_metal_kq_prep_rec * recs = realloc(buf->kq_recs, (size_t) cap * sizeof(*recs));
+        if (recs == NULL) {
+            return;
+        }
+        buf->kq_recs = recs;
+        buf->kq_cap  = cap;
+    }
+    const size_t woff = (size_t) ((uintptr_t) t->data - (uintptr_t) buf->all_data);
+    struct ggml_metal_kq_prep_rec * rec = &buf->kq_recs[buf->kq_n++];
+    rec->data      = t->data;
+    rec->woff      = woff;
+    rec->n_blocks  = n_blocks;
+    rec->n_written = 0;
+    rec->bad       = false;
+    if (buf->kq_n > 1 && woff >= buf->kq_run_wend && woff - buf->kq_run_wend <= GGML_METAL_KQ_RUN_GAP &&
+        (woff - buf->kq_run_wbase) % GGML_METAL_KQ_BLOCK == 0) {
+        rec->aoff = buf->kq_run_abase + (woff - buf->kq_run_wbase) / GGML_METAL_KQ_BLOCK * GGML_METAL_KQ_ENTRY;
+    } else {
+        rec->aoff = buf->kq_total;
+        buf->kq_run_wbase = woff;
+        buf->kq_run_abase = rec->aoff;
+    }
+    buf->kq_run_wend = woff + n_blocks * GGML_METAL_KQ_BLOCK;
+    buf->kq_total    = rec->aoff + n_blocks * GGML_METAL_KQ_ENTRY;
+}
+
+// The tensor's bytes are in hand on the host: unpack the header of every whole block in [offset, offset + size) and
+// copy the entries up. Same unpack as block_dot_q4_k_swar::accumulate (kmask1 0x3f3f, kmask2 0x0f0f, kmask3 0xc0c0).
+static void ggml_metal_buffer_kq_fill(ggml_metal_buffer_t buf, const struct ggml_tensor * t, const void * data, size_t offset, size_t size) {
+    if (buf->kq_n == 0) {
+        return;
+    }
+    struct ggml_metal_kq_prep_rec * rec = ggml_metal_buffer_kq_find(buf, t);
+    if (rec == NULL || rec->bad) {
+        return;
+    }
+    if (offset % GGML_METAL_KQ_BLOCK != 0 || size % GGML_METAL_KQ_BLOCK != 0 || offset + size > rec->n_blocks * GGML_METAL_KQ_BLOCK) {
+        rec->bad = true;
+        return;
+    }
+    @autoreleasepool {
+        if (buf->kq_arena == nil) {
+            const size_t arena_bytes = buf->kq_total + GGML_METAL_KQ_SLACK;
+            buf->kq_arena = [buf->dev->mtl_device newBufferWithLength:arena_bytes options:MTLResourceStorageModePrivate];
+            if (buf->kq_arena == nil) {
+                GGML_LOG_WARN("%s: no memory for %zu bytes of prepared Q4_K headers; the tensors keep the unprepared path\n", __func__, arena_bytes);
+                buf->kq_n = 0;
+                return;
+            }
+            ggml_metal_log_allocated_size(buf->dev->mtl_device, arena_bytes);
+        }
+        const size_t n = size / GGML_METAL_KQ_BLOCK;
+        id<MTLBuffer> stage = [buf->dev->mtl_device newBufferWithLength:n * GGML_METAL_KQ_ENTRY options:MTLResourceStorageModeShared];
+        GGML_ASSERT(stage);
+        uint8_t * p = (uint8_t *) [stage contents];
+        memset(p, 0, n * GGML_METAL_KQ_ENTRY);
+        const uint8_t * w = (const uint8_t *) data;
+        for (size_t b = 0; b < n; b++) {
+            const uint8_t * blk = w + b * GGML_METAL_KQ_BLOCK;
+            uint8_t * out = p + b * GGML_METAL_KQ_ENTRY;
+            for (int sp = 0; sp < 2; sp++) {
+                const uint16_t w0 = (uint16_t) (blk[4 + 2*(sp + 0)] | (blk[5 + 2*(sp + 0)] << 8));
+                const uint16_t w2 = (uint16_t) (blk[4 + 2*(sp + 2)] | (blk[5 + 2*(sp + 2)] << 8));
+                const uint16_t w4 = (uint16_t) (blk[4 + 2*(sp + 4)] | (blk[5 + 2*(sp + 4)] << 8));
+                const uint16_t u[4] = {
+                    (uint16_t) (w0 & 0x3f3f), (uint16_t) (w2 & 0x3f3f),
+                    (uint16_t) ((w4 & 0x0f0f) | ((w0 & 0xc0c0) >> 2)), (uint16_t) (((w4 >> 4) & 0x0f0f) | ((w2 & 0xc0c0) >> 2)),
+                };
+                memcpy(out + 8*sp, u, 8);
+            }
+            memcpy(out + 16, blk, 4);
+        }
+        ggml_metal_upload_flush(buf->dev->mtl_queue);
+        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBuffer];
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        [encoder copyFromBuffer:stage sourceOffset:0 toBuffer:buf->kq_arena destinationOffset:rec->aoff + offset / GGML_METAL_KQ_BLOCK * GGML_METAL_KQ_ENTRY size:n * GGML_METAL_KQ_ENTRY];
+        [encoder endEncoding];
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+        [stage release];
+        rec->n_written += n;
+        if (rec->n_written == rec->n_blocks) {
+            buf->kq_ready++;
+            if (buf->kq_ready == buf->kq_n) {
+                GGML_LOG_INFO("%s: prepared Q4_K headers: %d tensors, %.1f MiB; device allocated %.1f MiB of %.1f MiB recommended\n", __func__,
+                    buf->kq_n, buf->kq_total / 1024.0 / 1024.0,
+                    buf->dev->mtl_device.currentAllocatedSize / 1024.0 / 1024.0,
+                    buf->dev->mtl_device.recommendedMaxWorkingSetSize / 1024.0 / 1024.0);
+            }
+        }
+    }
+}
+
+// The prepared headers of a weight tensor, or a nil buffer when it has none (not named by a row, or its bytes did not
+// all arrive as whole blocks).
+struct ggml_metal_buffer_id ggml_metal_buffer_kq_prep_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
+    struct ggml_metal_buffer_id res = { nil, 0 };
+    if (buf->kq_n == 0 || buf->kq_arena == nil) {
+        return res;
+    }
+    const struct ggml_metal_kq_prep_rec * rec = ggml_metal_buffer_kq_find(buf, t);
+    if (rec == NULL || rec->bad || rec->n_written != rec->n_blocks) {
+        return res;
+    }
+    res.metal = buf->kq_arena;
+    res.offs  = rec->aoff;
+    return res;
+}
+
 bool ggml_metal_buffer_is_shared(ggml_metal_buffer_t buf) {
     return buf->is_shared;
 }
@@ -3171,6 +3413,7 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
         bid_dst.offs += offset;
 
+        ggml_metal_upload_flush(buf->dev->mtl_queue);
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
         {
@@ -3186,6 +3429,46 @@ void ggml_metal_buffer_memset_tensor(ggml_metal_buffer_t buf, struct ggml_tensor
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
     }
+}
+
+bool ggml_metal_buffer_set_nowait(ggml_metal_buffer_t buf) {
+    return !buf->is_shared && buf->dev->profile.set_nowait == 1;
+}
+
+// copy the bytes into a new shared buffer and commit the blit without waiting; the graph is committed later on the same
+// queue (dev->mtl_queue), so Metal runs it after this copy
+void ggml_metal_buffer_set_tensor_nowait(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    const int64_t t0 = ggml_time_us();
+
+    @autoreleasepool {
+        struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
+        bid_dst.offs += offset;
+
+        // the copy joins the queue's pending upload batch; false = the batch is switched off
+        if (ggml_metal_upload_add(buf->dev->mtl_queue, buf->dev->mtl_device, data, size, bid_dst.metal, bid_dst.offs)) {
+            ggml_metal_xfer_stats.h2d_bytes   += (int64_t)size;
+            ggml_metal_xfer_stats.h2d_time_us += ggml_time_us() - t0;
+            ggml_metal_xfer_stats.h2d_count   += 1;
+            ggml_metal_buffer_kq_fill(buf, tensor, data, offset, size);
+            return;
+        }
+
+        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytes:data length:size options:MTLResourceStorageModeShared];
+        GGML_ASSERT(buf_src);
+
+        id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBuffer];
+        id<MTLBlitCommandEncoder> encoder = [cmd_buf blitCommandEncoder];
+        [encoder copyFromBuffer:buf_src sourceOffset:0 toBuffer:bid_dst.metal destinationOffset:bid_dst.offs size:size];
+        [encoder endEncoding];
+        [cmd_buf commit];
+        [buf_src release];
+    }
+
+    ggml_metal_xfer_stats.h2d_bytes   += (int64_t)size;
+    ggml_metal_xfer_stats.h2d_time_us += ggml_time_us() - t0;
+    ggml_metal_xfer_stats.h2d_count   += 1;
+
+    ggml_metal_buffer_kq_fill(buf, tensor, data, offset, size);
 }
 
 void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -3218,6 +3501,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         //       this is alternative to waitUntilCompleted, which should be faster, but don't seem to make much difference
         dispatch_semaphore_t completion_semaphore = dispatch_semaphore_create(0);
 
+        ggml_metal_upload_flush(buf->dev->mtl_queue);
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
         {
@@ -3245,11 +3529,16 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
         dispatch_release(completion_semaphore);
 
         //[cmd_buf waitUntilCompleted];
+
+        // the copy is done: drop the shared wrapper of the host bytes (the device counts it as allocated until then)
+        [buf_src release];
     }
 
     ggml_metal_xfer_stats.h2d_bytes   += (int64_t)size;
     ggml_metal_xfer_stats.h2d_time_us += ggml_time_us() - t0;
     ggml_metal_xfer_stats.h2d_count   += 1;
+
+    ggml_metal_buffer_kq_fill(buf, tensor, data, offset, size);
 }
 
 void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3278,6 +3567,7 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         GGML_ASSERT(buf_dst);
 
+        ggml_metal_upload_flush(buf->dev->mtl_queue);
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
         {
@@ -3312,6 +3602,7 @@ void ggml_metal_buffer_clear(ggml_metal_buffer_t buf, uint8_t value) {
     }
 
     @autoreleasepool {
+        ggml_metal_upload_flush(buf->dev->mtl_queue);
         id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
 
         {

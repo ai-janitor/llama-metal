@@ -10,9 +10,9 @@ Tokens per second while generating, as llama.cpp prints it in its `eval time` li
 
 | GPU (Mac) | Qwen3.5-0.8B Q8_0 | Qwen3.5-4B Q4_K_M |
 |---|---|---|
-| FirePro D700 (Mac Pro 2013) | 57.2 | 17.2 |
-| Radeon Pro Vega 64 (iMac Pro 2017) | 138.7 | 52.7 |
-| Radeon Pro 5500M (MacBook Pro 2019) | 95.5 | 36.2 |
+| FirePro D700 (Mac Pro 2013) | 68.2 | 20.0 |
+| Radeon Pro Vega 64 (iMac Pro 2017) | 160.9 | 56.5 |
+| Radeon Pro 5500M (MacBook Pro 2019) | 118.5 | 38.7 |
 
 ### Check it on your Mac
 

@@ -8,6 +8,7 @@
 #include "../src/llama-ext.h"
 
 #include "fit.h"
+#include "gpu-pick.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -1151,6 +1152,7 @@ struct common_init_result::impl {
 
     std::vector<common_sampler_ptr> samplers;
     std::vector<llama_sampler_seq_config> samplers_seq_config;
+    std::vector<llama_sampler_ptr> gpu_pick_samplers;
 };
 
 static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NAMES = {
@@ -1378,7 +1380,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->samplers_seq_config[i] = { i, common_sampler_get(pimpl->samplers[i].get()) };
     }
 
-    if (params.sampling.backend_sampling) {
+    for (int i = 0; i < (int) cparams.n_seq_max; ++i) {
+        llama_sampler * gp = common_gpu_pick_init(params, pimpl->samplers[i].get());
+        if (gp) {
+            pimpl->gpu_pick_samplers.emplace_back(gp);
+            pimpl->samplers_seq_config[i] = { i, gp };
+            common_sampler_set_gpu_pick(pimpl->samplers[i].get(), true);
+        }
+    }
+
+    if (params.sampling.backend_sampling || !pimpl->gpu_pick_samplers.empty()) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }

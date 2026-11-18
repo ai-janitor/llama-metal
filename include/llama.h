@@ -1205,6 +1205,10 @@ extern "C" {
     // Returns whether decode accepts batches with state rows.
     LLAMA_API bool llama_set_ctx_state_src(struct llama_context * ctx, struct llama_context * ctx_src);
 
+    // True when a decode of ctx that reads state rows needs no host wait for the decode of ctx_src that wrote them:
+    // one device whose backend runs committed work in commit order, and no abort callback on either context.
+    LLAMA_API bool llama_ctx_state_src_in_order(const struct llama_context * ctx);
+
     // The paired context (llama_context_params::ctx_other), e.g. the target context of a draft context; may be nullptr
     LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
 

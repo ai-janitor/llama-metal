@@ -142,3 +142,72 @@ kernel void kernel_argmax_f32(
 
     dst_i32[tgpig] = arg_val;
 }
+
+// One threadgroup over a single row: each simdgroup reads whole 16-byte values side by side; ties keep the lowest index.
+kernel void kernel_argmax_f32_w4(
+        constant ggml_metal_kargs_argmax & args,
+        device   const char * src0,
+        device         char * dst,
+        threadgroup    char * shmem [[threadgroup(0)]],
+        uint  tgpig[[threadgroup_position_in_grid]],
+        ushort  tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort simd_width[[threads_per_simdgroup]],
+        ushort    ntg[[threads_per_threadgroup]]) {
+    device const float4 * x4 = (device const float4 *) ((device const char *) src0 + tgpig * args.nb01);
+
+    const int n4 = args.ne00/4;
+
+    float   lmax = -INFINITY;
+    int32_t larg = 0x7fffffff;
+
+    for (int i = tpitg; i < n4; i += ntg) {
+        const float4 v = x4[i];
+        const float  m = max(max(v.x, v.y), max(v.z, v.w));
+        if (m > lmax) {
+            lmax = m;
+            larg = 4*i + (v.x == m ? 0 : (v.y == m ? 1 : (v.z == m ? 2 : 3)));
+        }
+    }
+
+    float   max_val = simd_max(lmax);
+    int32_t arg_val = simd_min(select(0x7fffffff, larg, lmax == max_val));
+
+    device int32_t * dst_i32 = (device int32_t *) dst;
+
+    threadgroup   float * shared_maxval = (threadgroup   float *) shmem;
+    threadgroup int32_t * shared_argmax = (threadgroup int32_t *) (shmem + 128*sizeof(float));
+
+    if (ntg > simd_width) {
+        if (tiisg == 0) {
+            shared_maxval[sgitg] = max_val;
+            shared_argmax[sgitg] = arg_val;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (sgitg != 0) {
+            return;
+        }
+
+        const ushort nsg = (ntg + simd_width - 1) / simd_width;
+
+        float   best = -INFINITY;
+        int32_t arg  = 0x7fffffff;
+
+        for (ushort i = tiisg; i < nsg; i += simd_width) {
+            if (shared_maxval[i] > best || (shared_maxval[i] == best && shared_argmax[i] < arg)) {
+                best = shared_maxval[i];
+                arg  = shared_argmax[i];
+            }
+        }
+
+        max_val = simd_max(best);
+        arg_val = simd_min(select(0x7fffffff, arg, best == max_val));
+    }
+
+    if (tiisg == 0 && sgitg == 0) {
+        dst_i32[tgpig] = arg_val;
+    }
+}

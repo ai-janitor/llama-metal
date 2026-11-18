@@ -15,6 +15,8 @@ struct ggml_metal_command_buffer {
 
 bool ggml_metal_gpu_error_callback_registered(void);
 id<MTLCommandBuffer> ggml_metal_new_command_buffer(id<MTLCommandQueue> queue, bool unretained);
+void ggml_metal_upload_flush(id<MTLCommandQueue> queue);
+bool ggml_metal_upload_add(id<MTLCommandQueue> queue, id<MTLDevice> device, const void * data, size_t size, id<MTLBuffer> dst, size_t dst_offs);
 void ggml_metal_report_command_buffer_error(void * command_buffer, int index, bool extra);
 
 // Shared failed-buffer policy (R2). Completed -> SUCCESS, no callback.

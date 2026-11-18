@@ -94,7 +94,16 @@ int ggml_metal_q8_load_bytes(const struct ggml_device_profile * hw, const ggml_t
     return 4;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool use_shmem_reduce, bool src1_trans, int nr0_override, bool use_residual) {
+int ggml_metal_q8_act_load_bytes(const struct ggml_device_profile * hw, const ggml_tensor * src1) {
+    if (!hw || hw->q8_act_load_bytes != 16 || src1->type != GGML_TYPE_F32 || src1->nb[1] % 16 != 0) {
+        return 4;
+    }
+    // A 16-byte load needs a 16-byte aligned address: the lane's eight values start at a multiple of 32 bytes in the row.
+    return ggml_metal_get_buffer_id(src1).offs % 16 == 0 ? 16 : 4;
+}
+
+// kq_prep: the Q4_K entry point that reads block headers prepared at load (the caller binds them at 5); only for Q4_K x F32.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool use_shmem_reduce, bool src1_trans, int nr0_override, bool use_residual, bool kq_prep, int ncols, int col_form) {
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
@@ -258,17 +267,29 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         }
     }
 
-    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
+    if (ncols > 0) {
+        smem *= (size_t) ncols;
+    }
+    snprintf(base, 256, "kernel_mul_mv_%s%s%s_%s%s", ggml_type_name(tsrc0), kq_prep ? "_prep" : "", ncols > 0 ? "_cols" : "", ggml_type_name(tsrc1), suffix);
     // Include nr0 in the pipeline cache key so different NR0 values produce separate pipelines.
     // The residual epilogue changes buffer 3's destination and activates buffer 4,
     // so it must select a distinct cached function-constant specialization.
     // The hw row's mv_reduce picks the shared-memory reduce tail (1 = tree); other paths keep 0.
     const int16_t mv_tail = (use_shmem_reduce && hw && hw->mv_reduce == 1) ? 1 : 0;
     snprintf(name, 256, "%s_nsg=%d_sr=%d_st=%d_nr0=%d_lane=%d_residual=%d_tail=%d", base, nsg, use_shmem_reduce ? 1 : 0, src1_trans ? 1 : 0, nr0, selected_lane, use_residual ? 1 : 0, mv_tail);
+    if (ncols > 0) {
+        const size_t used = strlen(name);
+        snprintf(name + used, 256 - used, "_nc=%d_cf=%d", ncols, col_form);
+    }
     const int q8_load = (tsrc1 == GGML_TYPE_F32 && !src1_trans) ? ggml_metal_q8_load_bytes(hw, op->src[0]) : 1;
     if (q8_load != 1) {
         const size_t used = strlen(name);
         snprintf(name + used, 256 - used, "_q8load=%d", q8_load);
+    }
+    const int q8_act = (op->src[0]->type == GGML_TYPE_Q8_0 && !src1_trans) ? ggml_metal_q8_act_load_bytes(hw, op->src[1]) : 4;
+    if (q8_act != 4) {
+        const size_t used = strlen(name);
+        snprintf(name + used, 256 - used, "_q8act=%d", q8_act);
     }
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -285,8 +306,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         // Only the scalar Q4_K entry reads FC606; every other kernel ignores it.
         ggml_metal_cv_set_bool(cv, use_residual, FC_MUL_MV_RESIDUAL);
         ggml_metal_cv_set_int16(cv, mv_tail, FC_MUL_MV + 7);
+        if (ncols > 0) {
+            ggml_metal_cv_set_int16(cv, (int16_t) ncols, FC_MUL_MV + 12);
+            ggml_metal_cv_set_int16(cv, (int16_t) col_form, FC_MUL_MV + 13);
+        }
         if (q8_load != 1) {
             ggml_metal_cv_set_int16(cv, (int16_t) q8_load, FC_MUL_MV + 10);
+        }
+        if (q8_act != 4) {
+            ggml_metal_cv_set_int16(cv, (int16_t) q8_act, FC_MUL_MV + 11);
         }
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);

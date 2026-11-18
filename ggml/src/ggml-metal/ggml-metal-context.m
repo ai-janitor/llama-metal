@@ -38,6 +38,12 @@ struct ggml_metal {
     ggml_metal_pipelines_t pipelines_ext;
 
     bool use_fusion;
+
+    // logits staging buffer kept across reads when the hw row says staging_keep (discrete cards)
+    id<MTLBuffer> staging_kept;
+    // discrete-card readbacks whose blit is committed; synchronize or the next graph compute waits and copies out
+    NSMutableArray * get_pending;
+    bool get_defer;
     bool use_concurrency;
     bool use_graph_optimize;
 #ifdef GGML_METAL_TEST_OBSERVER
@@ -241,6 +247,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     }
 
     res->cmd_bufs_ext = [[NSMutableArray alloc] init];
+    res->get_pending  = [[NSMutableArray alloc] init];
+    {
+        // GGML_METAL_GET_DEFER=0: a discrete-card readback waits for its blit at once
+        const char * defer_env = getenv("GGML_METAL_GET_DEFER");
+        res->get_defer = !(defer_env && strcmp(defer_env, "0") == 0);
+    }
 
     res->cmd_buf_last = nil;
 
@@ -286,6 +298,12 @@ void ggml_metal_free(ggml_metal_t ctx) {
 
     [ctx->cmd_bufs_ext removeAllObjects];
     [ctx->cmd_bufs_ext release];
+    [ctx->get_pending release];
+
+    if (ctx->staging_kept) {
+        [ctx->staging_kept release];
+        ctx->staging_kept = nil;
+    }
 
     if (ctx->pipelines_ext) {
         ggml_metal_pipelines_free(ctx->pipelines_ext);
@@ -323,7 +341,24 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+// Wait for the pending readbacks of this context and copy each to its destination.
+static void ggml_metal_get_pending_complete(ggml_metal_t ctx) {
+    if ([ctx->get_pending count] == 0) {
+        return;
+    }
+    @autoreleasepool {
+        for (NSArray * p in ctx->get_pending) {
+            id<MTLCommandBuffer> cmd = [p objectAtIndex:0];
+            id<MTLBuffer>        stg = [p objectAtIndex:1];
+            [cmd waitUntilCompleted];
+            memcpy([[p objectAtIndex:2] pointerValue], [stg contents], [[p objectAtIndex:3] unsignedLongValue]);
+        }
+        [ctx->get_pending removeAllObjects];
+    }
+}
+
 static enum ggml_status ggml_metal_synchronize_checked(ggml_metal_t ctx) {
+    ggml_metal_get_pending_complete(ctx);
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         const bool l0_trace = ggml_l0_enabled();
@@ -541,9 +576,19 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
             [cmd_buf retain];
         } else {
-            // Discrete GPU: allocate a shared staging buffer, blit, wait, then memcpy
-            id<MTLBuffer> buf_staging = [device newBufferWithLength:size
-                                                            options:MTLResourceStorageModeShared];
+            // Discrete GPU: a shared staging buffer (kept and reused per context when the hw row says staging_keep), blit, wait, then memcpy
+            const bool keep = ggml_metal_device_get_profile(ctx->dev)->staging_keep == 1;
+            id<MTLBuffer> buf_staging = nil;
+            // a pending readback owns the kept buffer until it completes; the next one gets its own
+            if (keep && [ctx->get_pending count] == 0) {
+                if (ctx->staging_kept == nil || [ctx->staging_kept length] < size) {
+                    [ctx->staging_kept release];
+                    ctx->staging_kept = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+                }
+                buf_staging = [ctx->staging_kept retain];
+            } else {
+                buf_staging = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+            }
             GGML_ASSERT(buf_staging);
 
             [encoder copyFromBuffer:bid_src.metal
@@ -554,6 +599,15 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
             [encoder endEncoding];
             [cmd_buf commit];
+            if (ctx->get_defer) {
+                // as on shared memory: the data is valid after synchronize
+                [ctx->get_pending addObject:@[cmd_buf, buf_staging, [NSValue valueWithPointer:data], [NSNumber numberWithUnsignedLong:size]]];
+                [buf_staging release];
+                ggml_metal_xfer_stats.d2h_bytes   += (int64_t)size;
+                ggml_metal_xfer_stats.d2h_time_us += ggml_time_us() - t0;
+                ggml_metal_xfer_stats.d2h_count   += 1;
+                return;
+            }
             const bool l0_trace = ggml_l0_enabled();
             const double l0_wait_start = l0_trace ? ggml_l0_now() : 0;
             [cmd_buf waitUntilCompleted];
@@ -622,6 +676,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    ggml_metal_get_pending_complete(ctx);
     // INTENT/PDL: delimit actual graph encodes for debug-only fusion firing counts.
     if (ctx->debug_fusion > 1) {
         GGML_LOG_DEBUG("FUSION_GRAPH · graph=%p · nodes=%d · fusion=%d\n",

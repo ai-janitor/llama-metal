@@ -33,6 +33,9 @@ constant short FC_mul_mv_tail = is_function_constant_defined(FC_mul_mv_tail_raw)
 // Q8_0 weight load width in bytes: 1 (default) or 4 (aligned words, same bytes out).
 constant short FC_mul_mv_q8_load_raw [[function_constant(FC_MUL_MV + 10)]];
 constant short FC_mul_mv_q8_load = is_function_constant_defined(FC_mul_mv_q8_load_raw) ? FC_mul_mv_q8_load_raw : 1;
+// Q8_0 activation load width in bytes: 4 (default) or 16 (two aligned loads per lane, same bytes out).
+constant short FC_mul_mv_q8_act_raw [[function_constant(FC_MUL_MV + 11)]];
+constant short FC_mul_mv_q8_act = is_function_constant_defined(FC_mul_mv_q8_act_raw) ? FC_mul_mv_q8_act_raw : 4;
 
 // Shared memory reduction for GPUs where simd_sum() produces wrong results or where
 // actual SIMD width differs from N_SIMDWIDTH (Intel UHD 630: th_width=16, not 32).
@@ -381,7 +384,7 @@ void kernel_mul_mv_q8_0_f32_impl(
     device const float * yb = y + ib0*QK8_0;
 
     for (int ib = ib0; ib < nb; ib += NSG*CONCURRENT_BLOCKS) {
-        const block_dot_q8_0_activation prepared = block_dot_q8_0_scalar::prepare_activation<ARITHMETIC_LANE>(owned, yb);
+        const block_dot_q8_0_activation prepared = block_dot_q8_0_scalar::prepare_activation<ARITHMETIC_LANE>(owned, yb, FC_mul_mv_q8_act);
 
         for (short row = 0; row < NR0; row++) {
             if (FC_mul_mv_q8_load == 4 && ARITHMETIC_LANE == block_dot_lane_fp32) {
@@ -457,7 +460,7 @@ static inline void mul_mvg_q8_0_rows(
     device const float * yb = x + ib0*QK8_0;
 
     for (int ib = ib0; ib < nb; ib += NSG*CONCURRENT_BLOCKS) {
-        const block_dot_q8_0_activation prepared = block_dot_q8_0_scalar::prepare_activation<block_dot_lane_fp32>(owned, yb);
+        const block_dot_q8_0_activation prepared = block_dot_q8_0_scalar::prepare_activation<block_dot_lane_fp32>(owned, yb, FC_mul_mv_q8_act);
 
         for (short row = 0; row < NR0; row++) {
             if (FC_mul_mv_q8_load == 4) {

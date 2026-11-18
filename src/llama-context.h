@@ -136,6 +136,8 @@ struct llama_context {
     // state rows read from the h_nextn device buffer of ctx_src, see llama_set_ctx_state_src()
     bool set_ctx_state_src(llama_context * ctx_src);
     bool supports_state_row() const;
+    // the device queue alone orders a decode that reads state rows after the decode that wrote them
+    bool state_rows_in_queue_order() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
 

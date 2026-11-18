@@ -2,6 +2,7 @@
 
 #include "common.h"
 #include "fit.h"
+#include "gpu-pick.h"
 #include "log.h"
 #include "reasoning-budget.h"
 
@@ -125,6 +126,12 @@ struct common_sampler {
     // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
+    // the chain picks the highest logit and nothing in it can change which token that is (see common_sampler_greedy_only)
+    bool greedy_only = false;
+
+    // the token comes from the context: the GPU already picked it
+    bool gpu_pick = false;
+
     void reset() {
         prev.clear();
 
@@ -186,6 +193,50 @@ std::string common_params_sampling::print() const {
             mirostat, mirostat_eta, mirostat_tau, adaptive_target, adaptive_decay);
 
     return std::string(result);
+}
+
+// true when the chain built from these params returns the token with the highest logit: no grammar, reasoning budget,
+// logit bias or suppressed tokens, every sampler in the list off or keeping the top token, greedy last (as in init)
+static bool common_sampler_greedy_only(const common_params_sampling & p, const llama_vocab * vocab, bool has_grmr, bool has_rbudget) {
+    if (has_grmr || has_rbudget || p.backend_sampling || p.mirostat != 0 || p.n_probs != 0 || p.samplers.empty()) {
+        return false;
+    }
+    int32_t n_suppress = 0;
+    llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    if (!p.logit_bias.empty() || n_suppress != 0) {
+        return false;
+    }
+    const bool greedy_last =
+        (p.samplers.back() == COMMON_SAMPLER_TYPE_TEMPERATURE && p.temp == 0.0f && p.dynatemp_range == 0.0f) ||
+        (p.samplers.back() == COMMON_SAMPLER_TYPE_TOP_K && p.top_k == 1);
+    if (!greedy_last) {
+        return false;
+    }
+    for (const auto & s : p.samplers) {
+        switch (s) {
+            case COMMON_SAMPLER_TYPE_TOP_K:
+            case COMMON_SAMPLER_TYPE_TOP_P:
+            case COMMON_SAMPLER_TYPE_MIN_P:
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+            case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                break; // keep the top token
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (!(p.dry_multiplier == 0.0f || p.dry_base < 1.0f || p.dry_penalty_last_n == 0)) return false;
+                break;
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (!(p.penalty_last_n == 0 || (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f))) return false;
+                break;
+            case COMMON_SAMPLER_TYPE_XTC:
+                if (!(p.xtc_probability <= 0.0f || p.xtc_threshold > 0.5f)) return false;
+                break;
+            case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                if (!(p.typ_p >= 1.0f)) return false;
+                break;
+            default:
+                return false; // infill, adaptive-p and any new sampler
+        }
+    }
+    return true;
 }
 
 struct common_sampler * common_sampler_init(
@@ -432,6 +483,8 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    const bool greedy_only = common_sampler_greedy_only(params, vocab, grmr != nullptr, rbudget != nullptr);
+
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -443,6 +496,8 @@ struct common_sampler * common_sampler_init(
         // mix it, the chain and the draft are seeded from this one too
         /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
+
+    result->greedy_only = greedy_only;
 
     return result;
 }
@@ -604,11 +659,49 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+bool common_sampler_is_greedy_only(const struct common_sampler * gsmpl) {
+    return gsmpl && gsmpl->greedy_only;
+}
+
+void common_sampler_set_gpu_pick(struct common_sampler * gsmpl, bool on) {
+    gsmpl->gpu_pick = on;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
+
+    // the GPU picked the token: no logits are read
+    if (gsmpl->gpu_pick) {
+        const llama_token t = common_gpu_pick_token(ctx, idx);
+        if (t != LLAMA_TOKEN_NULL) {
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = llama_token_data{t, 0.0f, 1.0f};
+            gsmpl->cur_p  = { gsmpl->cur.data(), 1, 0, false };
+            return t;
+        }
+    }
+
+    // greedy only: the argmax of the logits is the chain's token, without the vocab-sized candidate array
+    if (gsmpl->greedy_only) {
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+        const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+        llama_token best   = 0;
+        float       best_l = logits[0];
+        for (llama_token t = 1; t < n_vocab; ++t) {
+            if (logits[t] > best_l) {
+                best_l = logits[t];
+                best   = t;
+            }
+        }
+        gsmpl->cur.resize(1);
+        gsmpl->cur[0] = llama_token_data{best, best_l, 1.0f};
+        gsmpl->cur_p  = { gsmpl->cur.data(), 1, 0, false };
+        return best;
+    }
 
     llama_token id = LLAMA_TOKEN_NULL;
 
