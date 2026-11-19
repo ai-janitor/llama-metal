@@ -1,7 +1,7 @@
 #ifndef GGML_METAL_MATMUL_BLOCK_DOT_Q4_K_METAL
 #define GGML_METAL_MATMUL_BLOCK_DOT_Q4_K_METAL
 
-#include "block-dot-lane.metal"
+#include "lane-fma-f32.metal"
 
 // Q4_K SWAR adapter. Callers retain traversal, reduction, and row scheduling.
 struct block_dot_q4_k_fragment {

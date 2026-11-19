@@ -5,7 +5,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
-
+#include "../../ggml/src/ggml-metal/ggml-metal-probe.h"
 #include <clocale>
 #include <cstdio>
 #include <cstring>
@@ -15,7 +15,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
+GGML_METAL_FAMILY(llama)
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
 #include <unistd.h>
@@ -541,7 +541,7 @@ int llama_completion(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
-    while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
+    while ((n_remain != 0 && !is_antiprompt) || params.interactive) { GGML_METAL_ZONE_BEGIN(token);
         // predict
         if (!embd.empty()) {
             // Note: (n_ctx - 4) here is to match the logic for commandline prompt handling via

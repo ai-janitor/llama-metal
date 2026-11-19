@@ -214,6 +214,11 @@ struct llama_hparams {
     uint32_t ssm_n_group = 0;
     float    ssm_norm_eps = 0.0f; // 0 = use f_norm_rms_eps
 
+    // activation formats the model asks for; GGML_TYPE_COUNT = not known
+    enum ggml_type act_dtype       = GGML_TYPE_COUNT; // hidden state
+    enum ggml_type act_state_dtype = GGML_TYPE_COUNT; // recurrent state
+    uint32_t       act_dtype_from  = 0;               // 0 = nowhere, 1 = keys of the file, 2 = built-in row for the name
+
     // for MiniMax-Text-01 linear attention
     uint32_t n_embd_head_la = 0;
 

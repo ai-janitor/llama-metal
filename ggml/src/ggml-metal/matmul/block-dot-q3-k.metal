@@ -28,9 +28,6 @@ struct block_dot_q3_k_fragment {
 
 struct block_dot_q3_k_activation {
     float values[32];
-    // The fast lane keeps two packed four-value activation groups for each
-    // original eight-value Q3 group. The faithful lane continues to use values.
-    half4 fast_groups[8];
 };
 
 struct block_dot_q3_k_legacy {
@@ -93,8 +90,7 @@ struct block_dot_q3_k_legacy {
     template<short ARITHMETIC_LANE = block_dot_lane_fp32>
     static inline block_dot_q3_k_activation prepare_activation(
             thread const block_dot_q3_k_fragment & owned, device const float * block_y) {
-        static_assert(ARITHMETIC_LANE == block_dot_lane_fp32 || ARITHMETIC_LANE == block_dot_lane_packed_fp16,
-                "Q3_K arithmetic lane must be fp32 or packed fp16");
+        static_assert(ARITHMETIC_LANE == block_dot_lane_fp32, "only the fp32 lane exists");
         block_dot_q3_k_activation prepared_values;
         device const float * y1 = block_y + owned.activation_offset;
         for (short l = 0; l < 8; ++l) {
@@ -102,17 +98,6 @@ struct block_dot_q3_k_legacy {
             prepared_values.values[l+ 8] = y1[l+16];
             prepared_values.values[l+16] = y1[l+32];
             prepared_values.values[l+24] = y1[l+48];
-        }
-        if constexpr (ARITHMETIC_LANE == block_dot_lane_packed_fp16) {
-            for (short group = 0; group < 4; ++group) {
-                const short offset = 8*group;
-                prepared_values.fast_groups[2*group + 0] = half4(
-                        prepared_values.values[offset + 0], prepared_values.values[offset + 1],
-                        prepared_values.values[offset + 2], prepared_values.values[offset + 3]);
-                prepared_values.fast_groups[2*group + 1] = half4(
-                        prepared_values.values[offset + 4], prepared_values.values[offset + 5],
-                        prepared_values.values[offset + 6], prepared_values.values[offset + 7]);
-            }
         }
         return prepared_values;
     }
@@ -124,68 +109,7 @@ struct block_dot_q3_k_legacy {
             thread const block_dot_q3_k_activation & prepared_values,
             thread float & first_accumulator,
             thread float & second_accumulator) {
-        static_assert(ARITHMETIC_LANE == block_dot_lane_fp32 || ARITHMETIC_LANE == block_dot_lane_packed_fp16,
-                "Q3_K arithmetic lane must be fp32 or packed fp16");
-        if constexpr (ARITHMETIC_LANE == block_dot_lane_packed_fp16) {
-            // The packed lane decodes each original Q3 group as two dot4 calls.
-            // Quant shifts restore the original masked low-quant magnitude before
-            // the fp32 high-mask correction and scale application.
-            device const uint16_t * q = (device const uint16_t *)(block->qs + owned.low_quant_byte_offset);
-            device const uint16_t * h = (device const uint16_t *)(block->hmask + owned.high_quant_byte_offset);
-            device const uint16_t * a = (device const uint16_t *)(block->scales);
-            device const half * dh = &block->d;
-            const float d_all = (float)dh[0];
-            uint32_t scales32, aux32;
-            thread uint16_t * scales16 = (thread uint16_t *)&scales32;
-            thread const int8_t * scales = (thread const int8_t *)&scales32;
-            scales16[0] = a[4];
-            scales16[1] = a[5];
-            aux32 = ((scales32 >> owned.scale_high_shift) << 4) & 0x30303030;
-            scales16[0] = a[owned.quarter_index*2+0];
-            scales16[1] = a[owned.quarter_index*2+1];
-            scales32 = ((scales32 >> owned.scale_low_shift) & 0x0f0f0f0f) | aux32;
-
-            for (short group = 0; group < 4; ++group) {
-                const short value_offset = 8*group;
-                const short q_offset = (group & 1) ? 8 : 0;
-                const short quant_shift = owned.quant_shift + (group >= 2 ? 2 : 0);
-                const ushort low_bit_shift = quant_shift;
-                const ushort high_byte_shift = low_bit_shift + 8;
-                uchar4 low_quant_first;
-                uchar4 low_quant_second;
-                float correction_sum = 0.0f;
-                const ushort4 high_masks = owned.high_masks;
-                const ushort high_mask_first = group < 2 ? high_masks[0] : high_masks[2];
-                const ushort high_mask_second = group < 2 ? high_masks[1] : high_masks[3];
-                const float correction_scale = group < 2 ? owned.correction_first : owned.correction_second;
-
-                for (short pair = 0; pair < 4; ++pair) {
-                    const ushort packed_q = q[q_offset + pair];
-                    const ushort packed_h = h[q_offset + pair];
-                    const uchar q0 = uchar((packed_q >> low_bit_shift) & 0x3);
-                    const uchar q1 = uchar((packed_q >> high_byte_shift) & 0x3);
-                    if (pair < 2) {
-                        low_quant_first[2*pair + 0] = q0;
-                        low_quant_first[2*pair + 1] = q1;
-                    } else {
-                        low_quant_second[2*(pair - 2) + 0] = q0;
-                        low_quant_second[2*(pair - 2) + 1] = q1;
-                    }
-                    const short correction_offset = 2*pair;
-                    correction_sum += ((packed_h & high_mask_first) ? 0.0f : prepared_values.values[value_offset + correction_offset + 0])
-                                   + ((packed_h & high_mask_second) ? 0.0f : prepared_values.values[value_offset + correction_offset + 1]);
-                }
-                const float restored_low_dot = (block_dot_packed_half_dot4(prepared_values.fast_groups[2*group + 0], low_quant_first)
-                        + block_dot_packed_half_dot4(prepared_values.fast_groups[2*group + 1], low_quant_second)) * float(1 << quant_shift);
-                const float group_dot = d_all * (restored_low_dot - correction_sum*correction_scale);
-                if (group < 2) {
-                    first_accumulator += group_dot * (scales[group] - 32);
-                } else {
-                    second_accumulator += group_dot * (scales[group] - 32);
-                }
-            }
-            return;
-        }
+        static_assert(ARITHMETIC_LANE == block_dot_lane_fp32, "only the fp32 lane exists");
         // scales32/scales16/scales are overlapping views of packed scale bytes.
         // scales32/scales16/scales: overlapping views of 4-byte scale buffer.
         // Used to reconstruct 6-bit per-group scales from the packed 12-byte format.

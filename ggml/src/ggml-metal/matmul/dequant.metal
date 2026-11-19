@@ -35,6 +35,11 @@ template <typename type4>
 void dequantize_bf16_t4(device const bfloat4 * src, short il, thread type4 & reg) {
     reg = (type4)(*(src));
 }
+#elif defined(GGML_METAL_BF16_U16)
+template <typename type4>
+void dequantize_bf16_t4(device const ggml_bf16_u4 * src, short il, thread type4 & reg) {
+    reg = (type4)(float4(*src));
+}
 #endif
 
 template <typename type4x4>
@@ -266,6 +271,306 @@ void dequantize_mxfp4(device const block_mxfp4 * xb, short il, thread type4x4 & 
         reg[i][2] = d * kvalues_mxfp4_f[(q2[4*i + 2] >> shr) & 0x0F];
         reg[i][3] = d * kvalues_mxfp4_f[(q2[4*i + 3] >> shr) & 0x0F];
     }
+}
+
+// Element e of a block, for the 1-bit, 2-bit, ternary and nvfp4 formats.
+static inline float q1_0_elem(device const block_q1_0 * xb, short e) {
+    const float d = xb->d;
+    return ((xb->qs[e / 8] >> (e % 8)) & 1) ? d : -d;
+}
+
+static inline float q2_0_elem(device const block_q2_0 * xb, short e) {
+    const int q = (xb->qs[e / 4] >> ((e % 4) * 2)) & 3;
+    return (float) (q - 1) * (float) xb->d;
+}
+
+// Two halves of 128 elements; inside a half, byte m holds elements m, 32 + m, 64 + m, 96 + m.
+static inline int tq2_0_trit(device const block_tq2_0 * xb, short e) {
+    const short r = e % 128;
+    return ((xb->qs[(e / 128) * 32 + r % 32] >> ((r / 32) * 2)) & 3) - 1;
+}
+
+// Base-3 digits: 5 per byte in qs (32 bytes over 160 elements, then 16 bytes over 80), 4 per byte in qh.
+static inline int tq1_0_trit(device const block_tq1_0 * xb, short e) {
+    const uint8_t pow3[5] = {1, 3, 9, 27, 81};
+    uint8_t b;
+    short n;
+    if (e < 160) {
+        n = e / 32;
+        b = xb->qs[e % 32];
+    } else if (e < 240) {
+        n = (e - 160) / 16;
+        b = xb->qs[32 + (e - 160) % 16];
+    } else {
+        n = (e - 240) / 4;
+        b = xb->qh[(e - 240) % 4];
+    }
+    const uint8_t q = (uint8_t) (b * pow3[n]);
+    return (int) (((uint) q * 3) >> 8) - 1;
+}
+
+// Unsigned E4M3 scale: 4 exponent bits (bias 7), 3 mantissa bits. kvalues_mxfp4_f holds the true 4-bit values.
+static inline float ue4m3_to_fp32(uint8_t x) {
+    if (x == 0 || x == 0x7F) {
+        return 0.0f;
+    }
+    const int exp = (x >> 3) & 0xF;
+    const int man = x & 0x7;
+    return exp == 0 ? ldexp((float) man, -9) : ldexp(1.0f + (float) man / 8.0f, exp - 7);
+}
+
+// A sub-block of 16 elements: low nibbles are elements 0-7, high nibbles 8-15.
+static inline float nvfp4_elem(device const block_nvfp4 * xb, short e) {
+    const short s = e / 16;
+    const short r = e % 16;
+    const uint8_t b = xb->qs[s * 8 + r % 8];
+    return kvalues_mxfp4_f[r >= 8 ? (b >> 4) : (b & 0x0F)] * ue4m3_to_fp32(xb->d[s]);
+}
+
+template <typename type4x4>
+void dequantize_q1_0(device const block_q1_0 * xb, short il, thread type4x4 & reg) {
+    for (short i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = q1_0_elem(xb, 16*il + i);
+    }
+}
+
+template <typename type4x4>
+void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
+    for (short i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = q2_0_elem(xb, 16*il + i);
+    }
+}
+
+template <typename type4x4>
+void dequantize_tq1_0(device const block_tq1_0 * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+    for (short i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = (float) tq1_0_trit(xb, 16*il + i) * d;
+    }
+}
+
+template <typename type4x4>
+void dequantize_tq2_0(device const block_tq2_0 * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+    for (short i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = (float) tq2_0_trit(xb, 16*il + i) * d;
+    }
+}
+
+template <typename type4x4>
+void dequantize_nvfp4(device const block_nvfp4 * xb, short il, thread type4x4 & reg) {
+    for (short i = 0; i < 16; ++i) {
+        reg[i/4][i%4] = nvfp4_elem(xb, 16*il + i);
+    }
+}
+
+// Quantize one block of floats into the 1-bit, 2-bit, ternary and nvfp4 formats (same steps as the CPU reference).
+void quantize_q1_0(device const float * src, device block_q1_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    float sum_abs = 0.0f;
+    for (int j = 0; j < QK1_0; ++j) {
+        sum_abs += fabs(src[j]);
+    }
+
+    dst.d = sum_abs / QK1_0;
+
+    for (int j = 0; j < QK1_0/8; ++j) {
+        uint8_t b = 0;
+        for (int k = 0; k < 8; ++k) {
+            b |= (src[8*j + k] >= 0.0f ? 1 : 0) << k;
+        }
+        dst.qs[j] = b;
+    }
+}
+
+void quantize_q2_0(device const float * src, device block_q2_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    float amax = 0.0f;
+    for (int j = 0; j < QK2_0; ++j) {
+        amax = max(amax, fabs(src[j]));
+    }
+
+    const float id = amax > 0.0f ? 1.0f/amax : 0.0f;
+
+    dst.d = amax;
+
+    for (int j = 0; j < QK2_0/4; ++j) {
+        uint8_t b = 0;
+        for (int k = 0; k < 4; ++k) {
+            const int q = clamp((int) round(src[4*j + k]*id) + 1, 0, 3);
+            b |= q << (2*k);
+        }
+        dst.qs[j] = b;
+    }
+}
+
+// Base-3 digits, most significant first, then scaled to a byte by a ceiling division by 243.
+static inline uint8_t tq1_0_pack(device const float * x, float id, short step, short n_digits) {
+    uint q = 0;
+    for (short n = 0; n < n_digits; ++n) {
+        q = q*3 + (uint) ((int) round(x[n*step]*id) + 1);
+    }
+    if (n_digits == 4) {
+        q *= 3;
+    }
+    return (uint8_t) ((q*256 + 242)/243);
+}
+
+void quantize_tq1_0(device const float * src, device block_tq1_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    float amax = 0.0f;
+    for (int j = 0; j < QK_K; ++j) {
+        amax = max(amax, fabs(src[j]));
+    }
+
+    const float id = amax > 0.0f ? 1.0f/amax : 0.0f;
+
+    dst.d = amax;
+
+    for (short m = 0; m < 32; ++m) {
+        dst.qs[m] = tq1_0_pack(src + m, id, 32, 5);
+    }
+    for (short m = 0; m < 16; ++m) {
+        dst.qs[32 + m] = tq1_0_pack(src + 160 + m, id, 16, 5);
+    }
+    for (short m = 0; m < 4; ++m) {
+        dst.qh[m] = tq1_0_pack(src + 240 + m, id, 4, 4);
+    }
+}
+
+void quantize_tq2_0(device const float * src, device block_tq2_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    float amax = 0.0f;
+    for (int j = 0; j < QK_K; ++j) {
+        amax = max(amax, fabs(src[j]));
+    }
+
+    const float id = amax > 0.0f ? 1.0f/amax : 0.0f;
+
+    dst.d = amax;
+
+    for (short h = 0; h < 2; ++h) {
+        for (short m = 0; m < 32; ++m) {
+            uint8_t q = 0;
+            for (short n = 0; n < 4; ++n) {
+                const int xi = (int) round(src[128*h + m + 32*n]*id) + 1;
+                q += (xi & 3) << (2*n);
+            }
+            dst.qs[32*h + m] = q;
+        }
+    }
+}
+
+static inline uint8_t fp32_to_ue4m3(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    x = min(x, 448.0f);
+    const uint bits = as_type<uint>(x);
+    int e = (int) ((bits >> 23) & 0xFF) - 127 + 7;
+    if (e <= 0) {
+        const int man = min((int) (x*512.0f + 0.5f), 7);
+        return man < 1 ? 0 : (uint8_t) man;
+    }
+    if (e >= 15) {
+        return 0x7E;
+    }
+    int man = (int) ((bits >> 20) & 0x7) + (int) ((bits >> 19) & 1);
+    if (man > 7) {
+        man = 0;
+        e++;
+        if (e >= 15) {
+            return 0x7E;
+        }
+    }
+    return (uint8_t) ((e << 3) | man);
+}
+
+static inline uint8_t nvfp4_best_index(float x, float d) {
+    uint8_t best = 0;
+    float best_err = fabs(kvalues_mxfp4_f[0]*d - x);
+    for (uint8_t i = 1; i < 16; ++i) {
+        const float err = fabs(kvalues_mxfp4_f[i]*d - x);
+        if (err < best_err) {
+            best = i;
+            best_err = err;
+        }
+    }
+    return best;
+}
+
+void quantize_nvfp4(device const float * src, device block_nvfp4 & dst) {
+#pragma METAL fp math_mode(safe)
+    for (short s = 0; s < 4; ++s) {
+        device const float * xb = src + 16*s;
+
+        float amax = 0.0f;
+        for (short j = 0; j < 16; ++j) {
+            amax = max(amax, fabs(xb[j]));
+        }
+
+        const uint8_t ue = fp32_to_ue4m3(amax / 6.0f);
+        dst.d[s] = ue;
+        const float d = ue4m3_to_fp32(ue);
+
+        for (short j = 0; j < 8; ++j) {
+            dst.qs[8*s + j] = nvfp4_best_index(xb[j], d) | (nvfp4_best_index(xb[8 + j], d) << 4);
+        }
+    }
+}
+
+// fp8 (E4M3: sign, 4 exponent bits with bias 7, 3 mantissa bits), one byte per element.
+static inline float f8_e4m3_to_fp32(uint8_t x) {
+    const uint8_t ax = x & 0x7F;
+    if (ax == 0x7F) {
+        return as_type<float>(0x7FC00000u);
+    }
+    const int exp = (ax >> 3) & 0xF;
+    const int man = ax & 0x7;
+    const float value = exp == 0 ? ldexp((float) man, -9) : ldexp(1.0f + (float) man / 8.0f, exp - 7);
+    return (x & 0x80) ? -value : value;
+}
+
+// fp8 weights have no block: the matvec template reads them as blocks of one element.
+struct block_f8_e4m3 { uint8_t bits; };
+
+static inline int f8_round_to_nearest_even(float x) {
+    const int value = (int) floor(x);
+    const float fraction = x - (float) value;
+    return (fraction > 0.5f || (fraction == 0.5f && (value & 1))) ? value + 1 : value;
+}
+
+// Saturating: infinities and overflow clamp to +/-448.
+static inline uint8_t fp32_to_f8_e4m3(float x) {
+#pragma METAL fp math_mode(safe)
+    const uint bits = as_type<uint>(x);
+    const uint8_t sign = (bits >> 31) ? 0x80 : 0;
+    const uint abits = bits & 0x7FFFFFFFu;
+    if (abits > 0x7F800000u) {
+        return 0x7F;
+    }
+    if (abits == 0) {
+        return sign;
+    }
+    const float ax = as_type<float>(abits);
+    if (abits == 0x7F800000u || ax >= 448.0f) {
+        return sign | 0x7E;
+    }
+    if (ax < 0.015625f) {
+        return sign | (uint8_t) f8_round_to_nearest_even(ax*512.0f);
+    }
+    // ax = m * 2^e with m in [1, 2)
+    const float m = as_type<float>((abits & 0x007FFFFFu) | 0x3F800000u);
+    int enc_exp = (int) (abits >> 23) - 127 + 7;
+    int enc_man = f8_round_to_nearest_even((m - 1.0f)*8.0f);
+    if (enc_man == 8) {
+        enc_man = 0;
+        enc_exp++;
+    }
+    if (enc_exp > 15 || (enc_exp == 15 && enc_man > 6)) {
+        return sign | 0x7E;
+    }
+    return sign | (uint8_t) (enc_exp << 3) | (uint8_t) enc_man;
 }
 
 template <typename type4>

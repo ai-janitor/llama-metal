@@ -247,7 +247,7 @@ kernel void kernel_l2_norm_impl(
     }
     sumf = simd_sum(sumf);
 
-    const float scale = 1.0f/sqrt(max(sumf, args.eps));
+    const float scale = 1.0f/max(sqrt(sumf), args.eps);
 
     for (int i00 = tpitg.x; i00 < args.ne00; i00 += ntg.x) {
         y[i00] = x[i00] * scale;
@@ -264,27 +264,36 @@ kernel void kernel_group_norm_f32(
         device const float * src0,
         device       float * dst,
         threadgroup float  * buf [[threadgroup(0)]],
-        uint tgpig[[threadgroup_position_in_grid]],
-        ushort tpitg[[thread_position_in_threadgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort   ntg[[threads_per_threadgroup]]) {
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg3[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3 ntg3[[threads_per_threadgroup]]) {
+    const ushort tpitg = tpitg3.x;
+    const ushort ntg   = ntg3.x;
+
     const int64_t ne = args.ne00*args.ne01*args.ne02;
     const int64_t gs = args.ne00*args.ne01*((args.ne02 + args.ngrp - 1) / args.ngrp);
 
-    int start = tgpig * gs;
-    int end   = start + gs;
+    // grid x is the group, grid y the batch item
+    device const float * x = src0 + tgpig.y*ne;
+    device       float * y = dst  + tgpig.y*ne;
 
-    start += tpitg;
+    int start = tgpig.x * gs;
+    int end   = start + gs;
 
     if (end >= ne) {
         end = ne;
     }
 
+    const float cnt = end - start; // the last group can be short
+
+    start += tpitg;
+
     float tmp = 0.0f; // partial sum for thread in warp
 
     for (int j = start; j < end; j += ntg) {
-        tmp += src0[j];
+        tmp += x[j];
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -306,12 +315,12 @@ kernel void kernel_group_norm_f32(
         tmp = simd_sum(tmp);
     }
 
-    const float mean = tmp / gs;
+    const float mean = tmp / cnt;
     tmp = 0.0f;
 
     for (int j = start; j < end; j += ntg) {
-        float xi = src0[j] - mean;
-        dst[j] = xi;
+        float xi = x[j] - mean;
+        y[j] = xi;
         tmp += xi * xi;
     }
 
@@ -333,9 +342,9 @@ kernel void kernel_group_norm_f32(
         tmp = simd_sum(tmp);
     }
 
-    const float variance = tmp / gs;
+    const float variance = tmp / cnt;
     const float scale = 1.0f/sqrt(variance + args.eps);
     for (int j = start; j < end; j += ntg) {
-        dst[j] *= scale;
+        y[j] *= scale;
     }
 }

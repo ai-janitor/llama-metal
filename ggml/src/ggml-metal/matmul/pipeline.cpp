@@ -3,15 +3,17 @@
 #include "../ggml-metal-device.h"
 #include "../ggml-metal-impl.h"
 #include "../ggml-impl.h"
+// The table header checks its rows against the constants of ggml-metal-impl.h in this file.
+#define GGML_METAL_MV_FORMATS_CHECK
 #include "tuning.h"
 #include "dispatch.h"
-#include "lane-policy.h"
-
+#include "../lanes/select.h"
+#include "ggml-metal-probe.h"
 #include <cassert>
 #include <memory>
 #include <string>
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_metal_library_t lib, ggml_type tsrc0, ggml_type tsrc1, int nsg, int nxpsg, int r1ptg, bool use_shmem_reduce, bool src1_trans) {
+GGML_METAL_FAMILY(matmul)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_metal_library_t lib, ggml_type tsrc0, ggml_type tsrc1, int nsg, int nxpsg, int r1ptg, bool use_shmem_reduce, bool src1_trans) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 
@@ -47,7 +49,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 
@@ -102,8 +104,31 @@ int ggml_metal_q8_act_load_bytes(const struct ggml_device_profile * hw, const gg
     return ggml_metal_get_buffer_id(src1).offs % 16 == 0 ? 16 : 4;
 }
 
+// The row of a block-quantized format with a kernel_mul_mv_<type>_f32 entry point; float types have none here.
+static const struct mv_format_row * mv_format_row_of(enum ggml_type type) {
+    const struct mv_format_row * row = ggml_metal_mv_format(type);
+    return row && row->nsg > 0 ? row : NULL;
+}
+
+// Threadgroup memory of a format's matvec kernel at this geometry.
+static size_t mv_format_smem(const struct mv_format_row * row, int simd_width, int nsg, int nr0, bool use_shmem_reduce) {
+    switch (row->smem) {
+        case MV_SMEM_NONE:
+            return 0;
+        case MV_SMEM_BYTES:
+            return (size_t) row->bytes;
+        case MV_SMEM_LANE_FLOATS:
+            return (size_t)simd_width*sizeof(float);
+        case MV_SMEM_ROW_SUMS:
+            return use_shmem_reduce
+                ? (size_t)nsg*simd_width*sizeof(float)*nr0
+                : (size_t)simd_width*sizeof(float)*nr0;
+    }
+    return 0;
+}
+
 // kq_prep: the Q4_K entry point that reads block headers prepared at load (the caller binds them at 5); only for Q4_K x F32.
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool use_shmem_reduce, bool src1_trans, int nr0_override, bool use_residual, bool kq_prep, int ncols, int col_form) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool use_shmem_reduce, bool src1_trans, int nr0_override, bool use_residual, bool kq_prep, int ncols, int col_form) { GGML_METAL_ZONE_BEGIN(pipeline);
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
@@ -121,8 +146,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
 
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
-    const int16_t selected_lane = ggml_metal_select_matvec_lane(
-        lib, tsrc0, GGML_METAL_MATVEC_ROUTE_SCALAR);
+    const int16_t selected_lane = ggml_metal_select_lane_id(
+        hw, GGML_METAL_LANE_FAMILY_MATMUL, GGML_METAL_LANE_ROUTE_MV_SCALAR, tsrc0, tsrc1);
 
     const char * suffix = "";
 
@@ -152,92 +177,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     suffix = ne00 % 4 == 0 ? "_4" : "";
                 }
             } break;
-        case GGML_TYPE_Q4_0:
-        case GGML_TYPE_Q4_1:
-        case GGML_TYPE_Q5_0:
-        case GGML_TYPE_Q5_1:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-            } break;
-        case GGML_TYPE_Q8_0:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-                // shmem_reduce path uses nsg*NW as reduction group_size in
-                // helper_mv_reduce_and_write_shmem, needing nsg*NW*NR0 floats.
-                // Non-shmem path (NW=32) uses NW*NR0 floats for simdgroup partials.
-                smem = use_shmem_reduce
-                    ? (size_t)nsg*simd_width*sizeof(float)*nr0
-                    : (size_t)simd_width*sizeof(float)*nr0;
-            } break;
-        case GGML_TYPE_MXFP4:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-                smem = (size_t)simd_width*sizeof(float);
-            } break;
-        case GGML_TYPE_Q2_K:
-        case GGML_TYPE_Q3_K:
-        case GGML_TYPE_Q4_K:
-        case GGML_TYPE_Q5_K:
-        case GGML_TYPE_Q6_K:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-            } break;
-        case GGML_TYPE_IQ2_XXS:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-                smem = 256*8+128;
-            } break;
-        case GGML_TYPE_IQ2_XS:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-                smem = 512*8+128;
-            } break;
-        case GGML_TYPE_IQ3_XXS:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-                smem = 256*4+128;
-            } break;
-        case GGML_TYPE_IQ3_S:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-                smem = 512*4;
-            } break;
-        case GGML_TYPE_IQ2_S:
-        case GGML_TYPE_IQ1_S:
-        case GGML_TYPE_IQ1_M:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-            } break;
-        case GGML_TYPE_IQ4_NL:
-        case GGML_TYPE_IQ4_XS:
-            {
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-                smem = (size_t)simd_width*sizeof(float);
-            } break;
         default:
             {
-                GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
-                GGML_ABORT("not implemented");
+                const struct mv_format_row * row = mv_format_row_of(tsrc0);
+                if (!row) {
+                    GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
+                    GGML_ABORT("not implemented");
+                }
+                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
+                nsg = t.nsg;
+                nr0 = t.nr0;
+                smem = mv_format_smem(row, simd_width, nsg, nr0, use_shmem_reduce);
             }
     };
 
@@ -255,9 +205,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     // added to the kernel entry point routes FC_mul_mv_nr0 to template instantiations,
     // but the dispatch grid + shmem sizing assumes the pipeline nr0 matches.
     // q8_0 keeps its compiled N_R0_Q8_0 (ggml-metal-impl.h); the rows override does not apply to it.
-    const bool supports_nr0_override = (tsrc0 == GGML_TYPE_Q4_0 || tsrc0 == GGML_TYPE_Q4_1 ||
-                                        tsrc0 == GGML_TYPE_Q5_0 || tsrc0 == GGML_TYPE_Q5_1 ||
-                                        tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K || tsrc0 == GGML_TYPE_Q6_K);
+    const struct mv_format_row * tsrc0_row = mv_format_row_of(tsrc0);
+    const bool supports_nr0_override = tsrc0_row && tsrc0_row->nr0_override;
     if (nr0_override > 0 && supports_nr0_override) {
         nr0 = nr0_override;
         if (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K || tsrc0 == GGML_TYPE_Q6_K) {
@@ -302,7 +251,6 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         // Set dynamic NR0 function constant — used by basic quant kernels (q4_0..q5_1).
         // K-quant kernels still use template<int nr0> and ignore this FC slot.
         ggml_metal_cv_set_int16(cv, (int16_t)nr0, FC_MUL_MV + 4);
-        ggml_metal_cv_set_int16(cv, selected_lane, FC_MATVEC_LANE);
         // Only the scalar Q4_K entry reads FC606; every other kernel ignores it.
         ggml_metal_cv_set_bool(cv, use_residual, FC_MUL_MV_RESIDUAL);
         ggml_metal_cv_set_int16(cv, mv_tail, FC_MUL_MV + 7);
@@ -336,56 +284,33 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     // Smem formulas using simd_width must be recomputed with the actual value.
     const int pw = res.pipeline ? ggml_metal_pipeline_thread_execution_width(res) : simd_width;
     if (pw != simd_width) {
-        // Recompute only for types whose smem depends on simd_width.
-        // Types with fixed smem (IQ2/IQ3 lookup tables) are unaffected.
-        switch (tsrc0) {
-            case GGML_TYPE_F32:
-            case GGML_TYPE_F16:
-            case GGML_TYPE_BF16:
-                if (ne00 >= 32) { smem = (size_t)(use_shmem_reduce ? nsg : 1) * pw * sizeof(float) * nr0; }
-                break;
-            case GGML_TYPE_Q8_0:
-                smem = use_shmem_reduce
-                    ? (size_t)nsg*pw*sizeof(float)*nr0
-                    : (size_t)pw*sizeof(float)*nr0;
-                break;
-            case GGML_TYPE_MXFP4:
-                if (!use_shmem_reduce && pw < 32) {
-                    // At NW<32 (Intel iGPU), simd_sum and simd_shuffle_down are
-                    // unreliable. Recompile mxfp4 with shmem_reduce=true so the
-                    // kernel uses the barrier-based reduction path that is known to
-                    // work on Intel (the same path used by the ext kernel at nxpsg=16).
-                    // This gives a fresh pipeline with name _sr=1 and correct smem.
-                    char sr1_name[256];
-                    snprintf(sr1_name, 256, "%s_nsg=%d_sr=1", base, nsg);
-                    ggml_metal_pipeline_with_params sr1 = ggml_metal_library_get_pipeline(lib, sr1_name);
-                    if (!sr1.pipeline) {
-                        ggml_metal_cv_t cv2 = ggml_metal_cv_init();
-                        ggml_metal_cv_set_int16(cv2, nsg, FC_MUL_MV + 0);
-                        ggml_metal_cv_set_bool  (cv2, true, FC_MUL_MV + 2); // sr=1
-                        sr1 = ggml_metal_library_compile_pipeline(lib, base, sr1_name, cv2);
-                        if (sr1.pipeline) {
-                            ggml_metal_pipeline_set_verified_vendors(sr1.pipeline,
-                                GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD | GGML_METAL_VERIFIED_INTEL);
-                        }
-                        ggml_metal_cv_free(cv2);
-                    }
-                    if (sr1.pipeline) {
-                        res = sr1;
-                        smem = (size_t)pw * sizeof(float); // lookup table base
-                        // shmem_reduce needs nsg*pw*nr0 floats; enforce at line 285
-                        use_shmem_reduce = true;
-                        break;
-                    }
+        // Only the kinds sized by the width change; a fixed table and the short float kernel (no threadgroup memory) do not.
+        const struct mv_format_row * row = ggml_metal_mv_format(tsrc0);
+        const bool float_short = row != nullptr && row->nsg == 0 && ne00 < 32;
+        if (row != nullptr && row->reduce_recompile && !use_shmem_reduce && pw < 32) {
+            // Below width 32 (Intel iGPU) simd_sum and simd_shuffle_down are unreliable: compile the kernel again
+            // with the shared-memory reduce, the barrier-based path the ext kernel uses there.
+            char sr1_name[256];
+            snprintf(sr1_name, 256, "%s_nsg=%d_sr=1", base, nsg);
+            ggml_metal_pipeline_with_params sr1 = ggml_metal_library_get_pipeline(lib, sr1_name);
+            if (!sr1.pipeline) {
+                ggml_metal_cv_t cv2 = ggml_metal_cv_init();
+                ggml_metal_cv_set_int16(cv2, nsg, FC_MUL_MV + 0);
+                ggml_metal_cv_set_bool  (cv2, true, FC_MUL_MV + 2); // sr=1
+                sr1 = ggml_metal_library_compile_pipeline(lib, base, sr1_name, cv2);
+                if (sr1.pipeline) {
+                    ggml_metal_pipeline_set_verified_vendors(sr1.pipeline,
+                        GGML_METAL_VERIFIED_APPLE | GGML_METAL_VERIFIED_AMD | GGML_METAL_VERIFIED_INTEL);
                 }
-                smem = (size_t)pw * sizeof(float);
-                break;
-            case GGML_TYPE_IQ4_NL:
-            case GGML_TYPE_IQ4_XS:
-                smem = (size_t)pw * sizeof(float);
-                break;
-            default:
-                break; // fixed smem, no change
+                ggml_metal_cv_free(cv2);
+            }
+            if (sr1.pipeline) {
+                res = sr1;
+                use_shmem_reduce = true;
+            }
+        }
+        if (row != nullptr && !float_short && (row->smem == MV_SMEM_LANE_FLOATS || row->smem == MV_SMEM_ROW_SUMS)) {
+            smem = mv_format_smem(row, pw, nsg, nr0, use_shmem_reduce);
         }
     }
 
@@ -397,7 +322,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(ggml_metal_library_t lib, int ne02, int ne20) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 
@@ -414,7 +339,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id_map0(g
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 
@@ -446,7 +371,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id(ggml_m
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op, bool use_shmem_reduce) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_metal_library_t lib, const ggml_tensor * op, bool use_shmem_reduce) { GGML_METAL_ZONE_BEGIN(pipeline);
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
@@ -478,123 +403,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 smem = (size_t)simd_width*sizeof(float)*nr0;
                 suffix = ne00 % 4 == 0 ? "_4" : "";
             } break;
-        case GGML_TYPE_Q4_0:
-            {
-                nsg = N_SG_Q4_0;
-                nr0 = N_R0_Q4_0;
-            } break;
-        case GGML_TYPE_Q4_1:
-            {
-                nsg = N_SG_Q4_1;
-                nr0 = N_R0_Q4_1;
-            } break;
-        case GGML_TYPE_Q5_0:
-            {
-                nsg = N_SG_Q5_0;
-                nr0 = N_R0_Q5_0;
-            } break;
-        case GGML_TYPE_Q5_1:
-            {
-                nsg = N_SG_Q5_1;
-                nr0 = N_R0_Q5_1;
-            } break;
-        case GGML_TYPE_Q8_0:
-            {
-                nsg = N_SG_Q8_0;
-                nr0 = N_R0_Q8_0;
-                // shmem_reduce path uses nsg*NW as reduction group_size in
-                // helper_mv_reduce_and_write_shmem, needing nsg*NW*NR0 floats.
-                // Non-shmem path (NW=32) uses NW*NR0 floats for simdgroup partials.
-                smem = use_shmem_reduce
-                    ? (size_t)nsg*simd_width*sizeof(float)*nr0
-                    : (size_t)simd_width*sizeof(float)*nr0;
-            } break;
-        case GGML_TYPE_MXFP4:
-            {
-                nsg = N_SG_MXFP4;
-                nr0 = N_R0_MXFP4;
-                smem = (size_t)simd_width*sizeof(float);
-            } break;
-        case GGML_TYPE_Q2_K:
-            {
-                nsg = N_SG_Q2_K;
-                nr0 = N_R0_Q2_K;
-            } break;
-        case GGML_TYPE_Q3_K:
-            {
-                nsg = N_SG_Q3_K;
-                nr0 = N_R0_Q3_K;
-            } break;
-        case GGML_TYPE_Q4_K:
-            {
-                nsg = N_SG_Q4_K;
-                nr0 = N_R0_Q4_K;
-            } break;
-        case GGML_TYPE_Q5_K:
-            {
-                nsg = N_SG_Q5_K;
-                nr0 = N_R0_Q5_K;
-            } break;
-        case GGML_TYPE_Q6_K:
-            {
-                nsg = N_SG_Q6_K;
-                nr0 = N_R0_Q6_K;
-            } break;
-        case GGML_TYPE_IQ2_XXS:
-            {
-                nsg = N_SG_IQ2_XXS;
-                nr0 = N_R0_IQ2_XXS;
-                smem = 256*8+128;
-            } break;
-        case GGML_TYPE_IQ2_XS:
-            {
-                nsg = N_SG_IQ2_XS;
-                nr0 = N_R0_IQ2_XS;
-                smem = 512*8+128;
-            } break;
-        case GGML_TYPE_IQ3_XXS:
-            {
-                nsg = N_SG_IQ3_XXS;
-                nr0 = N_R0_IQ3_XXS;
-                smem = 256*4+128;
-            } break;
-        case GGML_TYPE_IQ3_S:
-            {
-                nsg = N_SG_IQ3_S;
-                nr0 = N_R0_IQ3_S;
-                smem = 512*4;
-            } break;
-        case GGML_TYPE_IQ2_S:
-            {
-                nsg = N_SG_IQ2_S;
-                nr0 = N_R0_IQ2_S;
-            } break;
-        case GGML_TYPE_IQ1_S:
-            {
-                nsg = N_SG_IQ1_S;
-                nr0 = N_R0_IQ1_S;
-            } break;
-        case GGML_TYPE_IQ1_M:
-            {
-                nsg = N_SG_IQ1_M;
-                nr0 = N_R0_IQ1_M;
-            } break;
-        case GGML_TYPE_IQ4_NL:
-            {
-                nsg = N_SG_IQ4_NL;
-                nr0 = N_R0_IQ4_NL;
-                smem = (size_t)simd_width*sizeof(float);
-            } break;
-        case GGML_TYPE_IQ4_XS:
-            {
-                nsg = N_SG_IQ4_XS;
-                nr0 = N_R0_IQ4_XS;
-                smem = (size_t)simd_width*sizeof(float);
-            } break;
         default:
             {
-                GGML_LOG_ERROR("Asserting on type %d\n", (int)op->src[2]->type);
-                GGML_ABORT("not implemented");
+                const struct mv_format_row * row = mv_format_row_of(tsrc0);
+                if (!row) {
+                    GGML_LOG_ERROR("Asserting on type %d\n", (int)op->src[2]->type);
+                    GGML_ABORT("not implemented");
+                }
+                const struct mv_tuning t = ggml_metal_get_mv_tuning(nullptr, tsrc0);
+                nsg = t.nsg;
+                nr0 = t.nr0;
+                smem = mv_format_smem(row, simd_width, nsg, nr0, use_shmem_reduce);
             }
     };
 
@@ -652,25 +471,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
 // GCN-safe pipeline: pure threadgroup-memory reduction, no simd intrinsics.
 // For AMD GPUs with 64-wide wavefronts where simd_sum/simd_shuffle_down are unreliable.
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_gcn(ggml_metal_library_t lib, ggml_type tsrc0, ggml_type tsrc1) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_gcn(ggml_metal_library_t lib, ggml_type tsrc0, ggml_type tsrc1) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 
-    const char * type_name_0 = nullptr;
-    switch (tsrc0) {
-        case GGML_TYPE_F32:    type_name_0 = "f32";  break;
-        case GGML_TYPE_F16:    type_name_0 = "f16";  break;
-        case GGML_TYPE_Q4_0:   type_name_0 = "q4_0"; break;
-        case GGML_TYPE_Q4_1:   type_name_0 = "q4_1"; break;
-        case GGML_TYPE_Q5_0:   type_name_0 = "q5_0"; break;
-        case GGML_TYPE_Q5_1:   type_name_0 = "q5_1"; break;
-        case GGML_TYPE_Q8_0:   type_name_0 = "q8_0"; break;
-        case GGML_TYPE_Q4_K:   type_name_0 = "q4_K"; break;
-        case GGML_TYPE_Q3_K:   type_name_0 = "q3_K"; break;
-        case GGML_TYPE_Q5_K:   type_name_0 = "q5_K"; break;
-        case GGML_TYPE_Q6_K:   type_name_0 = "q6_K"; break;
-        default:               return {}; // unsupported — caller falls back to scalar
+    const struct mv_format_row * row0 = ggml_metal_mv_format(tsrc0);
+    if (row0 == nullptr || !row0->w64_fallback) {
+        return {}; // unsupported — caller falls back to scalar
     }
+    const char * type_name_0 = ggml_type_name(tsrc0);
 
     const char * type_name_1 = nullptr;
     switch (tsrc1) {

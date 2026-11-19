@@ -1,0 +1,39 @@
+# Which arithmetic lane is wired where. One row per (lane, family, route, operand types).
+# How the rows are used: lanes/gen-tables.cmake compiles them in when CMake configures (lanes-table.h, with capability.tsv).
+# The selector, ggml_metal_negotiate_lane_in (lanes/select.cpp), reads only these two tables. No file is read at run time.
+# It negotiates between the tensor type of the request (the model's requirement) and the card's capability rows: of the rows
+# of the family and route that are on, it takes the one that holds the activation natively, else exactly another way, else
+# wider. A row whose operand is narrower than the tensor is dropped. Equal steps go in file order, so the base row comes last.
+# No row left = a coverage gap: the selector returns none.
+# To add a lane: write its file, add its row with default off, run its test on the card, then turn it on.
+# Columns
+#   lane: the lane's name, the same as its file name without the extension.
+#   source: who compiles the lane: metal (the Metal shader compiler) | llvm-archive | llvm-native (LLVM, see llvm/toolchain.tsv). No llvm row exists yet.
+#   file: the file that holds the lane, relative to this backend's folder. The table check fails when it does not exist.
+#   family: the op family: matmul | flash-attn.
+#   route: the route of the family: mv-scalar | mv-grouped | mm-tiled | mm-matrix | fa-scalar | fa-vec | fa-matrix | fa-intel-tiled.
+#   weight: the weight type the row is for (a type name such as q4_K), or any = every type.
+#   activation: the activation type the row is for (f32 | f16 | bf16), or any = every type.
+#   operand: the format the lane holds an activation in while it forms products (f32 | f16 | bf16).
+#   holds: how the operand holds the row's activation type: native | exact-other | wider | narrower. For activation any the request's type decides. The generator refuses a cell that contradicts operand and activation.
+#   entry: the suffix of the lane's kernel entry point, or - = the route's own entry.
+#   capability: the capability the card must have, a lane name of capability.tsv, or - = none needed.
+#   class: what the lane does to the values: exact | product-rounded | narrows.
+#   origin: ours | upstream. upstream = a route that stages narrower types as shipped upstream. It is listed here and taken by its family's dispatch, not chosen by the selector, so it names no capability.
+#   default: on | off. on = measured and reviewed, may be picked. off = the lane exists and is never picked.
+#   seam_us: the cost in microseconds of handing the op to another submit route, 0 = none. A row with a cost is never picked.
+#   id: the value of the pipeline lane constant, also part of the pipeline name. 0 for the base lane.
+#   reason: why the row lands on its holds value. Free text, no tab.
+#   test: the command that proves the row on a card before default is set to on. Free text, no tab.
+lane	source	file	family	route	weight	activation	operand	holds	entry	capability	class	origin	default	seam_us	id	reason	test
+lane-fma-f32	metal	lanes/metal/lane-fma-f32.metal	matmul	mv-scalar	any	any	f32	wider	-	-	exact	ours	on	0	0	every card multiplies in fp32, which holds f32, f16 and bf16 exactly	test-backend-ops -o MUL_MAT
+lane-fma-f32	metal	lanes/metal/lane-fma-f32.metal	matmul	mv-grouped	any	any	f32	wider	-	-	exact	ours	on	0	0	every card multiplies in fp32, which holds f32, f16 and bf16 exactly	test-backend-ops -o MUL_MAT
+lane-fma-f32	metal	lanes/metal/lane-fma-f32.metal	matmul	mm-tiled	any	any	f32	wider	-	-	exact	ours	on	0	0	every card multiplies in fp32, which holds f32, f16 and bf16 exactly	test-backend-ops -o MUL_MAT
+lane-matrix8x8-bf16	metal	lanes/metal/lane-matrix8x8-bf16.metal	matmul	mm-matrix	bf16	any	bf16	narrower	-	-	narrows	upstream	on	0	0	upstream stages a bf16 weight and its activation as bfloat tiles for the matrix unit; kept as shipped	test-backend-ops -o MUL_MAT -p type_a=bf16 on Apple Silicon
+lane-matrix8x8-f16	metal	lanes/metal/lane-matrix8x8-f16.metal	matmul	mm-matrix	any	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages both operands as half tiles for the matrix unit; kept as shipped	test-backend-ops -o MUL_MAT on Apple Silicon
+lane-matrix8x8-bf16	metal	lanes/metal/lane-matrix8x8-bf16.metal	flash-attn	fa-matrix	bf16	any	bf16	narrower	-	-	narrows	upstream	on	0	0	upstream stages the query, bf16 keys and values as bfloat tiles; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT on Apple Silicon
+lane-matrix8x8-f32	metal	lanes/metal/lane-matrix8x8-f32.metal	flash-attn	fa-matrix	f32	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages the query as half tiles, f32 keys and values as float; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT on Apple Silicon
+lane-matrix8x8-f16	metal	lanes/metal/lane-matrix8x8-f16.metal	flash-attn	fa-matrix	any	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages the query as half tiles for the matrix unit; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT on Apple Silicon
+lane-fma-f32	metal	flash-attn/flash-attn-vec.metal	flash-attn	fa-vec	any	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages the query as half4 and forms products in fp32; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT
+lane-fma-f32	metal	flash-attn/flash-attn-intel.metal	flash-attn	fa-intel-tiled	any	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages K and V tiles as half; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT on an Intel GPU
+lane-fma-f32	metal	lanes/metal/lane-fma-f32.metal	flash-attn	fa-scalar	any	any	f32	wider	-	-	exact	ours	on	0	0	every card multiplies in fp32, which holds f32, f16 and bf16 exactly	test-backend-ops -o FLASH_ATTN_EXT

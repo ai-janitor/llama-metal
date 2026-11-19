@@ -1,6 +1,6 @@
 #include "ggml-metal-ops-internal.h"
-
-ggml_metal_op_t ggml_metal_op_init(
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(ops) ggml_metal_op_t ggml_metal_op_init(
         ggml_metal_device_t dev,
         ggml_metal_cmd_buf_t cmd_buf,
         ggml_cgraph * gf,
@@ -41,6 +41,10 @@ ggml_metal_op_t ggml_metal_op_init(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx) {
     delete ctx;
+}
+
+void ggml_metal_op_set_act_copy(ggml_metal_op_t ctx, struct ggml_metal_act_copy * act_copy) {
+    ctx->act_copy = act_copy;
 }
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
@@ -242,6 +246,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_rwkv(ctx, idx);
             } break;
+        case GGML_OP_GATED_LINEAR_ATTN:
+            {
+                n_fuse = ggml_metal_op_gated_linear_attn(ctx, idx);
+            } break;
         case GGML_OP_SOLVE_TRI:
             {
                 n_fuse = ggml_metal_op_solve_tri(ctx, idx);
@@ -283,6 +291,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                 }
             } break;
         case GGML_OP_ROPE:
+        case GGML_OP_ROPE_BACK:
             {
                 n_fuse = ggml_metal_op_rope(ctx, idx);
             } break;
@@ -329,6 +338,24 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_TIMESTEP_EMBEDDING:
             {
                 n_fuse = ggml_metal_op_timestep_embedding(ctx, idx);
+            } break;
+        case GGML_OP_TOP_K_MASK:
+            {
+                n_fuse = ggml_metal_op_top_k_mask(ctx, idx);
+            } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
+            } break;
+        case GGML_OP_OUT_PROD:
+            {
+                n_fuse = ggml_metal_op_out_prod(ctx, idx);
+            } break;
+        case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
+            {
+                n_fuse = ggml_metal_op_dsv4_hc(ctx, idx);
             } break;
         case GGML_OP_ARGSORT:
             {
@@ -396,6 +423,7 @@ update_ranges:
 
     // update the mem ranges in the encoding context
     for (int i = 0; i < n_fuse; ++i) {
+        ggml_metal_act_copy_note_write(ctx, ctx->node(idx + i));
         if (!ggml_metal_op_concurrency_add(ctx, ctx->node(idx + i), idx + i)) {
             ggml_metal_op_concurrency_reset(ctx, idx + i);
         }
@@ -404,7 +432,7 @@ update_ranges:
     return n_fuse;
 }
 
-int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN_OP(encode, ctx->node(idx)->op);
     // set op name on encoder for profiler labeling (no-op when profiling is off)
     ggml_metal_encoder_set_op_name(ctx->enc, ggml_op_name(ctx->node(idx)->op));
 

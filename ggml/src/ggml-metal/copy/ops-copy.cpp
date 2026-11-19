@@ -1,6 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
-
-int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(copy) int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -128,7 +128,7 @@ int ggml_metal_op_set(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -201,7 +201,7 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -246,7 +246,7 @@ int ggml_metal_op_get_rows(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -308,7 +308,7 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -350,7 +350,7 @@ int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_pool_1d(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_pool_1d(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -398,7 +398,7 @@ int ggml_metal_op_pool_1d(ggml_metal_op_t ctx, int idx) {
 }
 
 
-int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_pool_2d(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

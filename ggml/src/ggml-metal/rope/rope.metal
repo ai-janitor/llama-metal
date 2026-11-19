@@ -5,6 +5,9 @@
 // Reference: ggml-org/llama.cpp 4e5116f47, kernels/rope.metal (MIT).
 
 constant bool FC_rope_is_imrope [[function_constant(FC_ROPE + 0)]];
+// ROPE_BACK is the same rotation with the sine negated.
+constant bool FC_rope_is_back_v [[function_constant(FC_ROPE + 1)]];
+constant bool FC_rope_is_back = is_function_constant_defined(FC_rope_is_back_v) ? FC_rope_is_back_v : false;
 
 static float rope_yarn_ramp(const float low, const float high, const int i0) {
     const float y = (i0 / 2 - low) / max(0.001f, high - low);
@@ -28,6 +31,9 @@ static void rope_yarn(
     }
     *cos_theta = cos(theta) * mscale;
     *sin_theta = sin(theta) * mscale;
+    if (FC_rope_is_back) {
+        *sin_theta *= -1.0f;
+    }
 }
 
 // Apparently solving `n_rot = 2pi * x * base^((2 * max_pos_emb) / n_dims)` for x, we get
@@ -37,11 +43,17 @@ static float rope_yarn_corr_factor(int n_dims, int n_ctx_orig, float n_rot, floa
 }
 
 static void rope_yarn_corr_dims(
-    int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, float dims[2]
+    int n_dims, int n_ctx_orig, float freq_base, float beta_fast, float beta_slow, bool truncate, float dims[2]
 ) {
     // start and end correction dims
-    dims[0] = max(0.0f,         floor(rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_fast, freq_base)));
-    dims[1] = min(n_dims - 1.0f, ceil(rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base)));
+    float start = rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_fast, freq_base);
+    float end   = rope_yarn_corr_factor(n_dims, n_ctx_orig, beta_slow, freq_base);
+    if (truncate) {
+        start = floor(start);
+        end   = ceil(end);
+    }
+    dims[0] = max(0.0f,          start);
+    dims[1] = min(n_dims - 1.0f, end);
 }
 
 template<typename T>
@@ -61,7 +73,7 @@ kernel void kernel_rope_norm(
     // the correction dims are read only when ext_factor != 0
     float corr_dims[2] = { 0.0f, 0.0f };
     if (args.ext_factor != 0.0f) {
-        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, args.no_trunc == 0, corr_dims);
     }
 
     device const int32_t * pos = (device const int32_t *) src1;
@@ -118,7 +130,7 @@ kernel void kernel_rope_neox(
     // the correction dims are read only when ext_factor != 0
     float corr_dims[2] = { 0.0f, 0.0f };
     if (args.ext_factor != 0.0f) {
-        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, args.no_trunc == 0, corr_dims);
     }
 
     device const int32_t * pos = (device const int32_t *) src1;
@@ -175,7 +187,7 @@ kernel void kernel_rope_multi(
     // the correction dims are read only when ext_factor != 0
     float corr_dims[2] = { 0.0f, 0.0f };
     if (args.ext_factor != 0.0f) {
-        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, args.no_trunc == 0, corr_dims);
     }
 
     device const int32_t * pos = (device const int32_t *) src1;
@@ -262,7 +274,7 @@ kernel void kernel_rope_vision(
     // the correction dims are read only when ext_factor != 0
     float corr_dims[2] = { 0.0f, 0.0f };
     if (args.ext_factor != 0.0f) {
-        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, corr_dims);
+        rope_yarn_corr_dims(args.n_dims, args.n_ctx_orig, args.freq_base, args.beta_fast, args.beta_slow, args.no_trunc == 0, corr_dims);
     }
 
     device const int32_t * pos = (device const int32_t *) src1;

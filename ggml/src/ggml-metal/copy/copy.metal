@@ -43,14 +43,14 @@ template [[host_name("kernel_cpy_f32_f16")]]   kernel kernel_cpy_t kernel_cpy_t_
 template [[host_name("kernel_cpy_f32_i32")]]   kernel kernel_cpy_t kernel_cpy_t_t<float,   int32_t>;
 template [[host_name("kernel_cpy_i32_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<int32_t, float>;
 template [[host_name("kernel_cpy_i32_i32")]]   kernel kernel_cpy_t kernel_cpy_t_t<int32_t, int32_t>;
-#if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_cpy_f32_bf16")]]  kernel kernel_cpy_t kernel_cpy_t_t<float,   bfloat>;
+#if defined(GGML_METAL_BF16_ANY)
+template [[host_name("kernel_cpy_f32_bf16")]]  kernel kernel_cpy_t kernel_cpy_t_t<float,   GGML_BF16_T>;
 #endif
 template [[host_name("kernel_cpy_f16_f32")]]   kernel kernel_cpy_t kernel_cpy_t_t<half,    float>;
 template [[host_name("kernel_cpy_f16_f16")]]   kernel kernel_cpy_t kernel_cpy_t_t<half,    half>;
-#if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  float>;
-template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<bfloat,  bfloat>;
+#if defined(GGML_METAL_BF16_ANY)
+template [[host_name("kernel_cpy_bf16_f32")]]  kernel kernel_cpy_t kernel_cpy_t_t<GGML_BF16_T, float>;
+template [[host_name("kernel_cpy_bf16_bf16")]] kernel kernel_cpy_t kernel_cpy_t_t<GGML_BF16_T, GGML_BF16_T>;
 #endif
 
 template<short QK,
@@ -94,6 +94,11 @@ template [[host_name("kernel_cpy_f32_q4_1")]]   kernel cpy_f_q_t kernel_cpy_f32_
 template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_0,  block_q5_0,   quantize_q5_0>;
 template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_1,  block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_cpy_f32_q1_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK1_0, block_q1_0, quantize_q1_0>;
+template [[host_name("kernel_cpy_f32_q2_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK2_0, block_q2_0, quantize_q2_0>;
+template [[host_name("kernel_cpy_f32_tq1_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_K, block_tq1_0, quantize_tq1_0>;
+template [[host_name("kernel_cpy_f32_tq2_0")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_K, block_tq2_0, quantize_tq2_0>;
+template [[host_name("kernel_cpy_f32_nvfp4")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK_NVFP4, block_nvfp4, quantize_nvfp4>;
 
 template<typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
 kernel void kernel_cpy_q_f32(
@@ -141,6 +146,19 @@ template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
 
+template [[host_name("kernel_cpy_q1_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q1_0, 8, dequantize_q1_0>;
+template [[host_name("kernel_cpy_q2_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_q2_0, 4, dequantize_q2_0>;
+template [[host_name("kernel_cpy_tq1_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tq1_0, 16, dequantize_tq1_0>;
+template [[host_name("kernel_cpy_tq2_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tq2_0, 16, dequantize_tq2_0>;
+template [[host_name("kernel_cpy_nvfp4_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_nvfp4, 4, dequantize_nvfp4>;
+template [[host_name("kernel_cpy_q1_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q1_0, 8, dequantize_q1_0>;
+template [[host_name("kernel_cpy_q2_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q2_0, 4, dequantize_q2_0>;
+template [[host_name("kernel_cpy_tq1_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_tq1_0, 16, dequantize_tq1_0>;
+template [[host_name("kernel_cpy_tq2_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_tq2_0, 16, dequantize_tq2_0>;
+template [[host_name("kernel_cpy_nvfp4_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_nvfp4, 4, dequantize_nvfp4>;
+
+// For quantized types the row sizes in args are in blocks (nb0 is the block size).
+template<typename T>
 kernel void kernel_concat(
     constant ggml_metal_kargs_concat & args,
     device  const char * src0,
@@ -164,19 +182,42 @@ kernel void kernel_concat(
     int o[4] = {0, 0, 0, 0};
     o[args.dim] = args.dim == 0 ? args.ne00 : (args.dim == 1 ? args.ne01 : (args.dim == 2 ? args.ne02 : args.ne03));
 
-    device const float * x;
+    device const T * x;
 
     const int first_column = pack_rows ? int(tpitg.x)%args.ne0 : int(tpitg.x);
     for (int i0 = first_column; i0 < args.ne0; i0 += ntg.x) {
         if (i0 < args.ne00 && i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
-            x = (device const float *)(src0 + (i3       )*args.nb03 + (i2       )*args.nb02 + (i1       )*args.nb01 + (i0       )*args.nb00);
+            x = (device const T *)(src0 + (i3       )*args.nb03 + (i2       )*args.nb02 + (i1       )*args.nb01 + (i0       )*args.nb00);
         } else {
-            x = (device const float *)(src1 + (i3 - o[3])*args.nb13 + (i2 - o[2])*args.nb12 + (i1 - o[1])*args.nb11 + (i0 - o[0])*args.nb10);
+            x = (device const T *)(src1 + (i3 - o[3])*args.nb13 + (i2 - o[2])*args.nb12 + (i1 - o[1])*args.nb11 + (i0 - o[0])*args.nb10);
         }
 
-        device float * y = (device float *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
+        device T * y = (device T *)(dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1 + i0*args.nb0);
 
-        *y = *x;
+        // blocks whose size is not a multiple of 4 bytes are copied as 16-bit words
+        if (sizeof(T) > 8 && sizeof(T) % 4 != 0) {
+            for (uint k = 0; k < sizeof(T)/2; ++k) {
+                ((device ushort *) y)[k] = ((device const ushort *) x)[k];
+            }
+        } else {
+            *y = *x;
+        }
     }
 }
+
+typedef decltype(kernel_concat<float>) kernel_concat_t;
+
+// BF16 is copied as its 16-bit storage.
+template [[host_name("kernel_concat_f32")]]  kernel kernel_concat_t kernel_concat<float>;
+template [[host_name("kernel_concat_f16")]]  kernel kernel_concat_t kernel_concat<half>;
+template [[host_name("kernel_concat_bf16")]] kernel kernel_concat_t kernel_concat<ushort>;
+template [[host_name("kernel_concat_i8")]]   kernel kernel_concat_t kernel_concat<char>;
+template [[host_name("kernel_concat_i16")]]  kernel kernel_concat_t kernel_concat<short>;
+template [[host_name("kernel_concat_i32")]]  kernel kernel_concat_t kernel_concat<int>;
+template [[host_name("kernel_concat_i64")]]  kernel kernel_concat_t kernel_concat<long>;
+template [[host_name("kernel_concat_q4_0")]] kernel kernel_concat_t kernel_concat<block_q4_0>;
+template [[host_name("kernel_concat_q4_1")]] kernel kernel_concat_t kernel_concat<block_q4_1>;
+template [[host_name("kernel_concat_q5_0")]] kernel kernel_concat_t kernel_concat<block_q5_0>;
+template [[host_name("kernel_concat_q5_1")]] kernel kernel_concat_t kernel_concat<block_q5_1>;
+template [[host_name("kernel_concat_q8_0")]] kernel kernel_concat_t kernel_concat<block_q8_0>;
 

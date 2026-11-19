@@ -203,6 +203,8 @@ struct tiled_loader_q5_K {
 // q6_K loader
 // ============================================================================
 
+// Follows dequantize_q6_K (matmul/dequant.metal): weight j of the 16 weights of il is one nibble of byte j of
+// its ql region joined with one bit pair of byte j of its qh region, a value 0..63, minus 32, times d and the scale.
 inline void load_a_q6_K_to_shmem(
     device const char * src0_row,
     threadgroup float2 * buf_a,
@@ -216,71 +218,26 @@ inline void load_a_q6_K_to_shmem(
     if (idx_m < ne01 && block_idx < num_blocks) {
         device const block_q6_K * block_ptr = (device const block_q6_K *)(src0_row + loadc * nb01) + block_idx;
 
-        // q6_K: 6 bits per element = 4 bits (ql) + 2 bits (qh)
-        // Complex interleaved packing: use element-by-element dequant
-        // Map sub_block (0..7) to il parameter (0..15, each il produces 16 elements)
-        // sub_block 0 = il 0,1; sub_block 1 = il 2,3; etc.
+        // A K-tile of 32 weights is il = 2 * sub_block (loadr 0..7) and il + 1 (loadr 8..15); loadr holds weights 2j, 2j + 1.
+        const uint il = sub_block * 2 + (loadr >= 8 ? 1 : 0);
+        const uint j  = 2 * (loadr & 7);
 
-        const float d = (float)block_ptr->d;
-        device const int8_t * scales = (device const int8_t *)block_ptr->scales;
+        const float d  = (float) block_ptr->d;
+        const float sc = (float) block_ptr->scales[(il % 2) + 2 * (il / 2)];
 
-        // Determine which pair of il values this sub_block corresponds to
-        const uint il_base = sub_block * 2;
-        const bool second_half = (loadr >= 8);
-        const uint il = il_base + (second_half ? 1 : 0);
+        // The byte regions of this il: the offsets dequantize_q6_K adds in 16-bit words, here in bytes.
+        device const uint8_t * ql = block_ptr->ql + 64 * (il / 8) + 32 * ((il / 2) & 1) + 16 * (il & 1);
+        device const uint8_t * qh = block_ptr->qh + 32 * (il / 8) + 16 * (il & 1);
 
-        // Scale index: sc = scales[(il%2) + 2 * (il/2)]
-        const float sc = scales[(il % 2) + 2 * (il / 2)];
+        // The group of 32 within the half picks the nibble (low for 0 and 1, high for 2 and 3) and the bit pair.
+        const uint group      = (il / 2) & 3;
+        const uint nib_shift  = group > 1 ? 4 : 0;
+        const uint pair_shift = 2 * group;
 
-        // Element indices within this il's 16 elements
-        const uint local_idx0 = second_half ? (2 * (loadr - 8)) : (2 * loadr);
-        const uint local_idx1 = local_idx0 + 1;
+        const int q0 = int(((uint) ql[j]     >> nib_shift) & 0xF) | int((((uint) qh[j]     >> pair_shift) & 3) << 4);
+        const int q1 = int(((uint) ql[j + 1] >> nib_shift) & 0xF) | int((((uint) qh[j + 1] >> pair_shift) & 3) << 4);
 
-        // Compute element indices within the QK_K=256 block
-        // Each il produces 16 elements at different positions
-        // From dequant_q6_K: complex bit extraction based on il
-        // il/8 selects 32-element group, (il/2)&1 and il&1 select sub-positions
-
-        // Simplified approach: compute byte offsets directly
-        // ql: uint16_t access, base = 32*(il/8) + 16*((il/2)&1) + 8*(il&1)
-        // qh: uint16_t access, base = 16*(il/8) + 8*(il&1)
-
-        device const uint16_t * ql = (device const uint16_t *)block_ptr->ql;
-        device const uint16_t * qh = (device const uint16_t *)block_ptr->qh;
-
-        ql = ql + 32 * (il / 8) + 16 * ((il / 2) & 1) + 8 * (il & 1);
-        qh = qh + 16 * (il / 8) + 8 * (il & 1);
-
-        const uint il_mod = (il / 2) & 3;
-
-        // Extract 6-bit values for elements 0 and 1
-        // From dequant_q6_K logic:
-        const uint16_t ql0 = ql[local_idx0 / 2];
-        const uint16_t ql1 = ql[local_idx1 / 2];
-        const uint16_t qh0 = qh[local_idx0 / 2];
-        const uint16_t qh1 = qh[local_idx1 / 2];
-
-        // Bit extraction depends on il_mod and element position
-        uint q_val0, q_val1;
-
-        if (il_mod == 0) {
-            q_val0 = ((ql0 & 0xF) | ((qh0 & 0x03) << 4)) - 32;
-            q_val1 = ((ql1 & 0xF) | ((qh1 & 0x03) << 4)) - 32;
-        } else if (il_mod == 1) {
-            q_val0 = ((ql0 >> 4) | ((qh0 & 0x0c) << 2)) - 32;
-            q_val1 = ((ql1 >> 4) | ((qh1 & 0x0c) << 2)) - 32;
-        } else if (il_mod == 2) {
-            q_val0 = ((ql0 >> 8) | ((qh0 & 0x30) << 0)) - 32;
-            q_val1 = ((ql1 >> 8) | ((qh1 & 0x30) << 0)) - 32;
-        } else {  // il_mod == 3
-            q_val0 = ((ql0 >> 12) | ((qh0 & 0xc0) >> 2)) - 32;
-            q_val1 = ((ql1 >> 12) | ((qh1 & 0xc0) >> 2)) - 32;
-        }
-
-        const float val0 = d * sc * float(q_val0);
-        const float val1 = d * sc * float(q_val1);
-
-        buf_a[buf_idx] = float2(val0, val1);
+        buf_a[buf_idx] = float2(d * sc * float(q0 - 32), d * sc * float(q1 - 32));
     } else {
         buf_a[buf_idx] = float2(0.0f);
     }

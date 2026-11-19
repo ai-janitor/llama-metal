@@ -10,8 +10,9 @@
 // Each strategy is in its own file (dispatch-*.cpp) with a single entry point.
 // Strategy functions return 0 if not applicable, or N >= 1 (ops consumed) if dispatched.
 #include "dispatch.h"
-
-int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+#include "tuning.h"
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(matmul) int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     int n;
 
     // 1. Grouped: fuse consecutive q4_K/q6_K matvecs
@@ -43,7 +44,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
 // =========================================================================
 // Separate entry point — not part of the MUL_MAT priority chain.
 
-size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
+size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(encode);
     assert(op->op == GGML_OP_MUL_MAT_ID);
 
     const int64_t ne02 = op->src[0]->ne[2]; // n_expert
@@ -51,7 +52,7 @@ size_t ggml_metal_op_mul_mat_id_extra_tpe(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*ne02;
 }
 
-size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
+size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(encode);
     assert(op->op == GGML_OP_MUL_MAT_ID);
 
     const int64_t ne02 = op->src[0]->ne[2]; // n_expert
@@ -60,7 +61,7 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*ne02*ne21;
 }
 
-int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -99,9 +100,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
     // to the matrix-vector kernel
     // ne20 = n_used_experts
     // ne21 = n_rows (batch size)
-    const int ne21_mm_id_min = 32;
-
-    if (profile->has_matrix_hw && ne00 >= 64 && (ne21 >= ne21_mm_id_min)) {
+    if (ggml_metal_mm_route_takes(profile->has_matrix_hw, op)) {
         // some Metal matrix data types require aligned pointers
         // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
         //switch (op->src[0]->type) {
@@ -238,10 +237,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-        if (op->src[0]->type == GGML_TYPE_F32 ||
-            op->src[0]->type == GGML_TYPE_F16 ||
-            op->src[0]->type == GGML_TYPE_BF16 ||
-            op->src[0]->type == GGML_TYPE_Q8_0) {
+        if (ggml_metal_mv_rows_per_threadgroup(op->src[0]->type)) {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0 - 1)/(nr0), (_ne1 + nr1 - 1)/nr1, ne123, id_simd_w, nsg, 1);
         } else {
             ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nr0*nsg - 1)/(nr0*nsg), (_ne1 + nr1 - 1)/nr1, ne123, id_simd_w, nsg, 1);

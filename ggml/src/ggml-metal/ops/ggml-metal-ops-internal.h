@@ -18,6 +18,8 @@
 #include <vector>
 #include <string>
 
+#include "act-copy/act-copy.h"
+
 // struct ggml_metal_op — encoding context shared by all op dispatch functions
 struct ggml_metal_op {
     ggml_metal_op(
@@ -171,6 +173,10 @@ struct ggml_metal_op {
     int debug_graph;
     int debug_fusion;
 
+    // convert-once: the context's state and the source whose copy this encoding last wrote
+    struct ggml_metal_act_copy * act_copy = nullptr;
+    struct ggml_metal_act_slot   act_slot = {};
+
 #ifdef GGML_METAL_TEST_OBSERVER
     // Keep requested policy separate from the dispatch mode of the created encoder.
     bool encoder_concurrent;
@@ -209,6 +215,7 @@ static inline ggml_metal_buffer_id ggml_metal_get_kq_prep_id(const ggml_tensor *
 
 // Concurrency helpers used by multiple op files
 static inline bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx, int idx) {
+    GGML_UNUSED(idx); // read only by the test observer
     if (!ctx->mem_ranges) {
 #ifdef GGML_METAL_TEST_OBSERVER
         ctx->observe(idx, GGML_BACKEND_METAL_TEST_OBSERVER_RESET, true, false);
@@ -228,6 +235,7 @@ static inline bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx, int idx)
 }
 
 static inline bool ggml_metal_op_concurrency_check(ggml_metal_op_t ctx, const ggml_tensor * node, int idx) {
+    GGML_UNUSED(idx); // read only by the test observer
     if (!ctx->mem_ranges) {
 #ifdef GGML_METAL_TEST_OBSERVER
         ctx->observe(idx, GGML_BACKEND_METAL_TEST_OBSERVER_CHECK, false, false);
@@ -242,6 +250,7 @@ static inline bool ggml_metal_op_concurrency_check(ggml_metal_op_t ctx, const gg
 }
 
 static inline bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor * node, int idx) {
+    GGML_UNUSED(idx); // read only by the test observer
     if (!ctx->mem_ranges) {
 #ifdef GGML_METAL_TEST_OBSERVER
         ctx->observe(idx, GGML_BACKEND_METAL_TEST_OBSERVER_ADD, true, false);

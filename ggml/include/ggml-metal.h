@@ -71,6 +71,11 @@ GGML_BACKEND_API void ggml_backend_metal_set_model_profile(ggml_backend_t backen
         uint32_t n_embd, uint32_t n_ff, uint32_t n_layer,
         uint32_t n_head, uint32_t n_head_kv);
 
+// The model's activation precision (GGML_TYPE_BF16, GGML_TYPE_F16; GGML_TYPE_COUNT = not known, the default).
+// Tensors between ops stay f32. Ops that read their activations more than once may read a copy at this precision,
+// on the cards whose rows say so (ggml-metal/act-copy).
+GGML_BACKEND_API void ggml_backend_metal_set_act_precision(ggml_backend_t backend, enum ggml_type type);
+
 // helper to check if the device supports a specific family
 // ideally, the user code should be doing these checks
 // ref: https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf

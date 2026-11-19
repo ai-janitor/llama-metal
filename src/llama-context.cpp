@@ -1,5 +1,5 @@
 #include "llama-context.h"
-
+#include "../ggml/src/ggml-metal/ggml-metal-probe.h"
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -13,7 +13,7 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
-
+GGML_METAL_FAMILY(llama)
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
 #endif
@@ -482,6 +482,8 @@ llama_context::llama_context(
                     hparams.n_layer(),
                     hparams.n_head(0), // layer 0 Q heads (representative)
                     hparams.n_head_kv(0));
+                // the model's activation precision, for ops that read a copy of their activations
+                ggml_backend_metal_set_act_precision(backend, hparams.act_dtype);
             }
 #endif
         }
@@ -1935,7 +1937,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        GGML_METAL_ZONE_BEGIN(graph_build); gf = model.build_graph(gparams); GGML_METAL_ZONE_END(graph_build);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1945,7 +1947,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        GGML_METAL_ZONE_BEGIN(graph_alloc); if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1961,7 +1963,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
-        res->set_inputs(&ubatch);
+        GGML_METAL_ZONE_BEGIN(inputs); res->set_inputs(&ubatch); GGML_METAL_ZONE_END(inputs);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -2026,7 +2028,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const double l0_compute_start = l0_trace ? ggml_l0_now() : 0;
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    GGML_METAL_ZONE_BEGIN(submit); const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1); GGML_METAL_ZONE_END(submit);
     if (l0_trace) {
         const double l0_compute_end = ggml_l0_now();
         ggml_l0_event("graph_compute", l0_compute_start, l0_compute_end, static_cast<uint64_t>(gtype));
@@ -2398,7 +2400,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch_ext & batch_inp) {
+int llama_context::decode(const llama_batch_ext & batch_inp) { GGML_METAL_ZONE_BEGIN(decode);
     struct l0_decode_guard {
         bool enabled;
         double start;

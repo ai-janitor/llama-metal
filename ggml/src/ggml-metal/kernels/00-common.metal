@@ -57,6 +57,35 @@ typedef matrix<bfloat, 4, 4> bfloat4x4;
 typedef matrix<bfloat, 2, 4> bfloat2x4;
 #endif
 
+// BF16 element types for the templates: the native bfloat, or 16-bit storage widened by a shift (exact)
+// where the bfloat type is not available. Conversions to BF16 round as ggml_compute_fp32_to_bf16.
+#if defined(GGML_METAL_HAS_BF16)
+#define GGML_METAL_BF16_ANY 1
+#define GGML_BF16_T  bfloat
+#define GGML_BF16_T4 bfloat4
+#elif defined(GGML_METAL_BF16_U16)
+#define GGML_METAL_BF16_ANY 1
+struct ggml_bf16_u {
+    ushort v;
+    ggml_bf16_u() = default;
+    ggml_bf16_u(float f) {
+        const uint u = as_type<uint>(f);
+        v = (u & 0x7fffffffu) > 0x7f800000u ? ushort((u >> 16) | 64u) : ushort((u + (0x7fffu + ((u >> 16) & 1u))) >> 16);
+    }
+    operator float() const        { return as_type<float>(uint(v) << 16); }
+    operator float() const device { return as_type<float>(uint(v) << 16); }
+};
+struct ggml_bf16_u4 {
+    ushort4 v;
+    ggml_bf16_u4() = default;
+    ggml_bf16_u4(ggml_bf16_u a, ggml_bf16_u b, ggml_bf16_u c, ggml_bf16_u d) : v(a.v, b.v, c.v, d.v) {}
+    explicit operator float4() const        { return as_type<float4>(uint4(v) << 16); }
+    explicit operator float4() const device { return as_type<float4>(uint4(v) << 16); }
+};
+#define GGML_BF16_T  ggml_bf16_u
+#define GGML_BF16_T4 ggml_bf16_u4
+#endif
+
 constexpr constant static float kvalues_iq4nl_f[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f, 1.f, 13.f, 25.f, 38.f, 53.f, 69.f, 89.f, 113.f
 };

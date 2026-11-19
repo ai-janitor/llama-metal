@@ -1,12 +1,12 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <pthread.h>
-
+#include "ggml-metal-probe.h"
 #import "ggml-metal.h"
 #import "ggml-metal-command-buffer-error.h"
 #import "ggml-impl.h"
 
-static pthread_mutex_t g_gpu_error_mutex = PTHREAD_MUTEX_INITIALIZER;
+GGML_METAL_PROBE_ONLY(void ggml_metal_probe_transfer(id<MTLCommandBuffer> cb, const char * kind);) static pthread_mutex_t g_gpu_error_mutex = PTHREAD_MUTEX_INITIALIZER;
 static ggml_backend_metal_gpu_error_callback g_gpu_error_callback;
 static void * g_gpu_error_user_data;
 
@@ -45,7 +45,7 @@ void ggml_metal_upload_flush(id<MTLCommandQueue> queue) {
         struct ggml_metal_up * up = &g_up[i];
         if (up->queue == queue && up->cmd) {
             [up->enc endEncoding];
-            [up->cmd commit];
+            GGML_METAL_PROBE_ONLY(ggml_metal_probe_transfer(up->cmd, "upload");) [up->cmd commit];
             [up->enc release];
             [up->cmd release];
             [up->stage release];

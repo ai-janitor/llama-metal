@@ -163,6 +163,29 @@ kernel void kernel_unary_impl(
             // TODO: precise implementation
             dst_elem[0] = (T) (exp(x) - 1);
         }
+
+        if (FC_OP == OP_UNARY_NUM_FLOOR) {
+            dst_elem[0] = (T) floor(x);
+        }
+
+        if (FC_OP == OP_UNARY_NUM_CEIL) {
+            dst_elem[0] = (T) ceil(x);
+        }
+
+        if (FC_OP == OP_UNARY_NUM_ROUND) {
+            dst_elem[0] = (T) round(x);
+        }
+
+        if (FC_OP == OP_UNARY_NUM_TRUNC) {
+            dst_elem[0] = (T) trunc(x);
+        }
+
+        if (FC_OP == OP_UNARY_NUM_XIELU) {
+            // slope = alpha_n, scale = alpha_p, bias = beta, val = eps
+            const TC y_pos = TC(args.scale) * x * x + TC(args.bias) * x;
+            const TC y_neg = (exp(fmin(x, TC(args.val))) - TC(1.0f) - x) * TC(args.slope) + TC(args.bias) * x;
+            dst_elem[0] = (T) select(y_neg, y_pos, x > TC(0.0f));
+        }
     }
 
 #undef FC_OP
@@ -383,6 +406,14 @@ kernel void kernel_add_id(
 
     device       float * dst_row  = (device       float *)((device char *)dst  +  i1*nb1       + i2*nb2);
     device const float * src0_row = (device const float *)((device char *)src0 +  i1*args.nb01 + i2*args.nb02);
+    // id -1 means no row is added
+    if (i11 < 0) {
+        for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
+            dst_row[i0] = src0_row[i0];
+        }
+        return;
+    }
+
     device const float * src1_row = (device const float *)((device char *)src1 + i11*args.nb11);
 
     for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
@@ -421,3 +452,5 @@ template [[host_name("kernel_repeat_f32")]] kernel kernel_repeat_t kernel_repeat
 template [[host_name("kernel_repeat_f16")]] kernel kernel_repeat_t kernel_repeat<half>;
 template [[host_name("kernel_repeat_i32")]] kernel kernel_repeat_t kernel_repeat<int>;
 template [[host_name("kernel_repeat_i16")]] kernel kernel_repeat_t kernel_repeat<short>;
+// BF16 is copied as its 16-bit storage.
+template [[host_name("kernel_repeat_bf16")]] kernel kernel_repeat_t kernel_repeat<ushort>;

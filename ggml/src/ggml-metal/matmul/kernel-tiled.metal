@@ -136,10 +136,11 @@ inline void load_a_mxfp4_to_shmem(
 }
 
 // Cooperative load: B tile (BN rows × BK cols) into shared memory
-// B is f32 (src1 type). idx_n checked against ne11 (N dimension)
+// B is src1: f32, or the copy at the model's precision (ActT). idx_n checked against ne11 (N dimension)
 // Contiguous path: K elements are adjacent (stride_b is row stride only).
+template <typename ActT>
 inline void load_b_to_shmem(
-    device const float * data_b,
+    device const ActT * data_b,
     threadgroup float2 * buf_b,
     uint pos_b,
     uint loadr,
@@ -154,9 +155,9 @@ inline void load_b_to_shmem(
     const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
 
     if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B + 1 < end_k) {
-        buf_b[buf_idx] = float2(data_b[idx], data_b[idx + 1]);
+        buf_b[buf_idx] = float2(float(data_b[idx]), float(data_b[idx + 1]));
     } else if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B < end_k) {
-        buf_b[buf_idx] = float2(data_b[idx], 0.0f);
+        buf_b[buf_idx] = float2(float(data_b[idx]), 0.0f);
     } else {
         buf_b[buf_idx] = float2(0.0f);
     }
@@ -165,8 +166,9 @@ inline void load_b_to_shmem(
 // Strided B-loading for transposed src1: K elements are ks1 apart in device memory.
 // Separate function to avoid any overhead on the contiguous path — only called when
 // src1 is transposed (delta-net SSM), eliminating ggml_cont(ggml_transpose(...)) dispatches.
+template <typename ActT>
 inline void load_b_to_shmem_strided(
-    device const float * data_b,
+    device const ActT * data_b,
     threadgroup float2 * buf_b,
     uint pos_b,
     uint loadr,
@@ -183,9 +185,9 @@ inline void load_b_to_shmem_strided(
     const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
 
     if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B + 1 < end_k) {
-        buf_b[buf_idx] = float2(data_b[idx_base], data_b[idx_base + ks1]);
+        buf_b[buf_idx] = float2(float(data_b[idx_base]), float(data_b[idx_base + ks1]));
     } else if (idx_n < ne_b_rows && block + loadr * LOAD_VEC_B < end_k) {
-        buf_b[buf_idx] = float2(data_b[idx_base], 0.0f);
+        buf_b[buf_idx] = float2(float(data_b[idx_base]), 0.0f);
     } else {
         buf_b[buf_idx] = float2(0.0f);
     }
@@ -247,15 +249,8 @@ struct tiled_loader_mxfp4 {
 // Adding a new quant type = add one loader struct + one instantiation line.
 // ---------------------------------------------------------------------------
 
-// PackedMul (P17.12): compile-time packed-fp16 multiply stage. false (default) = the exact
-// float FMA body below, unchanged for every existing instance. true = operands narrowed to
-// half4, multiplied as packed half4, products widened to float4 BEFORE any add, then added
-// into the float sums in the original w,z,y,x order (fp32 accumulation). Loader geometry,
-// shared-memory float2 layout, barriers and stores are identical in both modes. Narrowing
-// operands to half is lossy and a half product can overflow (|a*b| > 65504 -> inf): numerical
-// behaviour is unproven until the parent's runtime sweep. To undo: delete the PackedMul param,
-// the `if (PackedMul)` arm and the *_v3 instantiation.
-template <typename LoadA, bool PackedMul = false>
+// ActT: element type the activations are read in (float, or the copy's type).
+template <typename LoadA, typename ActT = float>
 kernel void kernel_mul_mat_tiled_impl(
     constant ggml_metal_kargs_mul_mm & args [[buffer(0)]],
     device const char * src0 [[buffer(1)]],
@@ -301,11 +296,11 @@ kernel void kernel_mul_mat_tiled_impl(
     LoadA loader;
     loader.init(src0, offset0, ir, args);
 
-    // B matrix setup (shared across all types — B is always f32)
-    device const float * data_b = (device const float *)(src1 + args.nb13*i13 + args.nb12*i12 + args.nb11*(ic*BN));
-    const uint stride_b = args.nb11 / sizeof(float);  // B row stride in elements
+    // B matrix setup (shared across all weight types)
+    device const ActT * data_b = (device const ActT *)(src1 + args.nb13*i13 + args.nb12*i12 + args.nb11*(ic*BN));
+    const uint stride_b = args.nb11 / sizeof(ActT);  // B row stride in elements
     // ks1: K-element stride (1=contiguous, >1=transposed src1)
-    const uint ks1 = args.nb10 / sizeof(float);
+    const uint ks1 = args.nb10 / sizeof(ActT);
 
     const uint end_k = args.ne00;  // K dimension
 
@@ -365,37 +360,20 @@ kernel void kernel_mul_mat_tiled_impl(
                     cache_b.xy = buf_b[col * SHMEM_STRIDE + 2*i    ];
                     cache_b.zw = buf_b[col * SHMEM_STRIDE + 2*i + 1];
 
-                    if (PackedMul) {
-                        // Packed multiply stage: half4 * half4, widen each product to float4,
-                        // then accumulate in fp32 in the original w,z,y,x order.
-                        const half4 hb = half4(cache_b);
-                        for (uint wsir = 0; wsir < WMITER; wsir++) {
-                            for (uint cr = 0; cr < TM / 2; cr++) {
-                                const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
+                    // FMA accumulation (from Vulkan lines 326-334)
+                    for (uint wsir = 0; wsir < WMITER; wsir++) {
+                        for (uint cr = 0; cr < TM / 2; cr++) {
+                            const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
 
-                                const float4 p0 = float4(half4(cache_a[wsir * TM + 2*cr    ]) * hb);
-                                const float4 p1 = float4(half4(cache_a[wsir * TM + 2*cr + 1]) * hb);
+                            sums[sums_idx].x = fma(cache_a[wsir * TM + 2*cr    ].x, cache_b.x,
+                                               fma(cache_a[wsir * TM + 2*cr    ].y, cache_b.y,
+                                               fma(cache_a[wsir * TM + 2*cr    ].z, cache_b.z,
+                                               fma(cache_a[wsir * TM + 2*cr    ].w, cache_b.w, sums[sums_idx].x))));
 
-                                sums[sums_idx].x = (((sums[sums_idx].x + p0.w) + p0.z) + p0.y) + p0.x;
-                                sums[sums_idx].y = (((sums[sums_idx].y + p1.w) + p1.z) + p1.y) + p1.x;
-                            }
-                        }
-                    } else {
-                        // FMA accumulation (from Vulkan lines 326-334)
-                        for (uint wsir = 0; wsir < WMITER; wsir++) {
-                            for (uint cr = 0; cr < TM / 2; cr++) {
-                                const uint sums_idx = (wsic * TN + cc) * WMITER * (TM / 2) + wsir * (TM / 2) + cr;
-
-                                sums[sums_idx].x = fma(cache_a[wsir * TM + 2*cr    ].x, cache_b.x,
-                                                   fma(cache_a[wsir * TM + 2*cr    ].y, cache_b.y,
-                                                   fma(cache_a[wsir * TM + 2*cr    ].z, cache_b.z,
-                                                   fma(cache_a[wsir * TM + 2*cr    ].w, cache_b.w, sums[sums_idx].x))));
-
-                                sums[sums_idx].y = fma(cache_a[wsir * TM + 2*cr + 1].x, cache_b.x,
-                                                   fma(cache_a[wsir * TM + 2*cr + 1].y, cache_b.y,
-                                                   fma(cache_a[wsir * TM + 2*cr + 1].z, cache_b.z,
-                                                   fma(cache_a[wsir * TM + 2*cr + 1].w, cache_b.w, sums[sums_idx].y))));
-                            }
+                            sums[sums_idx].y = fma(cache_a[wsir * TM + 2*cr + 1].x, cache_b.x,
+                                               fma(cache_a[wsir * TM + 2*cr + 1].y, cache_b.y,
+                                               fma(cache_a[wsir * TM + 2*cr + 1].z, cache_b.z,
+                                               fma(cache_a[wsir * TM + 2*cr + 1].w, cache_b.w, sums[sums_idx].y))));
                         }
                     }
                 }
@@ -451,7 +429,7 @@ kernel void kernel_mul_mat_tiled_impl<tiled_loader_f32>(
     constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort);
 
-#if defined(GGML_METAL_HAS_BF16)
+#if defined(GGML_METAL_BF16_ANY)
 template [[host_name("kernel_mul_mat_tiled_bf16")]]
 kernel void kernel_mul_mat_tiled_impl<tiled_loader_bf16>(
     constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
@@ -492,14 +470,6 @@ kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq4_nl>(
 
 template [[host_name("kernel_mul_mat_tiled_q4_K")]]
 kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_K>(
-    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
-    device char *, threadgroup char *, uint3, ushort);
-
-// P17.12: Q4_K with the packed-fp16 multiply stage (fp32 accumulation). Opt-in only via
-// GGML_METAL_TILED_FP16_MUL=1 in dispatch-matmul.cpp; the plain q4_K entry above is untouched.
-// Other formats have no _v3 tiled entry (explicitly unimplemented, not claimed).
-template [[host_name("kernel_mul_mat_tiled_q4_K_v3")]]
-kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_K, true>(
     constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort);
 
@@ -564,3 +534,26 @@ template [[host_name("kernel_mul_mat_tiled_iq1_m")]]
 kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq1_m>(
     constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort);
+
+// Activations read from the copy at the model's precision (act-copy/): one entry per weight type that has a row.
+#if defined(GGML_METAL_BF16_ANY)
+template [[host_name("kernel_mul_mat_tiled_q8_0_abf16")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q8_0, GGML_BF16_T>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q4_K_abf16")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_K, GGML_BF16_T>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q5_K_abf16")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q5_K, GGML_BF16_T>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q6_K_abf16")]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q6_K, GGML_BF16_T>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+#endif

@@ -2,8 +2,8 @@
 // that avoid all simd intrinsics. Pure threadgroup memory + barrier reduction.
 // Used for f32/f16/bf16 types where the scalar mul_mv shmem_reduce is broken at NW=64.
 #include "dispatch.h"
-
-int dispatch_mul_mat_gcn(ggml_metal_op_t ctx, int idx) {
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(matmul) int dispatch_mul_mat_gcn(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
     const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);

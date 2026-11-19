@@ -43,14 +43,6 @@ struct ggml_device_mv_row {
     int32_t  form; // bit 0 = weights held (activations reloaded per row), bit 1 = weights kept packed
 };
 
-// Column count from which a K-quant weight type takes the small-batch kernel (mul_mv_ext) on a card.
-struct ggml_device_mv_ext_min {
-    uint32_t pci_vendor;
-    uint32_t pci_device;
-    int32_t  type; // ggml_type
-    int32_t  ext_min;
-};
-
 struct ggml_device_profile {
     // Identity
     enum ggml_gpu_vendor vendor;
@@ -127,8 +119,13 @@ struct ggml_device_profile {
     uint32_t kq_cols;
 
     // Per-type column count where K-quants take mul_mv_ext on this card (generated rows); none = 4.
-    const struct ggml_device_mv_ext_min * mv_ext_min;
-    uint32_t n_mv_ext_min;
+
+    // Bit i set = lane capability i is reached and correct on this card (generated capability rows); 0 = base lanes only.
+    uint32_t lane_ok;
+
+    // PCI ids of the card, 0 when it has none (Apple Silicon): the key of per-card table rows.
+    uint32_t pci_vendor;
+    uint32_t pci_device;
 };
 
 #ifdef __cplusplus

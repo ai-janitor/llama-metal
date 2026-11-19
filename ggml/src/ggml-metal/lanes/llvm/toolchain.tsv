@@ -1,0 +1,14 @@
+# LLVM builds of kernels for AMD cards, compiled outside the Metal shader compiler.
+# How the rows are used: nothing reads this table yet. No lane with an LLVM source is wired (lanes.tsv has no row with
+# source llvm-archive or llvm-native). It records the toolchain a first LLVM lane would be built with.
+# To add a row: one per card, with the build that was tried in source.
+# Columns
+#   pci: the card as 0xVVVV:0xDDDD (PCI vendor and device id, lower-case hex). A card with no row has no LLVM build recorded.
+#   llvm: the LLVM version the build was made with.
+#   target: the LLVM target triple.
+#   mcpu: the -mcpu value for the card's chip.
+#   flags: the other compiler flags.
+#   source: what was done with this toolchain for the card (built, compiled only, run or not). Free text, no tab.
+pci	llvm	target	mcpu	flags	source
+0x1002:0x7340	22.1.8	amdgcn-amd-amdhsa	gfx1012	-x cl -cl-std=CL1.2 -nogpulib -O3 -ffp-contract=off	builds kernel objects for this card (not run through this backend)
+0x1002:0x6860	22.1.8	amdgcn-amd-amdhsa	gfx900	-x cl -cl-std=CL1.2 -nogpulib -O3 -ffp-contract=off	compiles for this target (not run on the card)

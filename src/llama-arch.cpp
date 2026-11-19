@@ -408,6 +408,9 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_SSM_DT_B_C_RMS,     "%s.ssm.dt_b_c_rms"     },
     { LLM_KV_SSM_NORM_EPS,       "%s.ssm.norm_epsilon"   },
 
+    { LLM_KV_ACTIVATION_DTYPE,       "%s.activation.dtype"       },
+    { LLM_KV_ACTIVATION_STATE_DTYPE, "%s.activation.state_dtype" },
+
     { LLM_KV_KDA_HEAD_DIM,         "%s.kda.head_dim"         },
     { LLM_KV_KDA_SAFE_GATE,        "%s.kda.safe_gate"        },
     { LLM_KV_KDA_GATE_LOWER_BOUND, "%s.kda.gate_lower_bound" },

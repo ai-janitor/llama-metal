@@ -33,8 +33,9 @@ inline float load_element_q4_0(device const char * base, uint64_t row_offset, in
 
     // Extract 4-bit nibble from packed storage
     device const uint8_t * qs = block[block_idx].qs;
-    const int byte_idx = offset / 2;
-    const int nibble_shift = (offset % 2) * 4;
+    // elements 0..15 are the low nibbles of the 16 bytes, 16..31 the high nibbles
+    const int byte_idx = offset % 16;
+    const int nibble_shift = (offset / 16) * 4;
     const uint8_t nibble = (qs[byte_idx] >> nibble_shift) & 0x0F;
 
     // Dequantize: value = nibble * scale - 8 * scale
@@ -46,6 +47,67 @@ template<typename block_t>
 inline float load_element_f16(device const char * base, uint64_t row_offset, int elem_idx) {
     device const half * ptr = (device const half *)(base + row_offset);
     return float(ptr[elem_idx]);
+}
+
+// K/V element format of the kernels instantiated with fa_scalar_kv_fc.
+constant int32_t FC_flash_attn_ext_scalar_kv_v [[function_constant(FC_FLASH_ATTN_EXT_SCALAR + 0)]];
+constant int32_t FC_flash_attn_ext_scalar_kv = is_function_constant_defined(FC_flash_attn_ext_scalar_kv_v) ? FC_flash_attn_ext_scalar_kv_v : FA_SCALAR_KV_F16;
+// V element format, when the host sets it apart from K.
+constant int32_t FC_flash_attn_ext_scalar_v_v [[function_constant(FC_FLASH_ATTN_EXT_SCALAR + 1)]];
+constant int32_t FC_flash_attn_ext_scalar_v = is_function_constant_defined(FC_flash_attn_ext_scalar_v_v) ? FC_flash_attn_ext_scalar_v_v : FA_SCALAR_KV_F16;
+
+struct fa_scalar_kv_fc {};
+
+// One element of a K/V row in format fmt (FA_SCALAR_KV_*).
+inline float load_element_fmt(const int fmt, device const char * base, uint64_t row_offset, int elem_idx) {
+    device const char * row = base + row_offset;
+    const int ib = elem_idx / 32;
+    const int io = elem_idx % 32;
+    // 4-bit blocks: elements 0..15 are the low nibbles of the 16 bytes, 16..31 the high nibbles
+    const int ij = io % 16;
+    const int sh = (io / 16) * 4;
+
+    switch (fmt) {
+        case FA_SCALAR_KV_F32:
+            return ((device const float *) row)[elem_idx];
+        case FA_SCALAR_KV_BF16:
+            return as_type<float>(uint(((device const ushort *) row)[elem_idx]) << 16);
+        case FA_SCALAR_KV_Q8_0: {
+            device const block_q8_0 * b = (device const block_q8_0 *) row + ib;
+            return float(b->qs[io]) * float(b->d);
+        }
+        case FA_SCALAR_KV_Q4_0: {
+            device const block_q4_0 * b = (device const block_q4_0 *) row + ib;
+            return (float((b->qs[ij] >> sh) & 0x0F) - 8.0f) * float(b->d);
+        }
+        case FA_SCALAR_KV_Q4_1: {
+            device const block_q4_1 * b = (device const block_q4_1 *) row + ib;
+            return float((b->qs[ij] >> sh) & 0x0F) * float(b->d) + float(b->m);
+        }
+        case FA_SCALAR_KV_Q5_0: {
+            device const block_q5_0 * b = (device const block_q5_0 *) row + ib;
+            const int x = ((b->qs[ij] >> sh) & 0x0F) | (((b->qh[io / 8] >> (io % 8)) & 1) << 4);
+            return (float(x) - 16.0f) * float(b->d);
+        }
+        case FA_SCALAR_KV_Q5_1: {
+            device const block_q5_1 * b = (device const block_q5_1 *) row + ib;
+            const int x = ((b->qs[ij] >> sh) & 0x0F) | (((b->qh[io / 8] >> (io % 8)) & 1) << 4);
+            return float(x) * float(b->d) + float(b->m);
+        }
+        case FA_SCALAR_KV_IQ4_NL: {
+            device const block_iq4_nl * b = (device const block_iq4_nl *) row + ib;
+            return kvalues_iq4nl_f[(b->qs[ij] >> sh) & 0x0F] * float(b->d);
+        }
+        case FA_SCALAR_KV_F8_E4M3:
+            return f8_e4m3_to_fp32(((device const uint8_t *) row)[elem_idx]);
+        default:
+            return float(((device const half *) row)[elem_idx]);
+    }
+}
+
+// One element of a K row in the format named by the function constant.
+inline float load_element_fc(device const char * base, uint64_t row_offset, int elem_idx) {
+    return load_element_fmt(FC_flash_attn_ext_scalar_kv, base, row_offset, elem_idx);
 }
 
 template<int DK, int DV, typename kblock_t, typename vblock_t>
@@ -146,7 +208,9 @@ inline void flash_attn_ext_scalar_impl(
             float k_val;
 
             // Type dispatch: load K element based on kblock_t
-            if (is_same<kblock_t, block_q8_0>::value) {
+            if (is_same<kblock_t, fa_scalar_kv_fc>::value) {
+                k_val = load_element_fc(k_head, k_row_offset, k_idx);
+            } else if (is_same<kblock_t, block_q8_0>::value) {
                 k_val = load_element_q8_0<kblock_t>(k_head, k_row_offset, k_idx);
             } else if (is_same<kblock_t, block_q4_0>::value) {
                 k_val = load_element_q4_0<kblock_t>(k_head, k_row_offset, k_idx);
@@ -187,7 +251,9 @@ inline void flash_attn_ext_scalar_impl(
             float v_val;
 
             // Type dispatch: load V element based on vblock_t
-            if (is_same<vblock_t, block_q8_0>::value) {
+            if (is_same<vblock_t, fa_scalar_kv_fc>::value) {
+                v_val = load_element_fmt(FC_flash_attn_ext_scalar_v, v_head, v_row_offset, v_idx);
+            } else if (is_same<vblock_t, block_q8_0>::value) {
                 v_val = load_element_q8_0<vblock_t>(v_head, v_row_offset, v_idx);
             } else if (is_same<vblock_t, block_q4_0>::value) {
                 v_val = load_element_q4_0<vblock_t>(v_head, v_row_offset, v_idx);
@@ -651,4 +717,80 @@ kernel void kernel_flash_attn_ext_scalar_dk576_dv576(
     ushort  simd_size [[threads_per_simdgroup]])
 {
     flash_attn_ext_scalar_impl<576, 576, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
+}
+
+// Kernels per head pair whose K/V format is the function constant.
+#define FA_SCALAR_KV_KERNEL(NAME, DK, DV) \
+[[host_name(#NAME)]] \
+kernel void NAME( \
+    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]], \
+    device const char * q     [[buffer(1)]], \
+    device const char * k     [[buffer(2)]], \
+    device const char * v     [[buffer(3)]], \
+    device const char * mask  [[buffer(4)]], \
+    device       char * dst   [[buffer(5)]], \
+    device const char * sinks [[buffer(6)]], \
+    constant uint32_t * tg_offset [[buffer(7)]], \
+    threadgroup  float * shmem [[threadgroup(0)]], \
+    uint3   tgpig    [[threadgroup_position_in_grid]], \
+    ushort3 tptg     [[threads_per_threadgroup]], \
+    ushort  simd_gid [[simdgroup_index_in_threadgroup]], \
+    ushort  simd_lid [[thread_index_in_simdgroup]], \
+    ushort  simd_size [[threads_per_simdgroup]]) \
+{ \
+    flash_attn_ext_scalar_impl<DK, DV, fa_scalar_kv_fc, fa_scalar_kv_fc>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size); \
+}
+
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk32_dv32, 32, 32)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk40_dv40, 40, 40)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk48_dv48, 48, 48)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk64_dv64, 64, 64)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk72_dv72, 72, 72)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk80_dv80, 80, 80)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk96_dv96, 96, 96)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk112_dv112, 112, 112)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk128_dv128, 128, 128)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk192_dv192, 192, 192)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk256_dv256, 256, 256)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk512_dv512, 512, 512)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk576_dv576, 576, 576)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk96_dv64, 96, 64)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk128_dv96, 128, 96)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk192_dv128, 192, 128)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk320_dv256, 320, 256)
+FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk576_dv512, 576, 512)
+
+// Lightning indexer, one thread per (K row, token): the sum over heads of max(q . k, 0) * weight, plus the mask.
+// The K format is the function constant of the scalar flash attention kernels.
+kernel void kernel_lightning_indexer_scalar(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * w,
+        device const char * m,
+        device       char * dst,
+        uint3 gid [[thread_position_in_grid]]) {
+    const int ik = gid.x;
+    const int t  = gid.y;
+    const int s  = gid.z;
+    if (ik >= args.n_kv || t >= args.n_batch) {
+        return;
+    }
+
+    const uint64_t k_offset = (uint64_t) ik*args.nbk2 + (uint64_t) s*args.nbk3;
+    device const float * w_row = (device const float *) (w + (uint64_t) t*args.nbw1 + (uint64_t) s*args.nbw3);
+
+    float score = 0.0f;
+    for (int h = 0; h < args.n_head; ++h) {
+        device const float * q_row = (device const float *) (q + (uint64_t) h*args.nbq1 + (uint64_t) t*args.nbq2 + (uint64_t) s*args.nbq3);
+        float qk = 0.0f;
+        for (int i = 0; i < args.n_embd; ++i) {
+            qk += q_row[i] * load_element_fc(k, k_offset, i);
+        }
+        score += max(qk, 0.0f) * w_row[h];
+    }
+
+    device const half * m_row = (device const half *) (m + (uint64_t) t*args.nbm1 + (uint64_t) (s % args.mask_ne3)*args.nbm3);
+    device float * dst_row = (device float *) (dst + (uint64_t) t*args.nb1 + (uint64_t) s*args.nb3);
+    dst_row[ik] = score + (float) m_row[ik];
 }

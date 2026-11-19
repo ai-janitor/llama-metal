@@ -57,10 +57,10 @@ struct tiled_loader_f32 {
 // bf16: typed pointer, element-based stride (pattern A)
 // ---------------------------------------------------------------------------
 
-#if defined(GGML_METAL_HAS_BF16)
+#if defined(GGML_METAL_BF16_ANY)
 
 inline void load_a_bf16_to_shmem(
-    device const bfloat * data_a,
+    device const GGML_BF16_T * data_a,
     threadgroup float2 * buf_a,
     uint pos_a,
     uint loadr,
@@ -84,14 +84,14 @@ inline void load_a_bf16_to_shmem(
 }
 
 struct tiled_loader_bf16 {
-    device const bfloat * data_a;
+    device const GGML_BF16_T * data_a;
     uint stride_a;
     uint pos_a;
 
     void init(device const char * src0, uint64_t offset0, uint ir,
               constant ggml_metal_kargs_mul_mm & args) {
-        data_a = (device const bfloat *)(src0 + offset0 + args.nb01 * (ir * BM));
-        stride_a = args.nb01 / sizeof(bfloat);
+        data_a = (device const GGML_BF16_T *)(src0 + offset0 + args.nb01 * (ir * BM));
+        stride_a = args.nb01 / sizeof(GGML_BF16_T);
         pos_a = 0;
     }
 
@@ -103,7 +103,7 @@ struct tiled_loader_bf16 {
     void advance() { pos_a += BK; }
 };
 
-#endif // GGML_METAL_HAS_BF16
+#endif // GGML_METAL_BF16_ANY
 
 // ---------------------------------------------------------------------------
 // q8_0: block pointer, scale-only dequant (pattern B)

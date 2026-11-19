@@ -1,8 +1,9 @@
 // Ext mul_mv dispatch path — small-batch matrix-vector kernels for batch sizes 2..8.
 // Extracted from dispatch.cpp to keep each dispatch strategy in its own file.
 #include "dispatch.h"
-
-int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx) {
+#include "formats.h"
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(matmul) int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -25,14 +26,6 @@ int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    // P17.14: opt-in packed-fp16 tiled prefill. The K-quant predicate below (ne11 >= 4 &&
-    // (ne11 <= 8 || !has_matrix_hw)) would take long AMD Q4_K prompts before the tiled strategy runs,
-    // so step aside - before any pipeline work - only when the shared admission says the tiled V3
-    // route will take this op. Flag off (default) -> helper false -> ext unchanged.
-    if (ggml_metal_tiled_fp16_mul_admitted(ctx, idx)) {
-        return 0;
-    }
-
     // =========================================================================
     // Small-batch matrix-vector ext kernels (mul_mv_ext).
     // =========================================================================
@@ -42,33 +35,7 @@ int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx) {
     // More efficient than both mul_mv (batch=1 only, no batch tiling) and
     // mul_mm (designed for large batches, has tile overhead for small batches).
     // The ext kernels tile both the row (r0) and batch (r1) dimensions.
-    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
-        (
-         (
-          (
-           op->src[0]->type == GGML_TYPE_F32  || // TODO: helper function
-           op->src[0]->type == GGML_TYPE_F16  ||
-           op->src[0]->type == GGML_TYPE_Q4_0 ||
-           op->src[0]->type == GGML_TYPE_Q4_1 ||
-           op->src[0]->type == GGML_TYPE_Q5_0 ||
-           op->src[0]->type == GGML_TYPE_Q5_1 ||
-           op->src[0]->type == GGML_TYPE_Q8_0 ||
-           op->src[0]->type == GGML_TYPE_MXFP4 ||
-           op->src[0]->type == GGML_TYPE_IQ4_NL ||
-           false) && (ne11 >= 2 && (ne11 <= NE11_MM_MIN || (!profile->has_matrix_hw && op->src[0]->type != GGML_TYPE_F16 && op->src[0]->type != GGML_TYPE_MXFP4)))
-         ) ||
-         (
-          (
-           op->src[0]->type == GGML_TYPE_Q4_K ||
-           op->src[0]->type == GGML_TYPE_Q5_K ||
-           op->src[0]->type == GGML_TYPE_Q6_K ||
-           // K-quants take ext from a per-card column count (hw rows, default 4): its generic dequant is slow, so below
-           // it the scalar kernel runs once per column, or a cols row of the card takes the whole batch in one launch.
-           false) && (ne11 >= ggml_metal_kq_ext_min(profile, op->src[0]->type) && (ne11 <= 8 || !profile->has_matrix_hw)) &&
-          (ne11 > 4 || (ggml_metal_mv_hw_row(profile, 0, op->src[0]->type, ne00, ne01, ne11, true) == nullptr && !ggml_metal_kq_cols_test(nullptr, nullptr)))
-         )
-        )
-       ) {
+    if (ggml_metal_batch_route(ctx, idx) == MV_BATCH_EXT) {
         // Ext kernel configuration:
         //   nsg   — simdgroups per threadgroup
         //   nxpsg — threads along the K dimension per simdgroup (more = fewer reads,

@@ -1,7 +1,7 @@
 #include "ggml-metal-device.h"
-
+#include "ggml-metal-probe.h"
 #include "ggml-metal-impl.h"
-
+GGML_METAL_FAMILY(device)
 #include "ggml-impl.h"
 
 #include <cassert>
@@ -72,7 +72,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_base(ggml
     const char * op_str = "undefined";
     switch (op) {
         case GGML_OP_ADD_ID: op_str = "add_id"; break;
-        case GGML_OP_CONCAT: op_str = "concat"; break;
+        case GGML_OP_GATED_LINEAR_ATTN: op_str = "gated_linear_attn_f32"; break;
         default: GGML_ABORT("fatal error");
     };
 

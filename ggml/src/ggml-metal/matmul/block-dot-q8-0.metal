@@ -2,7 +2,7 @@
 #define GGML_METAL_MATMUL_BLOCK_DOT_Q8_0_METAL
 
 #include "dequant.metal"
-#include "block-dot-lane.metal"
+#include "lane-fma-f32.metal"
 
 // One native lane owns eight consecutive Q8_0 elements within a 32-weight block.
 struct block_dot_q8_0_fragment {
@@ -12,7 +12,6 @@ struct block_dot_q8_0_fragment {
 // Cached activation values match the scalar lane's eight sequential loads.
 struct block_dot_q8_0_activation {
     float values[8];
-    half4 half_groups[2]; // cached packed-lane activation quartets
 };
 
 // This adapter owns Q8_0 element ownership and scalar arithmetic; caller owns traversal and reduction.
@@ -27,16 +26,12 @@ struct block_dot_q8_0_scalar {
     }
 
     // This adapter is faithful-only until a separately specified fast lane is added.
-    // The fast lane caches the same eight source activations as two four-value half groups.
     template<short ARITHMETIC_LANE = block_dot_lane_fp32>
     static inline block_dot_q8_0_activation prepare_activation(
             thread const block_dot_q8_0_fragment & owned,
             device const float * block_y,
             const short act_load = 4) {
-        static_assert(
-                ARITHMETIC_LANE == block_dot_lane_fp32 ||
-                ARITHMETIC_LANE == block_dot_lane_packed_fp16,
-                "Q8_0 scalar adapter supports only fp32 or packed fp16 lanes");
+        static_assert(ARITHMETIC_LANE == block_dot_lane_fp32, "only the fp32 lane exists");
         block_dot_q8_0_activation prepared;
         device const float * lane_y = block_y + owned.element_offset;
 
@@ -53,11 +48,6 @@ struct block_dot_q8_0_scalar {
             }
         }
 
-        if (ARITHMETIC_LANE == block_dot_lane_packed_fp16) {
-            prepared.half_groups[0] = half4(prepared.values[0], prepared.values[1], prepared.values[2], prepared.values[3]);
-            prepared.half_groups[1] = half4(prepared.values[4], prepared.values[5], prepared.values[6], prepared.values[7]);
-        }
-
         return prepared;
     }
 
@@ -68,30 +58,16 @@ struct block_dot_q8_0_scalar {
             thread const block_dot_q8_0_fragment & owned,
             thread const block_dot_q8_0_activation & prepared,
             thread float & accumulator) {
-        static_assert(
-                ARITHMETIC_LANE == block_dot_lane_fp32 ||
-                ARITHMETIC_LANE == block_dot_lane_packed_fp16,
-                "Q8_0 scalar adapter supports only fp32 or packed fp16 lanes");
+        static_assert(ARITHMETIC_LANE == block_dot_lane_fp32, "only the fp32 lane exists");
         device const int8_t * quant = block->qs + owned.element_offset;
 
-        if (ARITHMETIC_LANE == block_dot_lane_fp32) {
-            float quant_dot = 0.f;
+        float quant_dot = 0.f;
 
-            FOR_UNROLL (short i = 0; i < elements_per_lane; ++i) {
-                quant_dot += quant[i]*prepared.values[i];
-            }
-
-            accumulator += quant_dot*block->d;
-        } else {
-            // Per-byte loads preserve the existing safe alignment assumptions for Q8_0 quants.
-            const char4 first_quants = char4(quant[0], quant[1], quant[2], quant[3]);
-            const char4 second_quants = char4(quant[4], quant[5], quant[6], quant[7]);
-            const float quant_dot =
-                    block_dot_packed_half_dot4(prepared.half_groups[0], first_quants) +
-                    block_dot_packed_half_dot4(prepared.half_groups[1], second_quants);
-
-            accumulator += quant_dot*block->d;
+        FOR_UNROLL (short i = 0; i < elements_per_lane; ++i) {
+            quant_dot += quant[i]*prepared.values[i];
         }
+
+        accumulator += quant_dot*block->d;
     }
 
     // The fp32 lane of accumulate, same products in the same order: the lane's eight weights are read as three

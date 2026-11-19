@@ -1,12 +1,12 @@
 #include "../ggml-metal-device.h"
 #include "../ggml-metal-impl.h"
 #include "../ggml-impl.h"
-
+#include "ggml-metal-probe.h"
 #include <cassert>
 #include <memory>
 #include <string>
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_irfft(ggml_metal_library_t lib, const ggml_tensor * op) {
+GGML_METAL_FAMILY(fft)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_irfft(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_IRFFT);
 
     char base[256];
@@ -23,7 +23,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_irfft(ggml_metal
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fold(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_fold(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_FOLD);
 
     char base[256];

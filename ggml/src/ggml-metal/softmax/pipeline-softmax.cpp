@@ -1,12 +1,12 @@
 #include "../ggml-metal-device.h"
 #include "../ggml-metal-impl.h"
 #include "../../ggml-impl.h"
-
+#include "ggml-metal-probe.h"
 #include <cassert>
 #include <memory>
 #include <string>
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_metal_library_t lib, const ggml_tensor * op) {
+GGML_METAL_FAMILY(softmax)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     GGML_ASSERT(!op->src[1] || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32);
 
     char base[256];

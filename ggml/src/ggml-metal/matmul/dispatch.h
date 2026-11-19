@@ -5,6 +5,8 @@
 #pragma once
 
 #include "../ops/ggml-metal-ops-internal.h"
+#include "formats.h"
+#include "batch-route.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -31,16 +33,6 @@ static inline bool ggml_metal_kq_prep_test_requested() {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
-// Column count from which this K-quant type takes mul_mv_ext on this card (hw rows); no row = 4.
-static inline int ggml_metal_kq_ext_min(const struct ggml_device_profile * profile, ggml_type type) {
-    for (uint32_t i = 0; i < profile->n_mv_ext_min; i++) {
-        if (profile->mv_ext_min[i].type == (int32_t) type) {
-            return profile->mv_ext_min[i].ext_min;
-        }
-    }
-    return 4;
-}
-
 // GGML_METAL_KQ_COLS_TEST=<rows><form> (two digits, e.g. 20; form 4 or 6 = paired halves, rows 2, 4 or 8): every 2-4 column
 // K-quant batch takes the N-column kernel (test only).
 static inline bool ggml_metal_kq_cols_test(int * nr0, int * form) {
@@ -62,15 +54,53 @@ static inline bool ggml_metal_kq_cols_test(int * nr0, int * form) {
 
 // Break-even batch size where matmul kernels become more efficient than matvec.
 // Used by ext (ne11 <= threshold) and matmul (ne11 > threshold) strategies.
-static constexpr int NE11_MM_MIN = 8;
+static constexpr int NE11_MM_MIN = GGML_METAL_NE11_MM_MIN;
 
-// P17.14: the ONE admission predicate for the opt-in Q4_K packed-fp16 tiled prefill route
-// (GGML_METAL_TILED_FP16_MUL exact "1", read per call): Q4_K weights, AMD, no matrix hw, f32 src1,
-// both operands non-transposed, ne01 >= 64, ne11 > NE11_MM_MIN. Shared by the ext strategy (which
-// must step aside, since its K-quant predicate would otherwise take long AMD Q4_K prompts first)
-// and the tiled strategy (V3 kernel selection) so the two can never disagree. Defined in
-// dispatch-matmul.cpp. False when the flag is off: nothing else changes.
-bool ggml_metal_tiled_fp16_mul_admitted(ggml_metal_op_t ctx, int idx);
+// Vendors the tiled kernel of a weight type is verified on.
+static inline uint8_t ggml_metal_tiled_verified_vendors(ggml_type type) {
+    uint8_t verified = GGML_METAL_VERIFIED_AMD;
+    if (type != GGML_TYPE_MXFP4) {
+        verified |= GGML_METAL_VERIFIED_INTEL; // f16 tiled is needed on Intel; mxfp4 tiled times out there
+    }
+    return verified;
+}
+
+// GGML_METAL_KQ_HW_ROWS=0 or GGML_METAL_KQ_EXT_ROWS=0: the card's batch route rows are not read.
+static inline bool ggml_metal_batch_rows_off() {
+    static const bool off = [] {
+        const char * rows = std::getenv("GGML_METAL_KQ_HW_ROWS");
+        const char * ext  = std::getenv("GGML_METAL_KQ_EXT_ROWS");
+        return (rows != nullptr && std::strcmp(rows, "0") == 0) || (ext != nullptr && std::strcmp(ext, "0") == 0);
+    }();
+    return off;
+}
+
+// The batch route of a MUL_MAT op on this card. The small-batch and the tiled route both ask here.
+static inline enum mv_batch_route ggml_metal_batch_route(ggml_metal_op_t ctx, int idx) {
+    const ggml_tensor * op = ctx->node(idx);
+    const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
+    const ggml_type type = op->src[0]->type;
+
+    int n_rows = 0;
+    const struct mv_batch_row * rows = ggml_metal_batch_rows_get(&n_rows);
+    const struct mv_batch_row * row = ggml_metal_batch_rows_off() ? nullptr
+        : ggml_metal_batch_row_in(rows, n_rows, profile->pci_vendor, profile->pci_device, type);
+
+    struct mv_batch_in in = {};
+    in.fmt             = ggml_metal_mv_format(type);
+    in.ext_from        = row ? row->ext_from : 0;
+    in.tiled_from      = row ? row->tiled_from : 0;
+    in.has_matrix_hw   = profile->has_matrix_hw;
+    in.tiled_vendor_ok = (ggml_metal_tiled_verified_vendors(type) & ggml_metal_vendor_to_verified_bit(profile->vendor)) != 0;
+    in.act_f32         = op->src[1]->type == GGML_TYPE_F32;
+    in.trans0          = ggml_is_transposed(op->src[0]);
+    in.trans1          = ggml_is_transposed(op->src[1]);
+    in.k               = op->src[0]->ne[0];
+    in.m               = op->src[0]->ne[1];
+    in.n               = op->src[1]->ne[1];
+    in.cols_takes      = in.n <= 4 && (ggml_metal_mv_hw_row(profile, 0, type, in.k, in.m, (int) in.n, true) != nullptr || ggml_metal_kq_cols_test(nullptr, nullptr));
+    return ggml_metal_batch_route_decide(&in);
+}
 
 // Grouped q4_K/q6_K fusion — fuses 2-8 consecutive matvecs into one dispatch.
 int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx);

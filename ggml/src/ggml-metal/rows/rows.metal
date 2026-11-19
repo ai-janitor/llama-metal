@@ -60,7 +60,8 @@ kernel void kernel_get_rows_f(
     }
 }
 
-template<typename TI, typename block_q, void (*quantize_func)(device const float *, device block_q &)>
+// QK = elements per block
+template<short QK, typename TI, typename block_q, void (*quantize_func)(device const float *, device block_q &)>
 kernel void kernel_set_rows_q32(
         constant ggml_metal_kargs_set_rows & args,
         device const  void * src0,
@@ -87,7 +88,7 @@ kernel void kernel_set_rows_q32(
     const device float   * src_row = (const device float   *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
 
     for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
-        quantize_func(src_row + 32*ind, dst_row[ind]);
+        quantize_func(src_row + QK*ind, dst_row[ind]);
     }
 }
 
@@ -127,17 +128,16 @@ kernel void kernel_diag_f32(
         device   const char * src0,
         device         char * dst,
         uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiitg[[thread_index_in_threadgroup]]) {
-    const short NW = N_SIMDWIDTH;
-
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort3  ntg[[threads_per_threadgroup]]) {
     const int32_t i3 = tgpig.z;
     const int32_t i2 = tgpig.y;
     const int32_t i1 = tgpig.x;
 
     device const float * src0_ptr = (device const float *)(src0 +                i2*args.nb02 + i3*args.nb03);
-    device       float * dst_ptr  = (device       float *)(dst  + i1*args.nb01 + i2*args.nb2  + i3*args.nb3);
+    device       float * dst_ptr  = (device       float *)(dst  + i1*args.nb1  + i2*args.nb2  + i3*args.nb3);
 
-    for (int i0 = tiitg; i0 < args.ne0; i0 += NW) {
+    for (int i0 = tiitg; i0 < args.ne0; i0 += ntg.x) {
         dst_ptr[i0] = i0 == i1 ? src0_ptr[i0] : 0.0f;
     }
 }
@@ -148,13 +148,39 @@ kernel void kernel_diag_f32(
 // get rows
 //
 
+// fp8 rows to f32: one byte per element, any row width
+[[host_name("kernel_get_rows_f8_e4m3")]]
+kernel void kernel_get_rows_f8_e4m3(
+        constant ggml_metal_kargs_get_rows & args,
+        device const void * src0,
+        device const void * src1,
+        device       void * dst,
+        uint3               tgpig[[threadgroup_position_in_grid]],
+        ushort              tiitg[[thread_index_in_threadgroup]],
+        ushort3             ntg [[threads_per_threadgroup]]) {
+    const int32_t iw0 = tgpig.x/args.ne10;
+    const int32_t i10 = tgpig.x%args.ne10;
+    const int32_t i11 = tgpig.y;
+    const int32_t i12 = tgpig.z;
+
+    const int32_t r = ((const device int32_t *) ((const device char *) src1 + i12*args.nb12 + i11*args.nb11 + i10*args.nb10))[0];
+
+    auto psrc = (const device uint8_t *) ((const device char *) src0 + i12*args.nb03 + i11*args.nb02 +   r*args.nb01);
+    auto pdst = (      device float   *) ((      device char *)  dst + i12*args.nb3  + i11*args.nb2  + i10*args.nb1);
+
+    const int ind = iw0*ntg.x + tiitg;
+    if (ind < args.ne00t) {
+        pdst[ind] = f8_e4m3_to_fp32(psrc[ind]);
+    }
+}
+
 typedef decltype(kernel_get_rows_f<float, float>) get_rows_f_t;
 
 template [[host_name("kernel_get_rows_f32")]]  kernel get_rows_f_t kernel_get_rows_f<float, float>;
 template [[host_name("kernel_get_rows_f16")]]  kernel get_rows_f_t kernel_get_rows_f<half,  float>;
 template [[host_name("kernel_get_rows_i32")]]  kernel get_rows_f_t kernel_get_rows_f<int32_t, int32_t>;
-#if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_get_rows_bf16")]] kernel get_rows_f_t kernel_get_rows_f<bfloat, float>;
+#if defined(GGML_METAL_BF16_ANY)
+template [[host_name("kernel_get_rows_bf16")]] kernel get_rows_f_t kernel_get_rows_f<GGML_BF16_T, float>;
 #endif
 
 typedef decltype(kernel_get_rows_q<block_q4_0, 2, dequantize_q4_0>) get_rows_q_t;
@@ -165,6 +191,11 @@ template [[host_name("kernel_get_rows_q5_0")]]    kernel get_rows_q_t kernel_get
 template [[host_name("kernel_get_rows_q5_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_1,    2, dequantize_q5_1>;
 template [[host_name("kernel_get_rows_q8_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q8_0,    2, dequantize_q8_0>;
 template [[host_name("kernel_get_rows_mxfp4")]]   kernel get_rows_q_t kernel_get_rows_q<block_mxfp4,   2, dequantize_mxfp4>;
+template [[host_name("kernel_get_rows_q1_0")]] kernel get_rows_q_t kernel_get_rows_q<block_q1_0, 8, dequantize_q1_0>;
+template [[host_name("kernel_get_rows_q2_0")]] kernel get_rows_q_t kernel_get_rows_q<block_q2_0, 4, dequantize_q2_0>;
+template [[host_name("kernel_get_rows_tq1_0")]] kernel get_rows_q_t kernel_get_rows_q<block_tq1_0, 16, dequantize_tq1_0>;
+template [[host_name("kernel_get_rows_tq2_0")]] kernel get_rows_q_t kernel_get_rows_q<block_tq2_0, 16, dequantize_tq2_0>;
+template [[host_name("kernel_get_rows_nvfp4")]] kernel get_rows_q_t kernel_get_rows_q<block_nvfp4, 4, dequantize_nvfp4>;
 template [[host_name("kernel_get_rows_q2_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q2_K,    QK_NL, dequantize_q2_K>;
 template [[host_name("kernel_get_rows_q3_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q3_K,    QK_NL, dequantize_q3_K>;
 template [[host_name("kernel_get_rows_q4_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_K,    QK_NL, dequantize_q4_K>;
@@ -184,28 +215,74 @@ template [[host_name("kernel_get_rows_iq4_xs")]]  kernel get_rows_q_t kernel_get
 // set rows
 //
 
+// fp8 destination: one encoded byte per element
+template<typename TI>
+kernel void kernel_set_rows_f8(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        ushort                 tiitg[[thread_index_in_threadgroup]],
+        ushort3                tptg [[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+
+    const int32_t i12 = i03%args.ne12;
+    const int32_t i11 = i02%args.ne11;
+
+    const int32_t i01 = tgpig.x*tptg.y + tiitg/tptg.x;
+    if (i01 >= args.ne01) {
+        return;
+    }
+
+    const int32_t i10 = i01;
+    const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+          device uint8_t * dst_row = (      device uint8_t *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
+    const device float   * src_row = (const device float   *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    for (int ind = tiitg%tptg.x; ind < args.nk0; ind += tptg.x) {
+        dst_row[ind] = fp32_to_f8_e4m3(src_row[ind]);
+    }
+}
+
 typedef decltype(kernel_set_rows_f<float, int64_t>) set_rows_f_t;
+
+template [[host_name("kernel_set_rows_f8_e4m3_i64")]] kernel set_rows_f_t kernel_set_rows_f8<int64_t>;
+template [[host_name("kernel_set_rows_f8_e4m3_i32")]] kernel set_rows_f_t kernel_set_rows_f8<int32_t>;
+
 
 template [[host_name("kernel_set_rows_f32_i64")]]  kernel set_rows_f_t kernel_set_rows_f<float, int64_t>;
 template [[host_name("kernel_set_rows_f32_i32")]]  kernel set_rows_f_t kernel_set_rows_f<float, int32_t>;
 template [[host_name("kernel_set_rows_f16_i64")]]  kernel set_rows_f_t kernel_set_rows_f<half, int64_t>;
 template [[host_name("kernel_set_rows_f16_i32")]]  kernel set_rows_f_t kernel_set_rows_f<half, int32_t>;
-#if defined(GGML_METAL_HAS_BF16)
-template [[host_name("kernel_set_rows_bf16_i64")]] kernel set_rows_f_t kernel_set_rows_f<bfloat, int64_t>;
-template [[host_name("kernel_set_rows_bf16_i32")]] kernel set_rows_f_t kernel_set_rows_f<bfloat, int32_t>;
+#if defined(GGML_METAL_BF16_ANY)
+template [[host_name("kernel_set_rows_bf16_i64")]] kernel set_rows_f_t kernel_set_rows_f<GGML_BF16_T, int64_t>;
+template [[host_name("kernel_set_rows_bf16_i32")]] kernel set_rows_f_t kernel_set_rows_f<GGML_BF16_T, int32_t>;
 #endif
 
-typedef decltype(kernel_set_rows_q32<int64_t, block_q8_0, quantize_q8_0>) set_rows_q32_t;
+typedef decltype(kernel_set_rows_q32<32, int64_t, block_q8_0, quantize_q8_0>) set_rows_q32_t;
 
-template [[host_name("kernel_set_rows_q8_0_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_q8_0,   quantize_q8_0>;
-template [[host_name("kernel_set_rows_q8_0_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_q8_0,   quantize_q8_0>;
-template [[host_name("kernel_set_rows_q4_0_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_q4_0,   quantize_q4_0>;
-template [[host_name("kernel_set_rows_q4_0_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_q4_0,   quantize_q4_0>;
-template [[host_name("kernel_set_rows_q4_1_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_q4_1,   quantize_q4_1>;
-template [[host_name("kernel_set_rows_q4_1_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_q4_1,   quantize_q4_1>;
-template [[host_name("kernel_set_rows_q5_0_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_q5_0,   quantize_q5_0>;
-template [[host_name("kernel_set_rows_q5_0_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_q5_0,   quantize_q5_0>;
-template [[host_name("kernel_set_rows_q5_1_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_q5_1,   quantize_q5_1>;
-template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_q5_1,   quantize_q5_1>;
-template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_iq4_nl, quantize_iq4_nl>;
-template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_set_rows_q8_0_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int64_t, block_q8_0,   quantize_q8_0>;
+template [[host_name("kernel_set_rows_q8_0_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int32_t, block_q8_0,   quantize_q8_0>;
+template [[host_name("kernel_set_rows_q4_0_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int64_t, block_q4_0,   quantize_q4_0>;
+template [[host_name("kernel_set_rows_q4_0_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int32_t, block_q4_0,   quantize_q4_0>;
+template [[host_name("kernel_set_rows_q4_1_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int64_t, block_q4_1,   quantize_q4_1>;
+template [[host_name("kernel_set_rows_q4_1_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int32_t, block_q4_1,   quantize_q4_1>;
+template [[host_name("kernel_set_rows_q5_0_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int64_t, block_q5_0,   quantize_q5_0>;
+template [[host_name("kernel_set_rows_q5_0_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int32_t, block_q5_0,   quantize_q5_0>;
+template [[host_name("kernel_set_rows_q5_1_i64")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int64_t, block_q5_1,   quantize_q5_1>;
+template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<32, int32_t, block_q5_1,   quantize_q5_1>;
+template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<32, int64_t, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<32, int32_t, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_set_rows_q1_0_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<QK1_0, int64_t, block_q1_0, quantize_q1_0>;
+template [[host_name("kernel_set_rows_q1_0_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<QK1_0, int32_t, block_q1_0, quantize_q1_0>;
+template [[host_name("kernel_set_rows_q2_0_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<QK2_0, int64_t, block_q2_0, quantize_q2_0>;
+template [[host_name("kernel_set_rows_q2_0_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<QK2_0, int32_t, block_q2_0, quantize_q2_0>;
+template [[host_name("kernel_set_rows_tq1_0_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<QK_K, int64_t, block_tq1_0, quantize_tq1_0>;
+template [[host_name("kernel_set_rows_tq1_0_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<QK_K, int32_t, block_tq1_0, quantize_tq1_0>;
+template [[host_name("kernel_set_rows_tq2_0_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<QK_K, int64_t, block_tq2_0, quantize_tq2_0>;
+template [[host_name("kernel_set_rows_tq2_0_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<QK_K, int32_t, block_tq2_0, quantize_tq2_0>;
+template [[host_name("kernel_set_rows_nvfp4_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<QK_NVFP4, int64_t, block_nvfp4, quantize_nvfp4>;
+template [[host_name("kernel_set_rows_nvfp4_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<QK_NVFP4, int32_t, block_nvfp4, quantize_nvfp4>;

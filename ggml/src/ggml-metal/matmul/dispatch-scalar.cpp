@@ -3,7 +3,7 @@
 // for non-32-wide GPUs (Intel NW<32, AMD NW=64).
 #include "dispatch.h"
 #include "tuning.h"
-
+#include "ggml-metal-probe.h"
 #include <algorithm>
 #include <cerrno>
 #include <cinttypes>
@@ -12,7 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <vector>
-
+GGML_METAL_FAMILY(matmul)
 #include "residual-alias-guard.h"
 
 struct nr0_row {
@@ -85,12 +85,14 @@ static std::vector<nr0_row> load_nr0_rows() {
         int64_t nr0 = 0;
         if (valid) {
             valid = std::strchr(fields[3], '\t') == nullptr;
-            if (std::strcmp(fields[0], ggml_type_name(GGML_TYPE_Q4_K)) == 0) {
-                row.type = GGML_TYPE_Q4_K;
-            } else if (std::strcmp(fields[0], ggml_type_name(GGML_TYPE_Q5_K)) == 0) {
-                row.type = GGML_TYPE_Q5_K;
-            } else if (std::strcmp(fields[0], ggml_type_name(GGML_TYPE_Q6_K)) == 0) {
-                row.type = GGML_TYPE_Q6_K;
+            const struct mv_format_row * fmt = nullptr;
+            for (const struct mv_format_row & f : mv_format_rows) {
+                if (f.shape_rows && std::strcmp(fields[0], ggml_type_name(f.type)) == 0) {
+                    fmt = &f;
+                }
+            }
+            if (fmt != nullptr) {
+                row.type = fmt->type;
             } else {
                 valid = false;
             }
@@ -628,7 +630,8 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
     // For k-quant types, the function constant is set but ignored — they still use the
     // template parameter (NR0 override requires changing all k-quant entry points too).
     const ggml_type type = op->src[0]->type;
-    const bool kquant_rows = type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K;
+    const struct mv_format_row * type_row = ggml_metal_mv_format(type);
+    const bool kquant_rows = type_row != nullptr && type_row->shape_rows;
     int nr0_dynamic = kquant_rows ? ggml_metal_mv_nr0_from_rows(type, ne00, ne01) : ggml_metal_compute_nr0_basic(profile, model, ne00);
 
     const bool use_shmem_reduce = (profile->simd_width != 32);
@@ -744,10 +747,7 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
     //         while other quant types use nr0*nsg (more rows per TG).
     // grid_y: src1 rows (batch dimension), 1 for matvec.
     // grid_z: attention heads × batch (3rd and 4th tensor dimensions).
-    const int32_t grid_x = (op->src[0]->type == GGML_TYPE_F32 ||
-                            op->src[0]->type == GGML_TYPE_F16 ||
-                            op->src[0]->type == GGML_TYPE_BF16 ||
-                            op->src[0]->type == GGML_TYPE_Q8_0)
+    const int32_t grid_x = ggml_metal_mv_rows_per_threadgroup(op->src[0]->type)
                            ? ((ne01 + nr0 - 1) / nr0)
                            : ((ne01 + nr0*nsg - 1) / (nr0*nsg));
     const int32_t grid_y = ncols > 0 ? 1 : ((ne11 + nr1 - 1) / nr1);
@@ -829,7 +829,7 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
 
 // Fused rms_norm -> MUL by the norm weight -> 1-4 Q8_0 matvecs reading it (GGML_METAL_NORM_MATVEC=1).
 // The graph optimizer packs the matvecs right after the norm; the normed vector is never written.
-int ggml_metal_op_norm_matvec(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_norm_matvec(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     if (!ctx->use_fusion || idx + 2 >= ctx->n_nodes()) {
         return 0;
     }
@@ -938,7 +938,7 @@ int ggml_metal_op_norm_matvec(ggml_metal_op_t ctx, int idx) {
 }
 
 // Residual add that also stores the mean of squares of its output in its slot of the device-owned buffer.
-int ggml_metal_op_add_scale(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_add_scale(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
     const int slot = ctx->graph_index(idx);
     if (slot >= GGML_METAL_NORM_MEANS_SLOTS) {

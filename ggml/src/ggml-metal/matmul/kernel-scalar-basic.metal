@@ -275,12 +275,7 @@ kernel void host_name_str(                                                      
 }
 
 BASIC_MV_ENTRY(kernel_mul_mv_q4_0_f32, block_q4_0, block_dot_lane_fp32)
-// The host does not route to this literal V3 entry yet; keeping it separate preserves faithful default behavior.
-BASIC_MV_ENTRY(kernel_mul_mv_q4_0_f32_v3, block_q4_0, block_dot_lane_packed_fp16)
 BASIC_MV_ENTRY(kernel_mul_mv_q4_1_f32, block_q4_1, block_dot_lane_fp32)
-// Dormant literal Q4_1 V3 entry (packed-half products, float-only accumulation), sibling of the Q4_0 V3 entry above;
-// it does not enable host routing, the faithful fp32 entry stays the default.
-BASIC_MV_ENTRY(kernel_mul_mv_q4_1_f32_v3, block_q4_1, block_dot_lane_packed_fp16)
 kernel void kernel_mul_mv_q5_0_f32(
         constant ggml_metal_kargs_mul_mv & args,
         device const char * src0,
@@ -291,38 +286,18 @@ kernel void kernel_mul_mv_q5_0_f32(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]],
         ushort tidx [[thread_index_in_threadgroup]]) {
-    // Lane selection is a function constant: the faithful default and packed-half
-    // Q5_0 specialization compile as separate kernels with no hot-loop branch.
-    if (FC_matvec_lane == block_dot_lane_packed_fp16) {
-        if (FC_mul_mv_nr0 == N_R0_Q5_0) {
-            mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0, constant ggml_metal_kargs_mul_mv &, block_dot_lane_packed_fp16>(
-                    args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
-        } else if (FC_mul_mv_nr0 == 8) {
-            mul_vec_q_n_f32_impl<block_q5_0, 8, constant ggml_metal_kargs_mul_mv &, block_dot_lane_packed_fp16>(
-                    args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
-        } else {
-            mul_vec_q_n_f32_impl<block_q5_0, 4, constant ggml_metal_kargs_mul_mv &, block_dot_lane_packed_fp16>(
-                    args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
-        }
+    if (FC_mul_mv_nr0 == N_R0_Q5_0) {
+        mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0, constant ggml_metal_kargs_mul_mv &>(
+                args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
+    } else if (FC_mul_mv_nr0 == 8) {
+        mul_vec_q_n_f32_impl<block_q5_0, 8, constant ggml_metal_kargs_mul_mv &>(
+                args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
     } else {
-        if (FC_mul_mv_nr0 == N_R0_Q5_0) {
-            mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0, constant ggml_metal_kargs_mul_mv &>(
-                    args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
-        } else if (FC_mul_mv_nr0 == 8) {
-            mul_vec_q_n_f32_impl<block_q5_0, 8, constant ggml_metal_kargs_mul_mv &>(
-                    args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
-        } else {
-            mul_vec_q_n_f32_impl<block_q5_0, 4, constant ggml_metal_kargs_mul_mv &>(
-                    args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
-        }
+        mul_vec_q_n_f32_impl<block_q5_0, 4, constant ggml_metal_kargs_mul_mv &>(
+                args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
     }
 }
-// P11.65: literal packed-fp16 V3 entry (Q5_0); dormant, host routes to it only through a selected candidate.
-BASIC_MV_ENTRY(kernel_mul_mv_q5_0_f32_v3, block_q5_0, block_dot_lane_packed_fp16)
 BASIC_MV_ENTRY(kernel_mul_mv_q5_1_f32, block_q5_1, block_dot_lane_fp32)
-
-// P11.63: literal packed-fp16 V3 entry (Q5_1); dormant, host does not route to it.
-BASIC_MV_ENTRY(kernel_mul_mv_q5_1_f32_v3, block_q5_1, block_dot_lane_packed_fp16)
 
 #undef BASIC_MV_ENTRY
 
@@ -583,20 +558,4 @@ kernel void kernel_mul_mv_q8_0_f32_rows(
     } else {
         kernel_mul_mv_q8_0_f32_rows_impl<4>(args, src0, src1, dst, shmem, tgpig, tidx);
     }
-}
-
-// P11.63: literal packed-fp16 V3 entry (q8_0); the host does not route to it. Faithful default above stays fp32.
-[[host_name("kernel_mul_mv_q8_0_f32_v3")]]
-kernel void kernel_mul_mv_q8_0_f32_v3(
-        constant ggml_metal_kargs_mul_mv & args,
-        device const char * src0,
-        device const char * src1,
-        device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]],
-        ushort tidx [[thread_index_in_threadgroup]]) {
-
-    kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ggml_metal_kargs_mul_mv &, block_dot_lane_packed_fp16>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
 }

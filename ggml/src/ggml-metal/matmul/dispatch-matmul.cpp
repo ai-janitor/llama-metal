@@ -1,84 +1,18 @@
 // Matrix-matrix multiplication dispatch — simdgroup_mm (Apple Silicon) and tiled (AMD/Intel).
 // Extracted from dispatch.cpp to keep each dispatch strategy in its own file.
 #include "dispatch.h"
-
+#include "formats.h"
+#include "act-copy/act-copy.h"
+#include "lanes/select.h"
+#include "ggml-metal-probe.h"
 #include <cstdlib>
 #include <cstring>
-
-// Maps ggml_type to the suffix used in tiled kernel host_name instantiations.
-// Each entry corresponds to a `template [[host_name("kernel_mul_mat_tiled_<suffix>")]]`
-// line in kernel-tiled.metal. Adding a new tiled type = add one entry here + one
-// template instantiation there.
+GGML_METAL_FAMILY(matmul)
+// The suffix of a type's kernel_mul_mat_tiled_<suffix> entry in kernel-tiled.metal, or nullptr when it has none.
+// A new tiled type is the tiled cell of its row in formats.tsv and one template instantiation there.
 static const char * tiled_type_suffix(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_F16:     return "f16";
-        case GGML_TYPE_F32:     return "f32";
-        case GGML_TYPE_BF16:    return "bf16";
-        case GGML_TYPE_MXFP4:   return "mxfp4";
-        case GGML_TYPE_Q8_0:    return "q8_0";
-        case GGML_TYPE_Q4_0:    return "q4_0";
-        case GGML_TYPE_Q4_1:    return "q4_1";
-        case GGML_TYPE_Q5_0:    return "q5_0";
-        case GGML_TYPE_Q5_1:    return "q5_1";
-        case GGML_TYPE_IQ4_NL:  return "iq4_nl";
-        case GGML_TYPE_Q4_K:    return "q4_K";
-        case GGML_TYPE_Q5_K:    return "q5_K";
-        case GGML_TYPE_Q6_K:    return "q6_K";
-        case GGML_TYPE_Q2_K:    return "q2_K";
-        case GGML_TYPE_Q3_K:    return "q3_K";
-        case GGML_TYPE_IQ4_XS:  return "iq4_xs";
-        case GGML_TYPE_IQ2_XXS: return "iq2_xxs";
-        case GGML_TYPE_IQ2_XS:  return "iq2_xs";
-        case GGML_TYPE_IQ2_S:   return "iq2_s";
-        case GGML_TYPE_IQ3_XXS: return "iq3_xxs";
-        case GGML_TYPE_IQ3_S:   return "iq3_s";
-        case GGML_TYPE_IQ1_S:   return "iq1_s";
-        case GGML_TYPE_IQ1_M:   return "iq1_m";
-        default:                return nullptr;
-    }
-}
-
-// P17.12/P17.13: GGML_METAL_TILED_FP16_MUL=1 (exact string) requests the Q4_K packed-fp16 multiply
-// stage kernel (kernel_mul_mat_tiled_q4_K_v3, fp32 accumulation). Absent, empty, "0" or any other
-// value is false. P17.13: read at EVERY dispatch, never cached in a static, so an activation harness
-// that sets and restores the variable per row (fresh context) sees its own value; the earlier
-// process-wide latch pinned the first row's answer onto every later row. To undo: restore the
-// P17.12 version of this function and tiled_fp16_mul_trace from git history.
-static bool tiled_fp16_mul_requested() {
-    const char * value = std::getenv("GGML_METAL_TILED_FP16_MUL");
-    return value != nullptr && strcmp(value, "1") == 0;
-}
-
-// Diagnostics are opt-in: GGML_METAL_ACTIVATION_TRACE exactly "1" (same literal-"1" flag the GDN
-// route trace uses, ssm/ops-ssm.cpp). Default quiet. Read per call, no suppression state.
-static bool tiled_fp16_mul_trace_enabled() {
-    const char * value = std::getenv("GGML_METAL_ACTIVATION_TRACE");
-    return value != nullptr && strcmp(value, "1") == 0;
-}
-
-// One line per ACTUAL route taken while the request flag is set (no once/set/lock: a runner counts
-// every row). effective=1 only after the v3 pipeline was submitted; effective=0 = requested but the
-// default tiled kernel (or mul_mv fallback) ran instead. Field layout is unchanged from P17.12.
-bool ggml_metal_tiled_fp16_mul_admitted(ggml_metal_op_t ctx, int idx) {
-    if (!tiled_fp16_mul_requested()) return false;
-
-    const ggml_tensor * op = ctx->node(idx);
-    const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
-
-    return op->src[0]->type == GGML_TYPE_Q4_K &&
-        profile->vendor == GGML_GPU_VENDOR_AMD &&
-        !profile->has_matrix_hw &&
-        op->src[1]->type == GGML_TYPE_F32 &&
-        !ggml_is_transposed(op->src[0]) &&
-        !ggml_is_transposed(op->src[1]) &&
-        op->src[0]->ne[1] >= 64 &&           // same BM=64 tile guard as the tiled path
-        op->src[1]->ne[1] > NE11_MM_MIN;     // same long-prompt threshold as the tiled path
-}
-
-static void tiled_fp16_mul_trace(bool effective, const char * kernel, int64_t ne11, int64_t batch, const char * why) {
-    if (!tiled_fp16_mul_trace_enabled()) return;
-    GGML_LOG_INFO("ggml-metal: tiled fp16 mul requested=1 effective=%d kernel=%s ne11=%lld batch=%lld (%s)\n",
-                  effective ? 1 : 0, kernel, (long long) ne11, (long long) batch, why);
+    const struct mv_format_row * row = ggml_metal_mv_format(type);
+    return row != nullptr && row->tiled ? ggml_type_name(type) : nullptr;
 }
 
 int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
@@ -107,11 +41,9 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
     // =========================================================================
     // simdgroup_mm path — Apple Silicon (M1+/A14+) with hardware matrix support.
     // =========================================================================
-    if (!ggml_is_transposed(op->src[0]) &&
-        !ggml_is_transposed(op->src[1]) &&
-        // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
-        // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
-        profile->has_matrix_hw && ne00 >= 64 && ne11 > NE11_MM_MIN) {
+    // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
+    // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
+    if (ggml_metal_mm_route_takes(profile->has_matrix_hw, op)) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         // some Metal matrix data types require aligned pointers
@@ -159,13 +91,7 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
     // =========================================================================
     // Tiled matmul path — for non-simdgroup_mm GPUs (AMD Radeon, Intel UHD).
     // =========================================================================
-    if (!ggml_is_transposed(op->src[0]) &&
-        !ggml_is_transposed(op->src[1]) &&
-        !profile->has_matrix_hw &&
-        ne01 >= 64 &&  // need at least one full BM=64 tile — tiny M wastes tile compute and risks timeout
-        ne11 > NE11_MM_MIN &&
-        tiled_type_suffix(op->src[0]->type) != nullptr &&
-        op->src[1]->type == GGML_TYPE_F32) {
+    if (ggml_metal_batch_route(ctx, idx) == MV_BATCH_TILED) {
 
         // Tiled matmul for non-simdgroup_mm GPUs (AMD Radeon, Intel UHD)
         // Kernel name built from type suffix — matches template instantiations in kernel-tiled.metal
@@ -177,29 +103,18 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
         char kernel_name[64];
         snprintf(kernel_name, sizeof(kernel_name), "kernel_mul_mat_tiled_%s", tiled_type_suffix(op->src[0]->type));
 
-        // P17.12: opt-in Q4_K packed-fp16 multiply entry, AMD only. The distinct kernel name keeps
-        // pipeline cache identity separate from the default entry; nothing else changes.
-        const char * fp16_mul_env = std::getenv("GGML_METAL_TILED_FP16_MUL");
-        if (fp16_mul_env != nullptr && fp16_mul_env[0] != '\0' && strcmp(fp16_mul_env, "0") != 0 &&
-            strcmp(fp16_mul_env, "1") != 0 && tiled_fp16_mul_trace_enabled()) {
-            // malformed value stays off; reported per call, only under the diagnostic flag
-            GGML_LOG_WARN("ggml-metal: GGML_METAL_TILED_FP16_MUL='%s' is invalid; using the default tiled kernel\n", fp16_mul_env);
-        }
-        // P17.14: identical admission to the ext strategy's step-aside (shared helper).
-        const bool fp16_mul_wanted = ggml_metal_tiled_fp16_mul_admitted(ctx, idx);
-        const int64_t fp16_mul_batch = (int64_t) ne12 * ne13;
-        bool fp16_mul_effective = false;
+        // Activations read from a copy at the model's precision when this card's row says so. A missing entry for
+        // the weight type leaves the op on the f32 kernel.
         ggml_metal_pipeline_with_params pipeline = {};
-        if (fp16_mul_wanted) {
-            char v3_name[64];
-            snprintf(v3_name, sizeof(v3_name), "%s_v3", kernel_name);
-            pipeline = ggml_metal_library_compile_pipeline(lib, v3_name, v3_name, NULL);
+        struct ggml_metal_act_plan act = ggml_metal_act_copy_plan(ctx, idx, GGML_METAL_LANE_FAMILY_MATMUL, GGML_METAL_LANE_ROUTE_MM_TILED, op->src[1], (ne01 + 63)/64);
+        if (act.applies) {
+            char act_name[64];
+            snprintf(act_name, sizeof(act_name), "%s_a%s", kernel_name, ggml_type_name(act.type));
+            pipeline = ggml_metal_library_compile_pipeline(lib, act_name, act_name, NULL);
             if (pipeline.pipeline) {
-                snprintf(kernel_name, sizeof(kernel_name), "%s", v3_name);
-                fp16_mul_effective = true;
+                snprintf(kernel_name, sizeof(kernel_name), "%s", act_name);
             } else {
-                // compile/pipeline failure: ordinary kernel below, logged as requested-not-effective
-                tiled_fp16_mul_trace(false, v3_name, ne11, fp16_mul_batch, "v3 pipeline unavailable, using default tiled kernel");
+                act.applies = 0;
             }
         }
         if (!pipeline.pipeline) {
@@ -208,11 +123,7 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
         if (pipeline.pipeline) {
             ggml_metal_pipeline_set_min_family(pipeline.pipeline, GGML_METAL_FAMILY_COMMON1); // no simd intrinsics needed
 
-            uint8_t verified = GGML_METAL_VERIFIED_AMD;
-            if (op->src[0]->type != GGML_TYPE_MXFP4) {
-                verified |= GGML_METAL_VERIFIED_INTEL;  // f16 tiled OK on Intel, mxfp4 tiled is not
-            }
-            ggml_metal_pipeline_set_verified_vendors(pipeline.pipeline, verified);
+            ggml_metal_pipeline_set_verified_vendors(pipeline.pipeline, ggml_metal_tiled_verified_vendors(op->src[0]->type));
         }
 
         // Vendor verification
@@ -224,9 +135,6 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
                 vendor_ok = true;
             } else {
                 GGML_LOG_WARN("%s: mul_mat_tiled NOT VERIFIED on vendor %d — falling back to mul_mv\n", __func__, profile->vendor);
-                if (fp16_mul_wanted) {
-                    tiled_fp16_mul_trace(false, kernel_name, ne11, fp16_mul_batch, "vendor not verified, falling back to mul_mv");
-                }
             }
         }
 
@@ -253,6 +161,14 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
             /*.tg_x_offset =*/ 0,
         };
 
+        if (act.applies) {
+            ggml_metal_act_copy_encode(ctx, idx, &act, op->src[1]);
+            args.nb10 = act.nb[0];
+            args.nb11 = act.nb[1];
+            args.nb12 = act.nb[2];
+            args.nb13 = act.nb[3];
+        }
+
         const size_t smem = 2 * BM * SHMEM_STRIDE * 2 * sizeof(float);  // ~17KB (float2 = 2 floats)
 
         const int32_t tiled_grid_x = ((ne01 + BM - 1)/BM);
@@ -264,7 +180,7 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
-        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, act.applies ? act.bid : ggml_metal_get_buffer_id(op->src[1]), 2);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -294,10 +210,6 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
 
         // P17.13: positive route evidence AFTER the dispatches above were submitted, and never for a
         // zero grid (nothing was dispatched then). Positive only when the v3 pipeline is the one used.
-        if (fp16_mul_wanted && tiled_total_tg > 0) {
-            tiled_fp16_mul_trace(fp16_mul_effective, kernel_name, ne11, fp16_mul_batch,
-                                 fp16_mul_effective ? "dispatched packed-fp16 multiply" : "dispatched default tiled kernel");
-        }
             return 1;  // dispatched
         }
     }

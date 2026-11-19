@@ -1,6 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
-
-int ggml_metal_op_irfft(ggml_metal_op_t ctx, int idx) {
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(fft) int ggml_metal_op_irfft(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -36,7 +36,7 @@ int ggml_metal_op_irfft(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_fold(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_fold(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

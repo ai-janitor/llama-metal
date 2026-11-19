@@ -1,8 +1,8 @@
 #include "../ops/ggml-metal-ops-internal.h"
-
+#include "ggml-metal-probe.h"
 #include <cstring>
-
-int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+GGML_METAL_FAMILY(ssm)
+int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -113,7 +113,7 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
 
 // CONCAT + CPY + SSM_CONV + silu of one decode token in one launch (GGML_METAL_FUSION_CONV_STATE);
 // returns 0 when the table does not match, so the four nodes encode as before.
-int ggml_metal_op_conv_state(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_conv_state(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     if (!ctx->use_fusion) {
         return 0;
     }
@@ -207,7 +207,7 @@ int ggml_metal_op_conv_state(ggml_metal_op_t ctx, int idx) {
     return n;
 }
 
-int ggml_metal_op_ssm_scan(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_ssm_scan(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -305,7 +305,7 @@ int ggml_metal_op_ssm_scan(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -346,7 +346,43 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_gated_linear_attn(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    // k, v, q, g: {head_size, n_head, n_tokens}; state: {head_size*head_size*n_head, n_seqs}
+    const int32_t head_size = op->src[0]->ne[0];
+    const int32_t n_head    = op->src[0]->ne[1];
+    const int32_t n_tokens  = op->src[0]->ne[2];
+    const int32_t n_seqs    = op->src[4]->ne[1];
+
+    ggml_metal_kargs_gla args = {
+        /*.head_size    =*/ head_size,
+        /*.n_head       =*/ n_head,
+        /*.n_seq_tokens =*/ n_tokens/n_seqs,
+        /*.n_seqs       =*/ n_seqs,
+        /*.scale        =*/ ggml_get_op_params_f32(op, 0),
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_base(lib, GGML_OP_GATED_LINEAR_ATTN);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 4);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 5);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         6);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_seqs*n_head, 1, 1, head_size, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -406,7 +442,7 @@ int ggml_metal_op_solve_tri(ggml_metal_op_t ctx, int idx) {
 
 // Reference: ggml-org/llama.cpp 4e5116f47, ggml-metal-ops.cpp:2062 (MIT).
 // INTENT/PDL: bind q/k/v and shared geometry; FU-MU-14 writes snapshots directly into the cache when matched.
-int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

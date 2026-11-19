@@ -1,16 +1,16 @@
 #include "../ggml-metal-device.h"
 #include "../ggml-metal-impl.h"
 #include "../ggml-impl.h"
-
+#include "ggml-metal-probe.h"
 #include <cassert>
 #include <memory>
 #include <string>
-
+GGML_METAL_FAMILY(flash_attn)
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_pad(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         bool    has_mask,
-        int32_t ncpsg) {
+        int32_t ncpsg) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_UNUSED(op);
 
@@ -56,7 +56,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_b
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         int32_t nqptg,
-        int32_t ncpsg) {
+        int32_t ncpsg) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_UNUSED(op);
 
@@ -106,7 +106,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         bool    has_bias,
         bool    has_scap,
         bool    has_kvpad,
-        int32_t nsg) {
+        int32_t nsg) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -175,7 +175,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         bool    has_scap,
         bool    has_kvpad,
         int32_t nsg,
-        int32_t nwg) {
+        int32_t nwg) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -235,7 +235,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_library_t lib,
         const ggml_tensor * op,
         int32_t dv,
-        int32_t nwg) {
+        int32_t nwg) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
     char base[256];
@@ -262,4 +262,22 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     return res;
 
     GGML_UNUSED(op);
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer(ggml_metal_library_t lib, int kv_code) { GGML_METAL_ZONE_BEGIN(pipeline);
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_lightning_indexer_scalar");
+    snprintf(name, 256, "%s_kv=%d", base, kv_code);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int32(cv, kv_code, FC_FLASH_ATTN_EXT_SCALAR + 0);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
 }

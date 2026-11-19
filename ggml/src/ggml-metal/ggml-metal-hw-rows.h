@@ -1,4 +1,4 @@
-// Generated hardware rows (input SHA-256 b949e40e2ab6). Do not edit.
+// Generated hardware rows (input SHA-256 96ed142a0476). Do not edit.
 #pragma once
 
 #include <stdint.h>
@@ -14,7 +14,6 @@ struct ggml_metal_hw_row {
     int32_t      l1_cache_per_cu; // bytes
     int32_t      l2_cache_total;  // bytes
     int64_t      local_bw;        // bytes/s
-    int32_t      int_dot;
     int32_t      simd_sum_w64_ok;
     int32_t      mv_reduce;       // matvec row-sum tail: 0 serial, 1 tree
     int32_t      f_scalar_w64;    // f16 and bf16 scalar matvec at width 64: 1 on, 0 off
@@ -32,12 +31,24 @@ struct ggml_metal_hw_row {
 };
 
 static const struct ggml_metal_hw_row ggml_metal_hw_rows[] = {
-    { 0x1002, 0x6798, "FirePro D700 (GCN 1.0, Tahiti)", "gcn1", 64, 32, 16384, 786432, 263000000000LL, -1, 1, 1, 1, 1, 1, 1, 1, 4, 4, 16384, 16, 1, 1, 1 },
-    { 0x1002, 0x7340, "Radeon Pro 5500M (RDNA 1, Navi 14)", "rdna1", 32, 24, 16384, 4194304, 192000000000LL, -1, -1, -1, 0, 1, 1, 0, 0, 4, 1, -1, -1, 1, 1, -1 },
-    { 0x1002, 0x6860, "Radeon Pro Vega 64 (GCN 5, Vega 10)", "gcn5", 64, -1, 16384, 4194304, -1LL, -1, 1, 0, 1, 1, 1, 1, 1, 4, 4, -1, -1, 1, 1, -1 },
+    { 0x1002, 0x6798, "FirePro D700 (GCN 1.0, Tahiti)", "gcn1", 64, 32, 16384, 786432, 263000000000LL, 1, 1, 1, 1, 1, 1, 1, 4, 4, 16384, 16, 1, 1, 1 },
+    { 0x1002, 0x7340, "Radeon Pro 5500M (RDNA 1, Navi 14)", "rdna1", 32, 24, 16384, 4194304, 192000000000LL, -1, -1, 0, 1, 1, 0, 0, 4, 1, -1, -1, 1, 1, -1 },
+    { 0x1002, 0x6860, "Radeon Pro Vega 64 (GCN 5, Vega 10)", "gcn5", 64, -1, 16384, 4194304, -1LL, 1, 0, 1, 1, 1, 1, 1, 4, 4, -1, -1, 1, 1, -1 },
 };
 
 static const int ggml_metal_hw_rows_n = (int) (sizeof(ggml_metal_hw_rows) / sizeof(ggml_metal_hw_rows[0]));
+
+#ifdef GGML_METAL_PROBES
+struct ggml_metal_probe_hw_row {
+    uint32_t vendor, device;
+    int8_t dispatch, stage, blit, timestamp;
+};
+static const struct ggml_metal_probe_hw_row ggml_metal_probe_hw_rows[] = {
+    { 0x1002, 0x6798, 1, 0, 1, 1 },
+    { 0x1002, 0x7340, 1, 0, 1, 1 },
+    { 0x1002, 0x6860, 1, 0, 1, 1 },
+};
+#endif
 
 // Per-shape matvec rows (input SHA-256 215baa62ef82). See ggml_device_mv_row in ggml-device-profile.h.
 // { pci_vendor, pci_device, kind (0 single, 1 group), ggml_type, ne00, ne01, nr0, prep, cols, form }; the last row is the end mark
@@ -84,13 +95,3 @@ static const struct ggml_device_mv_row ggml_metal_hw_mv_rows[] = {
 };
 
 static const int ggml_metal_hw_mv_rows_n = (int) (sizeof(ggml_metal_hw_mv_rows) / sizeof(ggml_metal_hw_mv_rows[0])) - 1;
-
-// Minimum column count for mul_mv_ext by K-quant type (input SHA-256 60e0f5884801).
-// { pci_vendor, pci_device, ggml_type, ext_min }; the last row is the end mark
-static const struct ggml_device_mv_ext_min ggml_metal_hw_mv_ext_min[] = {
-    { 0x1002, 0x6798, 12, 5 },
-    { 0x1002, 0x6798, 14, 5 },
-    { 0, 0, 0, 0 },
-};
-
-static const int ggml_metal_hw_mv_ext_min_n = (int) (sizeof(ggml_metal_hw_mv_ext_min) / sizeof(ggml_metal_hw_mv_ext_min[0])) - 1;

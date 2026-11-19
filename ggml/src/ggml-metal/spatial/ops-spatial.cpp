@@ -1,6 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
-
-int ggml_metal_op_upscale(ggml_metal_op_t ctx, int idx) {
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(spatial) int ggml_metal_op_upscale(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -53,7 +53,7 @@ int ggml_metal_op_upscale(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -80,7 +80,11 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
         /*.nb0  =*/ nb0,
         /*.nb1  =*/ nb1,
         /*.nb2  =*/ nb2,
-        /*.nb3  =*/ nb3
+        /*.nb3  =*/ nb3,
+        /*.lp0  =*/ ggml_get_op_params_i32(op, 0),
+        /*.lp1  =*/ ggml_get_op_params_i32(op, 2),
+        /*.lp2  =*/ ggml_get_op_params_i32(op, 4),
+        /*.lp3  =*/ ggml_get_op_params_i32(op, 6),
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_pad(lib, op);
@@ -97,7 +101,7 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_pad_reflect_1d(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_pad_reflect_1d(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -143,7 +147,7 @@ int ggml_metal_op_pad_reflect_1d(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_arange(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_arange(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -177,7 +181,7 @@ int ggml_metal_op_arange(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -211,7 +215,7 @@ int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_argsort(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_argsort(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -318,7 +322,7 @@ int ggml_metal_op_argsort(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -430,7 +434,7 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_tri(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_tri(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

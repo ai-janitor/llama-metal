@@ -1,6 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
-
-int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(rope) int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -77,6 +77,7 @@ int ggml_metal_op_rope(ggml_metal_op_t ctx, int idx) {
         /* sect_3      =*/ sect_3,
         /* n_offs      =*/ ggml_get_op_params_i32(op, 15),
         /* src2        =*/ op->src[2] != nullptr,
+        /* no_trunc    =*/ ggml_get_op_params_i32(op, 3),
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_rope(lib, op);

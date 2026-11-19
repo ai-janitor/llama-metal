@@ -2,8 +2,8 @@
 #include "../ops/ggml-metal-ops-internal.h"
 #include <cstdio>
 #include <cstring>
-
-static ggml_metal_pipeline_with_params small_pipeline(ggml_metal_library_t lib,
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(norm) static ggml_metal_pipeline_with_params small_pipeline(ggml_metal_library_t lib,
         const char * base, bool c4) {
     char name[128];
     std::snprintf(name, sizeof(name), "%s%s", base, c4 ? "_4" : "");
@@ -87,7 +87,7 @@ static int small_encode_gate(ggml_metal_op_t ctx, int idx, int count) {
 
 // The split_l2 (node index in ctx) whose two norms read the q and k heads of this conv output as consecutive
 // contiguous rows from offset 0, when the small fusion would take it as one launch; -1 otherwise.
-int ggml_metal_op_conv_l2_target(ggml_metal_op_t ctx, int from, const ggml_tensor * conv_out) {
+int ggml_metal_op_conv_l2_target(ggml_metal_op_t ctx, int from, const ggml_tensor * conv_out) { GGML_METAL_ZONE_BEGIN(encode);
     for (int j = from; j + 3 < ctx->n_nodes(); ++j) {
         const ggml_tensor * norm0 = ctx->node(j);
         if (norm0->op != GGML_OP_RMS_NORM) {
@@ -187,7 +187,7 @@ static int small_encode_norm(ggml_metal_op_t ctx, int idx, int count, bool gated
 }
 
 // Gate copy, sigmoid, attention output copy and multiply as one launch; 1 when the four nodes do not line up.
-int ggml_metal_op_attn_gate(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_attn_gate(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     if (idx + 3 >= ctx->n_nodes() || ctx->node(idx)->op != GGML_OP_CONT) {
         return 1;
     }
@@ -255,7 +255,7 @@ int ggml_metal_op_attn_gate(ggml_metal_op_t ctx, int idx) {
 }
 
 // Residual add, the rms norm of its sum and the weight multiply as one launch; 1 when the nodes do not line up.
-int ggml_metal_op_add_norm(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_add_norm(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     if (idx + 2 >= ctx->n_nodes()) {
         return 1;
     }
@@ -306,7 +306,7 @@ int ggml_metal_op_add_norm(ggml_metal_op_t ctx, int idx) {
     return 3;
 }
 
-int ggml_metal_op_fuse_small(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_fuse_small(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     const ggml_op op = ctx->node(idx)->op;
     if (op != GGML_OP_ADD && op != GGML_OP_RMS_NORM) {
         return 1;

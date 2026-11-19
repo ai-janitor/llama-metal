@@ -1,11 +1,11 @@
 #include "sampling.h"
-
+#include "../ggml/src/ggml-metal/ggml-metal-probe.h"
 #include "common.h"
 #include "fit.h"
 #include "gpu-pick.h"
 #include "log.h"
 #include "reasoning-budget.h"
-
+GGML_METAL_FAMILY(sampling)
 #include "ggml.h"
 
 #include <algorithm>
@@ -667,7 +667,7 @@ void common_sampler_set_gpu_pick(struct common_sampler * gsmpl, bool on) {
     gsmpl->gpu_pick = on;
 }
 
-llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) { GGML_METAL_ZONE_BEGIN(sample);
     llama_synchronize(ctx);
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations

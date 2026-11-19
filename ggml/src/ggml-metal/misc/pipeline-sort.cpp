@@ -1,12 +1,12 @@
 #include "../ggml-metal-device.h"
 #include "../ggml-metal-impl.h"
 #include "ggml-impl.h"
-
+#include "ggml-metal-probe.h"
 #include <cassert>
 #include <memory>
 #include <string>
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_metal_library_t lib, const ggml_tensor * op) {
+GGML_METAL_FAMILY(misc)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous_1(op->src[0]));
     GGML_ASSERT(op->src[0]->nb[0] == ggml_type_size(op->src[0]->type));
@@ -27,7 +27,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_meta
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax_w4(ggml_metal_library_t lib) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax_w4(ggml_metal_library_t lib) { GGML_METAL_ZONE_BEGIN(pipeline);
     const char * name = "kernel_argmax_f32_w4";
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -40,7 +40,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax_w4(ggml_m
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_ARGSORT);
 
     char base[256];
@@ -66,7 +66,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort(ggml_met
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_ARGSORT);
 
     char base[256];
@@ -93,7 +93,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge(gg
 }
 
 // note: reuse the argsort kernel for top_k
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_TOP_K);
 
     char base[256];
@@ -120,7 +120,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k(ggml_metal
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_TOP_K);
 
     char base[256];

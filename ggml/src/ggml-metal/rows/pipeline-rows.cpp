@@ -1,12 +1,12 @@
 #include "../ggml-metal-device.h"
 #include "../ggml-metal-impl.h"
 #include "ggml-impl.h"
-
+#include "ggml-metal-probe.h"
 #include <cassert>
 #include <memory>
 #include <string>
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows(ggml_metal_library_t lib, ggml_type tsrc) {
+GGML_METAL_FAMILY(rows)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows(ggml_metal_library_t lib, ggml_type tsrc) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 
@@ -21,7 +21,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows(ggml_me
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows(ggml_metal_library_t lib, ggml_type tidx, ggml_type tdst) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_set_rows(ggml_metal_library_t lib, ggml_type tidx, ggml_type tdst) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 

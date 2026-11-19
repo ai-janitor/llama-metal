@@ -38,17 +38,20 @@ kernel void kernel_pad_f32(
     const int64_t i2 = tgpig.y;
     const int64_t i1 = tgpig.x;
 
-    const int64_t i03 = i3;
-    const int64_t i02 = i2;
-    const int64_t i01 = i1;
+    // source indices: the destination shifted back by the left pads
+    const int64_t i03 = i3 - args.lp3;
+    const int64_t i02 = i2 - args.lp2;
+    const int64_t i01 = i1 - args.lp1;
 
-    device const float * src0_ptr = (device const float *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
-    device       float * dst_ptr  = (device       float *) (dst  +  i3*args.nb3  +  i2*args.nb2  +  i1*args.nb1);
+    device float * dst_ptr = (device float *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1);
 
-    if (i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
+    if (i01 >= 0 && i01 < args.ne01 && i02 >= 0 && i02 < args.ne02 && i03 >= 0 && i03 < args.ne03) {
+        device const float * src0_ptr = (device const float *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+
         for (int i0 = tpitg.x; i0 < args.ne0; i0 += ntg.x) {
-            if (i0 < args.ne00) {
-                dst_ptr[i0] = src0_ptr[i0];
+            const int i00 = i0 - args.lp0;
+            if (i00 >= 0 && i00 < args.ne00) {
+                dst_ptr[i0] = *(device const float *)((device const char *) src0_ptr + i00*args.nb00);
             } else {
                 dst_ptr[i0] = 0.0f;
             }

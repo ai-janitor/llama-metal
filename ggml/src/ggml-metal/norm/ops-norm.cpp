@@ -1,6 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
-
-int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) {
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(norm) int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -68,7 +68,7 @@ int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -114,12 +114,12 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, ngrp, 1, 1, nth, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ngrp, ne03, 1, nth, 1, 1);
 
     return 1;
 }
 
-int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

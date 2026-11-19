@@ -1,6 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
-
-int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) {
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(reduction) int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op  = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -37,7 +37,7 @@ int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_sum_rows(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_sum_rows(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -78,6 +78,7 @@ int ggml_metal_op_sum_rows(ggml_metal_op_t ctx, int idx) {
     if (pipeline.c4) {
         args.ne00 = ne00/4;
         args.ne0  = ne0/4;
+        args.nb00 = 4*nb00; // the kernel steps by nb00 per float4
     }
 
     int nth = 32; // SIMD width
@@ -103,7 +104,7 @@ int ggml_metal_op_sum_rows(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -118,7 +119,8 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) {
 
     auto pipeline_blk = ggml_metal_library_get_pipeline_cumsum_blk(lib, op);
 
-    int nth = 1;
+    // at least one full wave: the kernel stores a wave sum from its last lane
+    int nth = ggml_metal_library_get_simd_width(lib);
     while (nth < ne00 && 2*nth <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_blk)) {
         nth *= 2;
     }

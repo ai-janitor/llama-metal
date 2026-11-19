@@ -38,18 +38,8 @@ struct ggml_metal_test_override_row {
 };
 
 // Registry. Add a row only after its candidate family has a verified record.
-// P11.65: nine scalar mul_mv rows (variant 3 / contract 3) select the dormant packed-fp16 V3 entries; other formats stay unsupported until they have their own row.
 static const struct ggml_metal_test_override_row ggml_metal_test_override_rows[] = {
     { "q4_k_grouped", 3, "kernel_mul_mv_grouped_kquant_f32", 3, "kernel_mul_mv_grouped_kquant_f32" },
-    { "q2_k_scalar", 3, "kernel_mul_mv_q2_K_f32", 3, "kernel_mul_mv_q2_K_f32_v3" },
-    { "q3_k_scalar", 3, "kernel_mul_mv_q3_K_f32", 3, "kernel_mul_mv_q3_K_f32_v3" },
-    { "q4_0_scalar", 3, "kernel_mul_mv_q4_0_f32", 3, "kernel_mul_mv_q4_0_f32_v3" },
-    { "q4_1_scalar", 3, "kernel_mul_mv_q4_1_f32", 3, "kernel_mul_mv_q4_1_f32_v3" },
-    { "q5_0_scalar", 3, "kernel_mul_mv_q5_0_f32", 3, "kernel_mul_mv_q5_0_f32_v3" },
-    { "q5_1_scalar", 3, "kernel_mul_mv_q5_1_f32", 3, "kernel_mul_mv_q5_1_f32_v3" },
-    { "q5_k_scalar", 3, "kernel_mul_mv_q5_K_f32", 3, "kernel_mul_mv_q5_K_f32_v3" },
-    { "q6_k_scalar", 3, "kernel_mul_mv_q6_K_f32", 3, "kernel_mul_mv_q6_K_f32_v3" },
-    { "q8_0_scalar", 3, "kernel_mul_mv_q8_0_f32", 3, "kernel_mul_mv_q8_0_f32_v3" },
 };
 
 enum ggml_metal_test_override_status {

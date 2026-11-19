@@ -67,6 +67,7 @@
 #include "ggml-model-profile.h"
 #include "ggml.h"
 #include "../ggml-metal-impl.h"
+#include "formats.h"
 
 // Compute optimal NR0 (rows per simdgroup) for a given matmul operation.
 //
@@ -153,6 +154,12 @@ static inline int ggml_metal_compute_nr0_basic(
 // Validated on D700 (GCN) — 2026-03-29.
 // Other devices require re-benchmarking before adopting non-default values.
 
+// Float and q8_0 matvec kernels take nr0 rows per threadgroup; every other format takes nr0 rows per simdgroup.
+static inline bool ggml_metal_mv_rows_per_threadgroup(enum ggml_type type) {
+    const struct mv_format_row * row = ggml_metal_mv_format(type);
+    return row && row->rows_per_threadgroup;
+}
+
 struct mv_tuning {
     int nsg;  // simdgroups per threadgroup
     int nr0;  // rows per simdgroup
@@ -163,27 +170,9 @@ struct mv_tuning {
 static inline struct mv_tuning ggml_metal_get_mv_tuning(
         const struct ggml_device_profile * hw, enum ggml_type type) {
     (void) hw;
-    switch (type) {
-        case GGML_TYPE_Q4_0: return mv_tuning{N_SG_Q4_0, N_R0_Q4_0};
-        case GGML_TYPE_Q4_1: return mv_tuning{N_SG_Q4_1, N_R0_Q4_1};
-        case GGML_TYPE_Q5_0: return mv_tuning{N_SG_Q5_0, N_R0_Q5_0};
-        case GGML_TYPE_Q5_1: return mv_tuning{N_SG_Q5_1, N_R0_Q5_1};
-        case GGML_TYPE_Q8_0: return mv_tuning{N_SG_Q8_0, N_R0_Q8_0};
-        case GGML_TYPE_Q2_K: return mv_tuning{N_SG_Q2_K, N_R0_Q2_K};
-        case GGML_TYPE_Q3_K: return mv_tuning{N_SG_Q3_K, N_R0_Q3_K};
-        case GGML_TYPE_Q4_K: return mv_tuning{N_SG_Q4_K, N_R0_Q4_K};
-        case GGML_TYPE_Q5_K: return mv_tuning{N_SG_Q5_K, N_R0_Q5_K};
-        case GGML_TYPE_Q6_K: return mv_tuning{N_SG_Q6_K, N_R0_Q6_K};
-        case GGML_TYPE_IQ1_S: return mv_tuning{N_SG_IQ1_S, N_R0_IQ1_S};
-        case GGML_TYPE_IQ1_M: return mv_tuning{N_SG_IQ1_M, N_R0_IQ1_M};
-        case GGML_TYPE_IQ2_XXS: return mv_tuning{N_SG_IQ2_XXS, N_R0_IQ2_XXS};
-        case GGML_TYPE_IQ2_XS: return mv_tuning{N_SG_IQ2_XS, N_R0_IQ2_XS};
-        case GGML_TYPE_IQ2_S: return mv_tuning{N_SG_IQ2_S, N_R0_IQ2_S};
-        case GGML_TYPE_IQ3_XXS: return mv_tuning{N_SG_IQ3_XXS, N_R0_IQ3_XXS};
-        case GGML_TYPE_IQ3_S: return mv_tuning{N_SG_IQ3_S, N_R0_IQ3_S};
-        case GGML_TYPE_IQ4_NL: return mv_tuning{N_SG_IQ4_NL, N_R0_IQ4_NL};
-        case GGML_TYPE_IQ4_XS: return mv_tuning{N_SG_IQ4_XS, N_R0_IQ4_XS};
-        case GGML_TYPE_MXFP4: return mv_tuning{N_SG_MXFP4, N_R0_MXFP4};
-        default: return mv_tuning{N_SG_Q8_0, N_R0_Q8_0};
+    const struct mv_format_row * row = ggml_metal_mv_format(type);
+    if (row && row->nsg > 0) {
+        return mv_tuning{row->nsg, row->nr0};
     }
+    return mv_tuning{N_SG_Q8_0, N_R0_Q8_0};
 }

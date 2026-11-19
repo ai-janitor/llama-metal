@@ -202,6 +202,11 @@ add_library(ggml-base
             ggml-quants.h
             gguf.cpp)
 
+if (GGML_METAL AND GGML_METAL_PROBES)
+    target_sources(ggml-base PRIVATE ggml-metal/ggml-metal-probe.c)
+    target_compile_definitions(ggml-base PUBLIC GGML_METAL_PROBES)
+endif()
+
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}
     SOVERSION ${GGML_VERSION_MAJOR}

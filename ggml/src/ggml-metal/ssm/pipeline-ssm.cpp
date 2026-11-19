@@ -1,13 +1,13 @@
 #include "../ggml-metal-device.h"
 #include "../ggml-metal-impl.h"
 #include "../ggml-impl.h"
-
+#include "ggml-metal-probe.h"
 #include <algorithm>
 #include <cassert>
 #include <memory>
 #include <string>
-
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(ggml_metal_library_t lib, const ggml_tensor * op, bool use_silu) {
+GGML_METAL_FAMILY(ssm)
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(ggml_metal_library_t lib, const ggml_tensor * op, bool use_silu) { GGML_METAL_ZONE_BEGIN(pipeline);
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
 
@@ -37,7 +37,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(ggml_me
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state_l2(ggml_metal_library_t lib) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state_l2(ggml_metal_library_t lib) { GGML_METAL_ZONE_BEGIN(pipeline);
     const char * name = "kernel_ssm_conv_state_l2_f32_4";
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -48,7 +48,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state_l2(gg
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state(ggml_metal_library_t lib, int nc) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state(ggml_metal_library_t lib, int nc) { GGML_METAL_ZONE_BEGIN(pipeline);
     // same _4 rule as the conv it replaces (the weight width)
     const char * name = nc % 4 == 0 ? "kernel_ssm_conv_state_f32_4" : "kernel_ssm_conv_state_f32";
 
@@ -60,7 +60,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_state(ggml_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched(ggml_metal_library_t lib, const ggml_tensor * op, int ssm_conv_bs, bool use_silu) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched(ggml_metal_library_t lib, const ggml_tensor * op, int ssm_conv_bs, bool use_silu) { GGML_METAL_ZONE_BEGIN(pipeline);
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
 
@@ -93,7 +93,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_metal_library_t lib, const ggml_tensor * op)  {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_metal_library_t lib, const ggml_tensor * op)  { GGML_METAL_ZONE_BEGIN(pipeline);
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
 
     char base[256];
@@ -122,7 +122,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_me
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 
@@ -160,7 +160,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv(ggml_metal_
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 
@@ -195,7 +195,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_m
 }
 
 // Reference: upstream 4e5116f47 getter (MIT); split follows simd_width/thread limit.
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     char base[256];
     char name[256];
 

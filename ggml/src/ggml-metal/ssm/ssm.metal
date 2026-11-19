@@ -784,3 +784,52 @@ typedef decltype(kernel_gated_delta_net_impl<4>) kernel_gated_delta_net_t;
 template [[host_name("kernel_gated_delta_net_f32_1")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<1>;
 template [[host_name("kernel_gated_delta_net_f32_2")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<2>;
 template [[host_name("kernel_gated_delta_net_f32_4")]] kernel kernel_gated_delta_net_t kernel_gated_delta_net_impl<4>;
+
+// Gated linear attention, ref: ggml-cpu ggml_compute_forward_gla_f32.
+// One threadgroup per (sequence, head), one thread per column j of the head's state matrix.
+kernel void kernel_gated_linear_attn_f32(
+    constant ggml_metal_kargs_gla & args,
+    device const float * k,
+    device const float * v,
+    device const float * q,
+    device const float * g,
+    device const float * state_in,
+    device       float * dst,
+    uint3   tgpig[[threadgroup_position_in_grid]],
+    ushort3 tpitg[[thread_position_in_threadgroup]]) {
+    const int hs  = args.head_size;
+    const int C   = hs*args.n_head;
+    const int seq = tgpig.x / args.n_head;
+    const int h   = tgpig.x % args.n_head;
+    const int j   = tpitg.x;
+
+    // column j of the state: state[i] = S[i][j]
+    float state[128];
+
+    const int s_off = seq*hs*C + h*hs*hs + j;
+
+    for (int i = 0; i < hs; ++i) {
+        state[i] = state_in[s_off + i*hs];
+    }
+
+    for (int t = 0; t < args.n_seq_tokens; ++t) {
+        const int base = (seq*args.n_seq_tokens + t)*C + h*hs;
+
+        const float v_val = v[base + j];
+
+        float y = 0.0f;
+        for (int i = 0; i < hs; ++i) {
+            const float s = state[i]*g[base + i] + v_val*k[base + i];
+            y += s*(q[base + i]*args.scale);
+            state[i] = s;
+        }
+
+        dst[base + j] = y;
+    }
+
+    device float * state_out = dst + args.n_seqs*args.n_seq_tokens*C;
+
+    for (int i = 0; i < hs; ++i) {
+        state_out[s_off + i*hs] = state[i];
+    }
+}

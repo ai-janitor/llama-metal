@@ -3,11 +3,11 @@
 // Extracted from dispatch.cpp to keep each dispatch strategy in its own file.
 #include "dispatch.h"
 #include "tuning.h"
-#include "lane-policy.h"
-
+#include "../lanes/select.h"
+#include "ggml-metal-probe.h"
 #include <cstdlib>
 #include <cstring>
-
+GGML_METAL_FAMILY(matmul)
 
 static bool read_grouped_env() {
     const char * value = std::getenv("GGML_METAL_MV_GROUPED");
@@ -59,8 +59,9 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     //   - All types must share the same N_R0_KQUANT for correct grid computation
     //
     // Returns the number of ops consumed (>1 if fusion happened).
+    const struct mv_format_row * fmt = ggml_metal_mv_format(op->src[0]->type);
     if (ne11 != 1 ||
-        (op->src[0]->type != GGML_TYPE_Q4_K && op->src[0]->type != GGML_TYPE_Q6_K) ||
+        fmt == nullptr || !fmt->grouped ||
         op->src[1]->type != GGML_TYPE_F32) {
         return 0;
     }
@@ -148,9 +149,9 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
 
         // Only fuse q4_K and q6_K — they share THREADS_PER_BLOCK=16
         // and N_R0_KQUANT, so threadgroup geometry is identical.
+        const struct mv_format_row * gfmt = ggml_metal_mv_format(gop->src[0]->type);
         const bool is_q4k = (gop->src[0]->type == GGML_TYPE_Q4_K);
-        const bool is_q6k = (gop->src[0]->type == GGML_TYPE_Q6_K);
-        if (!is_q4k && !is_q6k) break;
+        if (gfmt == nullptr || !gfmt->grouped) break;
         if (gop->src[0]->ne[0] != ne00) break;  // K dimension must match
         if (gop->src[1]->ne[1] != 1) break;     // must be matvec (batch=1)
         if (g > 0 && !(gop->flags & GGML_TENSOR_FLAG_COMPUTE)) break;
@@ -262,8 +263,8 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     // (FC_grouped_nr0), allowing different NR0 per model. Pipeline is
     // cached by name (includes NR0), so each variant compiles only once.
     char gpipeline_name[128];
-    const int16_t selected_lane = ggml_metal_select_matvec_lane(
-        lib, op->src[0]->type, GGML_METAL_MATVEC_ROUTE_GROUPED);
+    const int16_t selected_lane = ggml_metal_select_lane_id(
+        profile, GGML_METAL_LANE_FAMILY_MATMUL, GGML_METAL_LANE_ROUTE_MV_GROUPED, op->src[0]->type, op->src[1]->type);
     // The card's hw row picks the reduce: every row stored before the row sums, or one row at a time.
     const bool g_red = profile->mv_group_red == 1;
     const char * gbase = kq_prep ? (g_red ? "kernel_mul_mv_grouped_q4k_prep_red_f32" : "kernel_mul_mv_grouped_q4k_prep_f32")
@@ -275,7 +276,6 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     if (!gpipeline.pipeline) {
         ggml_metal_cv_t cv = ggml_metal_cv_init();
         ggml_metal_cv_set_int16(cv, (int16_t)nr0, FC_MUL_MV_GROUPED + 0);
-        ggml_metal_cv_set_int16(cv, selected_lane, FC_MATVEC_LANE);
         gpipeline = ggml_metal_library_compile_pipeline(lib,
             gbase, gpipeline_name, cv);
         ggml_metal_cv_free(cv);

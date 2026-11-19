@@ -21,12 +21,14 @@
 
 #include "llama.h"
 #include "models/models.h"
+#include "llama-model-requirements.h"
 
 #include "ggml.h"
 #include "ggml-cpp.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
@@ -1486,6 +1488,36 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         return;
     }
 
+    // activation formats the model asks for: the file's own keys, else the built-in row for this architecture and name
+    {
+        const auto parse = [](const std::string & s) {
+            return s == "bf16" ? GGML_TYPE_BF16 : s == "f16" ? GGML_TYPE_F16 : s == "f32" ? GGML_TYPE_F32 : GGML_TYPE_COUNT;
+        };
+        std::string dtype;
+        if (ml.get_key(LLM_KV_ACTIVATION_DTYPE, dtype, false)) {
+            hparams.act_dtype      = parse(dtype);
+            hparams.act_dtype_from = 1;
+            if (ml.get_key(LLM_KV_ACTIVATION_STATE_DTYPE, dtype, false)) {
+                hparams.act_state_dtype = parse(dtype);
+            }
+        } else {
+            const std::string arch_name = ml.get_arch_name();
+            for (const auto & row : llama_model_requirement_rows) {
+                const std::string row_name = row.name;
+                const bool same_name = row_name.size() == name.size() &&
+                    std::equal(name.begin(), name.end(), row_name.begin(), [](unsigned char a, unsigned char b) {
+                        return std::tolower(a) == std::tolower(b);
+                    });
+                if (arch_name == row.arch && same_name) {
+                    hparams.act_dtype       = row.hidden;
+                    hparams.act_state_dtype = row.state;
+                    hparams.act_dtype_from  = 2;
+                    break;
+                }
+            }
+        }
+    }
+
     ml.get_key(LLM_KV_CONTEXT_LENGTH,          hparams.n_ctx_train);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH,        hparams.n_embd);
     ml.get_key(LLM_KV_EMBEDDING_LENGTH_OUT,    hparams.n_embd_out_impl, false);
@@ -2647,6 +2679,10 @@ void llama_model::print_info() const {
         LLAMA_LOG_INFO("%s: n_expert_groups       = %d\n",     __func__, hparams.n_expert_groups);
         LLAMA_LOG_INFO("%s: n_group_used          = %d\n",     __func__, hparams.n_group_used);
         LLAMA_LOG_INFO("%s: causal attn           = %d\n",     __func__, hparams.causal_attn);
+        LLAMA_LOG_INFO("%s: activation dtype      = %s, state %s (from %s)\n", __func__,
+                hparams.act_dtype       == GGML_TYPE_COUNT ? "unknown" : ggml_type_name(hparams.act_dtype),
+                hparams.act_state_dtype == GGML_TYPE_COUNT ? "unknown" : ggml_type_name(hparams.act_state_dtype),
+                hparams.act_dtype_from == 1 ? "the file" : hparams.act_dtype_from == 2 ? "the built-in row" : "nowhere");
         LLAMA_LOG_INFO("%s: pooling type          = %d\n",     __func__, hparams.pooling_type);
         LLAMA_LOG_INFO("%s: rope type             = %d\n",     __func__, hparams.rope_type);
         LLAMA_LOG_INFO("%s: rope scaling          = %s\n",     __func__, rope_scaling_type.c_str());

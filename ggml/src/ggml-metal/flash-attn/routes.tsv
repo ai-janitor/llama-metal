@@ -1,0 +1,27 @@
+# Which flash attention route encodes an op.
+# How the rows are used: flash-attn/gen-routes.cmake compiles them in when CMake configures (routes-table.h). The router
+# (flash-attn/router.cpp) walks the rows in order and takes the first one whose cells all match. The Intel tiled route may
+# decline (no kernel for the head size), and the walk goes on. No row matches = the op is not taken here. No file is read at run time.
+# To add a route: write flash-attn/route-<name>.cpp, add its name to the generator and the router, then add its row.
+# In every condition column, any = the column does not restrict the row.
+# Columns
+#   order: the place in the walk, counting up from 1 with no gap.
+#   route: intel-tiled | scalar | matrix | vec. The encoder the row selects.
+#   file: the source file of that encoder, for the reader of this table. The code does not read this cell.
+#   needs_matrix: the card has simdgroup matrices: yes | no | any.
+#   vendor: intel | not-intel | any.
+#   width: the card's simd width: 32 | not-32 | any.
+#   batch: small (under 20 queries and a head size that is a multiple of 32) | large | any.
+#   kv: the K and V types: same | differ | any.
+#   fp8: K is f8_e4m3: yes | no | any.
+#   head: the head size the route has a kernel for: a number | any.
+#   note: why the row exists or what limits it. Free text, no tab. The code does not read this cell.
+order	route	file	needs_matrix	vendor	width	batch	kv	fp8	head	note
+1	intel-tiled	flash-attn/route-intel-tiled.cpp	no	intel	any	any	same	no	64	K/V tiled into threadgroup memory; head size 64 only
+2	scalar	flash-attn/route-scalar.cpp	no	intel	any	any	any	any	any	the vec kernel compiles narrower than it assumes on Intel
+3	scalar	flash-attn/route-scalar.cpp	no	any	not-32	any	any	any	any	the vec kernel assumes width 32
+4	scalar	flash-attn/route-scalar.cpp	no	any	any	large	any	any	any	no simdgroup matrices for the matrix route
+5	scalar	flash-attn/route-scalar.cpp	no	any	any	any	differ	any	any	only the scalar kernels take two formats
+6	scalar	flash-attn/route-scalar.cpp	no	any	any	any	any	yes	any	fp8 is read by the scalar kernels only
+7	matrix	flash-attn/route-matrix.cpp	any	any	any	large	any	any	any	simdgroup matrix kernel
+8	vec	flash-attn/route-vec.cpp	any	any	any	small	any	any	any	small batches

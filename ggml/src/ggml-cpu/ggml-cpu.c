@@ -15,13 +15,13 @@
 #include "ggml.h"
 #include "common.h"
 #include "tiled/tiled.h"
-
+#include "../ggml-metal/ggml-metal-probe.h"
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
 #include <alloca.h>
 #endif
-
+GGML_METAL_FAMILY(cpu)
 #include <assert.h>
 #include <errno.h>
 #include <time.h>
@@ -3156,7 +3156,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         }
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
-        // Try fused ops, fall back to normal compute
+        GGML_METAL_PROBE_ONLY(struct ggml_metal_probe_scope probe_compute __attribute__((cleanup(ggml_metal_probe_end))) = state->ith == 0 ? ggml_metal_probe_begin(ggml_metal_probe_file_family, GGML_METAL_PROBE_ZONE_compute, node->op) : (struct ggml_metal_probe_scope) { 0 };)
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;

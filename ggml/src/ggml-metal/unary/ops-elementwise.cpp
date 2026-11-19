@@ -1,6 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
-
-int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
+#include "ggml-metal-probe.h"
+GGML_METAL_FAMILY(unary) int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -15,8 +15,13 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
 
     const int32_t dim = ((const int32_t *) op->op_params)[0];
 
+    // quantized rows are copied block by block (nb0 is the block size)
+    const int32_t blck = ggml_is_quantized(op->type) ? (int32_t) ggml_blck_size(op->type) : 1;
+    GGML_ASSERT(ne00 % blck == 0 && ne10 % blck == 0 && ne0 % blck == 0);
+    const int32_t ne0_arg = ne0/blck;
+
     ggml_metal_kargs_concat args = {
-        /*.ne00 =*/ ne00,
+        /*.ne00 =*/ ne00/blck,
         /*.ne01 =*/ ne01,
         /*.ne02 =*/ ne02,
         /*.ne03 =*/ ne03,
@@ -24,7 +29,7 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
         /*.nb01 =*/ nb01,
         /*.nb02 =*/ nb02,
         /*.nb03 =*/ nb03,
-        /*.ne10 =*/ ne10,
+        /*.ne10 =*/ ne10/blck,
         /*.ne11 =*/ ne11,
         /*.ne12 =*/ ne12,
         /*.ne13 =*/ ne13,
@@ -32,7 +37,7 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
         /*.nb11 =*/ nb11,
         /*.nb12 =*/ nb12,
         /*.nb13 =*/ nb13,
-        /*.ne0  =*/ ne0,
+        /*.ne0  =*/ ne0_arg,
         /*.ne1  =*/ ne1,
         /*.ne2  =*/ ne2,
         /*.ne3  =*/ ne3,
@@ -43,7 +48,7 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
         /*.dim  =*/ dim,
     };
 
-    auto pipeline = ggml_metal_library_get_pipeline_base(lib, GGML_OP_CONCAT);
+    auto pipeline = ggml_metal_library_get_pipeline_concat(lib, op->type);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -53,17 +58,17 @@ int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) {
 
     // Narrow rows otherwise leave most native lanes idle. Pack independent rows
     // into one TG; use the actual width so the kernel agrees on every device.
-    const bool pack_rows = ne0 < 32;
+    const bool pack_rows = ne0_arg < 32;
     const int nth = pack_rows ? std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline))
-                              : std::min(1024, ne0);
-    const int rows_per_group = pack_rows ? std::max(1, nth/ne0) : 1;
+                              : std::min(1024, ne0_arg);
+    const int rows_per_group = pack_rows ? std::max(1, nth/ne0_arg) : 1;
     ggml_metal_encoder_dispatch_threadgroups(enc, (ne1 + rows_per_group - 1)/rows_per_group,
                                             ne2, ne3, nth, 1, 1);
 
     return 1;
 }
 
-int ggml_metal_op_repeat(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_repeat(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -107,7 +112,7 @@ int ggml_metal_op_repeat(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -218,7 +223,7 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -277,6 +282,13 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         args.max = ggml_get_op_params_f32(op, 1);
     }
 
+    if (op->op == GGML_OP_UNARY && ggml_get_unary_op(op) == GGML_UNARY_OP_XIELU) {
+        args.slope = ggml_get_op_params_f32(op, 1); // alpha_n
+        args.scale = ggml_get_op_params_f32(op, 2); // alpha_p
+        args.bias  = ggml_get_op_params_f32(op, 3); // beta
+        args.val   = ggml_get_op_params_f32(op, 4); // eps
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_unary(lib, op);
 
     if (pipeline.c4) {
@@ -308,7 +320,7 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -368,7 +380,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
-int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
@@ -536,7 +548,7 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     return n_fuse;
 }
 
-int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) {
+int ggml_metal_op_add_id(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;

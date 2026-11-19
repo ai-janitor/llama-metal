@@ -1,7 +1,7 @@
 #ifndef GGML_METAL_MATMUL_BLOCK_DOT_Q6_GROUPED_METAL
 #define GGML_METAL_MATMUL_BLOCK_DOT_Q6_GROUPED_METAL
 
-#include "block-dot-lane.metal"
+#include "lane-fma-f32.metal"
 
 // Grouped Q6_K preserves the legacy per-element arithmetic. It shares only
 // the facade's ownership map; the scalar SWAR unpack and bias fold stay separate.

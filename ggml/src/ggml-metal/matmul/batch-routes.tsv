@@ -1,0 +1,29 @@
+# The batch route of a matmul per card and weight type: from which activation column count each kernel takes the op.
+# Three routes by column count: one column at a time (the matvec kernel, or a column-form kernel) below ext_from, the
+# small-batch kernel (mul_mv_ext) from ext_from, the tiled kernel from tiled_from.
+# How the rows are used: matmul/gen-batch-routes.cmake compiles them in when CMake configures (batch-routes-table.h).
+# ggml_metal_batch_route_decide (matmul/batch-route.cpp) names the route, and both the small-batch route (dispatch-ext.cpp)
+# and the tiled route (dispatch-matmul.cpp) ask it. No file is read at run time. GGML_METAL_KQ_EXT_ROWS=0 or
+# GGML_METAL_KQ_HW_ROWS=0 in the environment ignores every row.
+# To change a row: measure prompt speed on the card at the column counts around the change, write the numbers in source,
+# and leave column counts that were not measured on the route they had. Then run the row's test on the card.
+# Columns
+#   pci: the card as 0xVVVV:0xDDDD (PCI vendor and device id, lower-case hex). A card with no row for a weight type keeps the format's routes (matmul/formats.tsv).
+#   weight: the weight type, a type name of matmul/formats.tsv.
+#   ext_from: columns from which the small-batch kernel takes the op: 2 to 9, or - = the format's start (2, or 4 for K-quants). Allowed only for a type that has a small-batch kernel.
+#   tiled_from: columns from which the tiled kernel takes the op where it can run it, ahead of the small-batch kernel: a number from 2, above ext_from. - = the small-batch kernel keeps every count it takes, and the tiled kernel takes what is left above 8 columns. Allowed only for a type that has a tiled kernel.
+#   source: the measurement behind the row: date, model, the numbers, and which counts were not measured. Free text, no tab.
+#   test: the command that proves the row on the card. Free text, no tab.
+pci	weight	ext_from	tiled_from	source	test
+0x1002:0x7340	q8_0	-	64	measured 2026-11-19, prefill crossover sweep, Qwen 0.8B Q8_0, llama-bench prompt t/s, 5 repetitions: 64 columns 593.3 -> 642.2, 32 columns 573.9 -> 395.3 / 33-63 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q8_0
+0x1002:0x7340	q4_K	-	64	measured 2026-11-19, prefill crossover sweep, Qwen 4B Q4_K_M (all its K-quant types switched together), llama-bench prompt t/s, 5 repetitions: 64 columns 53.9 -> 78.9, 32 columns 55.6 -> 44.1 / 33-63 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q4_K
+0x1002:0x7340	q5_K	-	64	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q5_K
+0x1002:0x7340	q6_K	-	64	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q6_K
+0x1002:0x6860	q8_0	-	128	measured 2026-11-19, prefill crossover sweep, Qwen 0.8B Q8_0, llama-bench prompt t/s, 5 repetitions: 128 columns 746.1 -> 898.6, 64 columns 713.5 -> 512.2 / 65-127 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q8_0
+0x1002:0x6860	q4_K	9	32	measured 2026-11-19, prefill crossover sweep, Qwen 4B Q4_K_M (all its K-quant types switched together), llama-bench prompt t/s, 5 repetitions: 4 columns 46.0 -> 80.9 and 8 columns 53.0 -> 90.2 one column at a time, 32 columns 58.8 -> 81.0 tiled, 16 columns 55.7 -> 44.6 tiled / 9-15 and 17-31 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q4_K
+0x1002:0x6860	q5_K	9	32	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q5_K
+0x1002:0x6860	q6_K	9	32	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q6_K
+0x1002:0x6798	q8_0	-	64	measured 2026-11-19, prefill crossover sweep, Qwen 0.8B Q8_0, llama-bench prompt t/s, 5 repetitions: 64 columns 201.5 -> 266.2, 32 columns 189.4 -> 154.6 / 33-63 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q8_0
+0x1002:0x6798	q4_K	9	32	measured 2026-11-19, prefill crossover sweep, Qwen 4B Q4_K_M (all its K-quant types switched together), llama-bench prompt t/s, 5 repetitions: 4 columns 24.0 -> 30.0 and 8 columns 15.8 -> 27.3 one column at a time, 32 columns 16.6 -> 30.1 tiled, 16 columns 16.3 -> 15.9 tiled / 9-15 and 17-31 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q4_K
+0x1002:0x6798	q5_K	9	32	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q5_K
+0x1002:0x6798	q6_K	9	32	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q6_K
