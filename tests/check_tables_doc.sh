@@ -1,7 +1,7 @@
 #!/bin/sh
 # Checks "## The tables" of ggml/src/ggml-metal/README.md: every .tsv of the folder is listed there, and every
 # `file:line` (`name`) it cites still holds that name on that line. Checks every .tsv itself: each column of its header
-# row has a comment line "#   <column>: " in the same file.
+# row (of each header row, in a table with [section] lines) has a comment line "#   <column>: " in the same file.
 # usage: check_tables_doc.sh <ggml-metal dir> [extra .tsv name that must be reported missing, or -] [README to read instead]
 dir="$1"
 extra="$2"
@@ -23,7 +23,8 @@ for f in $(cd "$dir" && find . -name '*.tsv' | sed 's|^\./||' | sort) $extra; do
 done
 cols=0
 for f in $(cd "$dir" && find . -name '*.tsv' | sed 's|^\./||' | sort); do
-    for c in $(grep -v '^#' "$dir/$f" | head -1 | tr '\t' ' '); do
+    # the header rows: the row after each [section] line, or the first row of a table without sections
+    for c in $(awk '/^#/ || /^$/ { next } /^\[/ { sec = 1; take = 1; next } take || (!sec && !done) { print; take = 0; done = 1 }' "$dir/$f" | tr '\t' ' ' | tr ' ' '\n' | sort -u); do
         cols=$((cols + 1))
         if ! grep -q "^#   $c: " "$dir/$f"; then
             echo "FAIL tables doc: $f has no comment for column $c"

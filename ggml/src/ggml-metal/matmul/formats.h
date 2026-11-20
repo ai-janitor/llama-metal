@@ -1,6 +1,6 @@
 #pragma once
 
-// Per-format facts of the matvec and matmul kernels. The rows are matmul/formats.tsv,
+// Per-format facts of the matvec and matmul kernels. The rows are data/matmul.tsv [formats],
 // turned into mv-formats-table.h at configure time.
 #include "ggml.h"
 

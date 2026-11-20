@@ -1,0 +1,132 @@
+# Reads a tab-separated table of data/ for a generator (include it, then call tsv_lines, or tsv_section for a table with sections).
+# A CMake list gives a meaning to four characters: ; separates elements, [ and ] group them, \ escapes. tsv_lines
+# returns the file's lines as a list with those four replaced by stand-ins (control characters 28 to 31), so that after
+# string(REPLACE "\t" ";" ...) only a tab separates cells and a free-text cell may hold any of them. tsv_text gives a
+# line or a cell back as it was written, for a message.
+string(ASCII 28 TSV_SEMI)
+string(ASCII 29 TSV_OPEN)
+string(ASCII 30 TSV_CLOSE)
+string(ASCII 31 TSV_BACK)
+function(tsv_lines path out)
+    file(READ "${path}" text)
+    string(REPLACE "\\" "${TSV_BACK}" text "${text}")
+    string(REPLACE ";" "${TSV_SEMI}" text "${text}")
+    string(REPLACE "[" "${TSV_OPEN}" text "${text}")
+    string(REPLACE "]" "${TSV_CLOSE}" text "${text}")
+    string(REPLACE "\r" "" text "${text}")
+    string(REPLACE "\n" ";" text "${text}")
+    set(${out} "${text}" PARENT_SCOPE)
+endfunction()
+function(tsv_text in out)
+    string(REPLACE "${TSV_SEMI}" ";" text "${in}")
+    string(REPLACE "${TSV_OPEN}" "[" text "${text}")
+    string(REPLACE "${TSV_CLOSE}" "]" text "${text}")
+    string(REPLACE "${TSV_BACK}" "\\" text "${text}")
+    set(${out} "${text}" PARENT_SCOPE)
+endfunction()
+
+# tsv_section(path name known out): the rows of section [name] of a table with sections, comment and empty lines left
+# out; the first element is the section's header row. A section starts at a line that is exactly [name]. known lists
+# every section the file may hold. Refused: a row before the first section line, a section that is not in known or is
+# there twice, and a file without section [name].
+function(tsv_section path name known out)
+    tsv_lines("${path}" lines)
+    set(cur "")
+    set(have "")
+    set(got "")
+    foreach(line IN LISTS lines)
+        if (line MATCHES "^#" OR line STREQUAL "")
+            continue()
+        endif()
+        if (line MATCHES "^${TSV_OPEN}([^\t]*)${TSV_CLOSE}$")
+            set(cur "${CMAKE_MATCH_1}")
+            list(FIND known "${cur}" at)
+            if (at EQUAL -1)
+                message(FATAL_ERROR "${path}: unknown section [${cur}] (sections of this table: ${known})")
+            endif()
+            list(FIND have "${cur}" at)
+            if (NOT at EQUAL -1)
+                message(FATAL_ERROR "${path}: section [${cur}] is there twice")
+            endif()
+            list(APPEND have "${cur}")
+            continue()
+        endif()
+        if (cur STREQUAL "")
+            tsv_text("${line}" shown)
+            message(FATAL_ERROR "${path}: a row before the first section line: ${shown}")
+        endif()
+        if (cur STREQUAL name)
+            list(APPEND got "${line}")
+        endif()
+    endforeach()
+    list(FIND have "${name}" at)
+    if (at EQUAL -1)
+        message(FATAL_ERROR "${path}: the table has no section [${name}]")
+    endif()
+    set(${out} "${got}" PARENT_SCOPE)
+endfunction()
+
+# tsv_header(line want where): refuses a section's first row that is not the header want (a ;-list of column names).
+function(tsv_header line want where)
+    string(REPLACE "\t" ";" f "${line}")
+    if (NOT "${f}" STREQUAL "${want}")
+        tsv_text("${line}" shown)
+        string(REPLACE ";" " " names "${want}")
+        message(FATAL_ERROR "${where}: the first row must be the header, tab-separated: ${names}; got: ${shown}")
+    endif()
+endfunction()
+
+# tsv_card(cell where out): a card cell as written, for a generated C string. It is the card's Metal device name,
+# compared whole at run time: not empty, not any, no space at either end, nothing that needs escaping in a C string,
+# at most 62 bytes. The device keeps 63 bytes of its name (ggml_device_profile.name), and a name of 63 bytes there may
+# be a longer one cut short, so no row may be that long: a cut name then equals no row.
+function(tsv_card cell where out)
+    tsv_text("${cell}" card)
+    string(LENGTH "${card}" len)
+    if ("${card}" STREQUAL "" OR "${card}" STREQUAL "any" OR "${card}" STREQUAL "-" OR "${card}" MATCHES "^ " OR "${card}" MATCHES " $" OR "${card}" MATCHES "[\"\\\\]" OR len GREATER 62)
+        message(FATAL_ERROR "${where}: card must be the Metal device name as the log prints it after 'found device: ' (not empty, no space at either end, no quote or backslash, at most 62 bytes: the device keeps 63 bytes of its name and a name that long may be cut short), got '${card}'")
+    endif()
+    set(${out} "${card}" PARENT_SCOPE)
+endfunction()
+
+# tsv_cstring(cell where out): a free-text cell for a generated C string, read back by the program as it was written:
+# a backslash and a quote are escaped.
+function(tsv_cstring cell where out)
+    tsv_text("${cell}" text)
+    string(REPLACE "\\" "\\\\" text "${text}")
+    string(REPLACE "\"" "\\\"" text "${text}")
+    set(${out} "${text}" PARENT_SCOPE)
+endfunction()
+
+# tsv_number(cell where name max out): a whole number from 1 to max (a decimal number, the limit of the field the cell
+# goes to) without a leading zero, as written; or - = absent, given back as -1.
+function(tsv_number cell where name max out)
+    if ("${cell}" STREQUAL "-")
+        set(${out} "-1" PARENT_SCOPE)
+        return()
+    endif()
+    string(LENGTH "${cell}" len)
+    string(LENGTH "${max}" max_len)
+    if (NOT "${cell}" MATCHES "^[1-9][0-9]*$" OR len GREATER max_len OR (len EQUAL max_len AND "${cell}" STRGREATER "${max}"))
+        tsv_text("${cell}" shown)
+        message(FATAL_ERROR "${where}: ${name} is a whole number from 1 to ${max} without a leading zero, or -; got '${shown}'")
+    endif()
+    set(${out} "${cell}" PARENT_SCOPE)
+endfunction()
+
+# tsv_word(cell where name out word=value ...): the value of the word the cell holds; refuses any other word.
+function(tsv_word cell where name out)
+    set(words "")
+    foreach(pair IN LISTS ARGN)
+        string(REGEX REPLACE "=.*$" "" word "${pair}")
+        string(REGEX REPLACE "^[^=]*=" "" value "${pair}")
+        if ("${cell}" STREQUAL "${word}")
+            set(${out} "${value}" PARENT_SCOPE)
+            return()
+        endif()
+        list(APPEND words "${word}")
+    endforeach()
+    string(REPLACE ";" " | " words "${words}")
+    tsv_text("${cell}" shown)
+    message(FATAL_ERROR "${where}: ${name} must be one of ${words}, got '${shown}'")
+endfunction()

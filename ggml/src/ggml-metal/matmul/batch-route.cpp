@@ -2,26 +2,28 @@
 
 #include "batch-routes-table.h"
 
+#include <cstring>
+
 const struct mv_batch_row * ggml_metal_batch_rows_get(int * n) {
     *n = (int) (sizeof(mv_batch_rows) / sizeof(mv_batch_rows[0])) - 1;
     return mv_batch_rows;
 }
 
 const struct mv_batch_row * ggml_metal_batch_row_in(
-        const struct mv_batch_row * rows, int n, uint32_t pci_vendor, uint32_t pci_device, enum ggml_type type) {
-    for (int i = 0; i < n; ++i) {
-        if (rows[i].pci_vendor == pci_vendor && rows[i].pci_device == pci_device && rows[i].type == type) {
+        const struct mv_batch_row * rows, int n, const char * card, enum ggml_type type) {
+    for (int i = 0; card != nullptr && i < n; ++i) {
+        if (rows[i].type == type && std::strcmp(rows[i].card, card) == 0) {
             return &rows[i];
         }
     }
     return nullptr;
 }
 
-int ggml_metal_batch_rows_count(uint32_t pci_vendor, uint32_t pci_device) {
+int ggml_metal_batch_rows_count(const char * card) {
     int n = 0, count = 0;
     const struct mv_batch_row * rows = ggml_metal_batch_rows_get(&n);
-    for (int i = 0; i < n; ++i) {
-        if (rows[i].pci_vendor == pci_vendor && rows[i].pci_device == pci_device) {
+    for (int i = 0; card != nullptr && i < n; ++i) {
+        if (std::strcmp(rows[i].card, card) == 0) {
             count++;
         }
     }

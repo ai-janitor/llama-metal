@@ -32,7 +32,7 @@ enum ggml_metal_lane_holds {
     GGML_METAL_LANE_HOLDS_NARROWER,
 };
 
-// One row of lanes/lanes.tsv. weight / activation GGML_TYPE_COUNT = any type.
+// One row of data/arithmetic.tsv [lanes]. weight / activation GGML_TYPE_COUNT = any type.
 struct ggml_metal_lane_row {
     const char * lane;
     int          source;
@@ -54,21 +54,20 @@ struct ggml_metal_lane_row {
     const char * test;
 };
 
-// One row of lanes/capability.tsv: 1 yes, 0 no, -1 unknown.
+// One row of data/arithmetic.tsv [capabilities]: 1 yes, 0 no, -1 unknown. card = the card's Metal device name, compared whole.
 struct ggml_metal_lane_cap_row {
-    uint32_t pci_vendor;
-    uint32_t pci_device;
-    int      capability;
-    int      in_hardware;
-    int      reached;
-    int      correct;
+    const char * card;
+    int          capability;
+    int          in_hardware;
+    int          reached;
+    int          correct;
 };
 
 const struct ggml_metal_lane_row     * ggml_metal_lane_rows_get(int * n);
 const struct ggml_metal_lane_cap_row * ggml_metal_lane_cap_rows_get(int * n);
 
-// Bit i set = capability i is reached and correct on this card. A card with no rows gets 0.
-uint32_t ggml_metal_lane_ok_mask(uint32_t pci_vendor, uint32_t pci_device);
+// Bit i set = capability i is reached and correct on the card of this Metal device name. A card with no rows gets 0.
+uint32_t ggml_metal_lane_ok_mask(const char * card);
 
 // How operand holds tensor: equal = native (exact-other when the row declares it), f32 over f16 / bf16 = wider, else narrower.
 int ggml_metal_lane_holds(int operand, enum ggml_type tensor, int declared);

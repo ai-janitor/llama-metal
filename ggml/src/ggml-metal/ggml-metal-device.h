@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "ggml-device-profile.h"
 #include "ggml-model-profile.h"
+#include "card-object.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -363,6 +364,9 @@ void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);
+// The device's library, built now if the device has none (its first build failed): one caller at a time builds it and
+// probes the wave width, and every caller gets that one library. NULL when the build fails again.
+ggml_metal_library_t ggml_metal_device_ensure_library(ggml_metal_device_t dev);
 
 // GGML_METAL_NORM_MATVEC: a device-owned buffer of GGML_METAL_NORM_MEANS_SLOTS floats; slot = graph node index of the residual add
 #define GGML_METAL_NORM_MEANS_SLOTS 65536
@@ -398,6 +402,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
 
 const struct ggml_device_profile * ggml_metal_device_get_profile(ggml_metal_device_t dev);
+// The card facts the layout rules read (card-object.h).
+const struct ggml_metal_card * ggml_metal_device_get_card(ggml_metal_device_t dev);
 
 // Model profile: captures model dimensions for kernel tuning decisions.
 // Set via ggml_backend_metal_set_model_profile() after loading GGUF metadata.

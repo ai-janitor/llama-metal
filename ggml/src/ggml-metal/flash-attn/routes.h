@@ -1,6 +1,6 @@
 #pragma once
 
-// The flash attention route table. The rows are flash-attn/routes.tsv, turned into routes-table.h at configure time.
+// The flash attention route table. The rows are data/attention.tsv, turned into routes-table.h at configure time.
 enum fa_route { FA_ROUTE_INTEL_TILED, FA_ROUTE_SCALAR, FA_ROUTE_MATRIX, FA_ROUTE_VEC };
 
 // Each cell: 1 = must hold, 0 = must not hold, -1 = any. head: the head size the route takes, 0 = any.

@@ -1,5 +1,6 @@
 // Batch route table checks, host only: no GPU, no model.
-// usage: test_metal_batch_routes            the decide function against the two predicates it replaced, given the row's cells
+// usage: test_metal_batch_routes            the decide function against the two predicates it replaced, given the row's cells;
+//                                           then the rows themselves against the card names and thresholds written below
 //        test_metal_batch_routes control    built with tiled_from 16 on the q4_K rows: fixed cases must land on the expected routes
 #include "matmul/batch-route.h"
 
@@ -47,6 +48,68 @@ static enum mv_batch_route new_route(
     return ggml_metal_batch_route_decide(&in);
 }
 
+// The shipped thresholds, written here apart from the table: the name each card reports to Metal, the weight type,
+// ext_from, tiled_from (0 = the cell is -). A row added to or changed in data/matmul.tsv [tiles] is added or changed here.
+static const struct mv_batch_row expected_rows[] = {
+    { "AMD Radeon Pro 5500M",         GGML_TYPE_Q8_0, 0, 64  },
+    { "AMD Radeon Pro 5500M",         GGML_TYPE_Q4_K, 0, 64  },
+    { "AMD Radeon Pro 5500M",         GGML_TYPE_Q5_K, 0, 64  },
+    { "AMD Radeon Pro 5500M",         GGML_TYPE_Q6_K, 0, 64  },
+    { "AMD Radeon Pro Vega 64",       GGML_TYPE_Q8_0, 0, 128 },
+    { "AMD Radeon Pro Vega 64",       GGML_TYPE_Q4_K, 9, 32  },
+    { "AMD Radeon Pro Vega 64",       GGML_TYPE_Q5_K, 9, 32  },
+    { "AMD Radeon Pro Vega 64",       GGML_TYPE_Q6_K, 9, 32  },
+    { "AMD Radeon HD - FirePro D700", GGML_TYPE_Q8_0, 0, 64  },
+    { "AMD Radeon HD - FirePro D700", GGML_TYPE_Q4_K, 9, 32  },
+    { "AMD Radeon HD - FirePro D700", GGML_TYPE_Q5_K, 9, 32  },
+    { "AMD Radeon HD - FirePro D700", GGML_TYPE_Q6_K, 9, 32  },
+};
+// Names no row may answer to: one character off, another case, a space at the end, a name with no rows, the empty name.
+static const char * const unknown_cards[] = { "AMD Radeon Pro 5500", "amd radeon pro vega 64", "AMD Radeon Pro Vega 64 ", "AMD Radeon Pro Vega 56", "" };
+
+// Failures of the generated rows against expected_rows.
+static int check_expected(const struct mv_batch_row * rows, int n_rows) {
+    const int n_exp = (int) (sizeof(expected_rows) / sizeof(expected_rows[0]));
+    int bad = 0;
+    for (int i = 0; i < n_exp; ++i) {
+        const struct mv_batch_row & e = expected_rows[i];
+        const struct mv_batch_row * row = ggml_metal_batch_row_in(rows, n_rows, e.card, e.type);
+        if (row == nullptr || row->ext_from != e.ext_from || row->tiled_from != e.tiled_from) {
+            std::printf("FAIL expected row %s type %d ext_from %d tiled_from %d: the table has %s", e.card, (int) e.type, e.ext_from, e.tiled_from, row ? "" : "no such row\n");
+            if (row != nullptr) {
+                std::printf("ext_from %d tiled_from %d\n", row->ext_from, row->tiled_from);
+            }
+            bad++;
+        }
+    }
+    // every generated row is one of the expected rows, so a mistyped card name cannot sit beside them
+    for (int r = 0; r < n_rows; ++r) {
+        bool known = false;
+        for (int i = 0; i < n_exp; ++i) {
+            known = known || (std::strcmp(rows[r].card, expected_rows[i].card) == 0 && rows[r].type == expected_rows[i].type);
+        }
+        if (!known) {
+            std::printf("FAIL the table row %s type %d is not in expected_rows of this test\n", rows[r].card, (int) rows[r].type);
+            bad++;
+        }
+    }
+    for (const char * card : unknown_cards) {
+        for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+            if (ggml_metal_batch_row_in(rows, n_rows, card, (enum ggml_type) t) != nullptr) {
+                std::printf("FAIL the name '%s' matches a row of type %d\n", card, t);
+                bad++;
+            }
+        }
+        if (ggml_metal_batch_rows_count(card) != 0) {
+            std::printf("FAIL the name '%s' counts rows\n", card);
+            bad++;
+        }
+    }
+    // a card with rows has none for a type it was not measured with
+    bad += ggml_metal_batch_row_in(rows, n_rows, "AMD Radeon Pro Vega 64", GGML_TYPE_F32) != nullptr;
+    return bad;
+}
+
 int main(int argc, char ** argv) {
     const bool control = argc == 2 && std::strcmp(argv[1], "control") == 0;
     if (argc != 1 && !control) {
@@ -65,7 +128,7 @@ int main(int argc, char ** argv) {
         for (int fi = -1; fi < n_fmt; ++fi) {
             const struct mv_format_row * f = fi < 0 ? nullptr : &mv_format_rows[fi];
             const struct mv_batch_row * row = (card < 0 || f == nullptr) ? nullptr
-                : ggml_metal_batch_row_in(rows, n_rows, rows[card].pci_vendor, rows[card].pci_device, f->type);
+                : ggml_metal_batch_row_in(rows, n_rows, rows[card].card, f->type);
             const int kq_ext_min = row && row->ext_from > 0 ? row->ext_from : 4;
             const int small_min  = row && row->ext_from > 0 ? row->ext_from : 2;
             const int tiled_from = row ? row->tiled_from : 0;
@@ -96,8 +159,10 @@ int main(int argc, char ** argv) {
     }
 
     if (!control) {
-        std::printf("MAIN batch routes: %d rows, %ld cases, %ld moved by a row, %ld failures\n", n_rows, cases, moved, diffs);
-        return diffs == 0 ? 0 : 1;
+        const int named = check_expected(rows, n_rows);
+        std::printf("MAIN batch routes: %d rows, %ld cases, %ld moved by a row, %ld failures, %d rows differ from the names and thresholds of this test\n",
+            n_rows, cases, moved, diffs, named);
+        return diffs == 0 && named == 0 ? 0 : 1;
     }
 
     // control: the q4_K row carries tiled_from 16

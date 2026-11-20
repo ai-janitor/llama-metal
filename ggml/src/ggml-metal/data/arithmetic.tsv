@@ -1,0 +1,98 @@
+# The arithmetic tables of the Metal backend: what each card's arithmetic can do, which arithmetic lane is wired into
+# which kernel route, and which ops read a copy of their activations at the model's precision.
+# A line that is exactly [name] starts a section; the next row is that section's header and is required as written.
+# Cells are separated by one tab. - = absent. No file is read at run time: the generators below run when CMake configures.
+# A card is named as Metal reports it, exactly: the text after "found device: " in the log of any run on that card (for
+# example: AMD Radeon Pro Vega 64). A name that differs by one character matches no card.
+#
+# [capabilities]: what each card can do per arithmetic capability. lanes/gen-tables.cmake compiles the rows in
+# (lanes-table.h, with [lanes]). ggml_metal_lane_ok_mask (lanes/select.cpp) turns the rows of one card into the set of
+# capabilities it may use: a capability counts only when reached and correct are both yes. A card with no row can use
+# the base lane of each route only. One row per card and capability.
+# To add a row: run the lane probe on the card, or cite the document, and write where the cell values come from in source.
+# In the three yes | no | unknown columns, unknown reads as no.
+#   card: the card's name as Metal reports it (see above).
+#   capability: the capability's name, the one a [lanes] row asks for in its capability column (for example pk-mul-f16, dot4-i32-i8). Lower-case letters, digits and -.
+#   in_hardware: the chip has the instruction: yes | no | unknown. For the reader. The selector does not use it.
+#   reached: the Metal shader compiler emits the instruction (seen as throughput in the probe): yes | no | unknown.
+#   correct: the result equals the CPU reference: yes | no | unknown.
+#   ratio: throughput against the fp32 lane on that card, a number above 0, or - when not timed. For the reader.
+#   source: [capabilities]: where the cells come from: the probe and its date, or the document. Free text, no tab.
+#
+# [lanes]: which arithmetic lane is wired where. One row per (lane, family, route, operand types). lanes/gen-tables.cmake
+# compiles the rows in (lanes-table.h). The selector, ggml_metal_negotiate_lane_in (lanes/select.cpp), reads only
+# [lanes] and [capabilities]. It negotiates between the tensor type of the request (the model's requirement) and the
+# card's capability rows: of the rows of the family and route that are on, it takes the one that holds the activation
+# natively, else exactly another way, else wider. A row whose operand is narrower than the tensor is dropped. Equal
+# steps go in file order, so the base row comes last. No row left = a coverage gap: the selector returns none.
+# To add a lane: write its file, add its row with default off, run its test on the card, then turn it on.
+#   lane: the lane's name, the same as its file name without the extension.
+#   source ([lanes]): who compiles the lane: metal (the Metal shader compiler) | llvm-archive | llvm-native (LLVM). No llvm row exists yet.
+#   file: the file that holds the lane, relative to this backend's folder. The table check fails when it does not exist.
+#   family: the op family: matmul | flash-attn.
+#   route: the route of the family: mv-scalar | mv-grouped | mm-tiled | mm-matrix | fa-scalar | fa-vec | fa-matrix | fa-intel-tiled.
+#   weight: the weight type the row is for (a type name such as q4_K), or any = every type.
+#   activation: the activation type the row is for (f32 | f16 | bf16), or any = every type.
+#   operand: the format the lane holds an activation in while it forms products (f32 | f16 | bf16).
+#   holds: how the operand holds the row's activation type: native | exact-other | wider | narrower. For activation any the request's type decides. The generator refuses a cell that contradicts operand and activation.
+#   entry: the suffix of the lane's kernel entry point, or - = the route's own entry.
+#   capability ([lanes]): the capability the card must have, a name of [capabilities], or - = none needed.
+#   class: what the lane does to the values: exact | product-rounded | narrows.
+#   origin: ours | upstream. upstream = a route that stages narrower types as shipped upstream. It is listed here and taken by its family's dispatch, not chosen by the selector, so it names no capability.
+#   default: on | off. on = measured and reviewed, may be picked. off = the lane exists and is never picked.
+#   seam_us: the cost in microseconds of handing the op to another submit route, 0 = none. A row with a cost is never picked.
+#   id: the value of the pipeline lane constant, also part of the pipeline name. 0 for the base lane.
+#   reason: [lanes]: why the row lands on its holds value. [copies]: why the row has its applies value (what was measured, or that nothing was). Free text, no tab.
+#   test: [lanes]: the command that proves the row on a card before default is set to on. [copies]: the command that proves the row on the card before applies is set to yes. Free text, no tab.
+#
+# [copies]: which op families convert their activations once, at the start of the op, to the model's precision, per
+# card. Tensors between ops stay f32. The copy is a scratch buffer owned by act-copy/. act-copy/gen-act-copy.cmake
+# compiles the rows in (act-copy-table.h), and ggml_metal_act_copy_decide_in (act-copy/decide.cpp) picks the row of the
+# op's card, family and route. A card with no row for a family and route gets no copy. One row per card, family, route and copy.
+# To change a row: run its test on that card first, then set applies. A new family first needs a kernel entry that reads the copy's type.
+#   card ([copies]): the card's name as Metal reports it (see above).
+#   family ([copies]): the op family, as named in [lanes] (matmul | flash-attn).
+#   route ([copies]): the route of that family whose kernel reads the copy, as named in [lanes] (for example mm-tiled).
+#   copy: the type the activations are converted to: bf16 | f16. It applies only when it equals the model's precision.
+#   applies: yes | no. no = the row is documented but the op reads its f32 activations as before.
+#   min_rereads: the op must read each activation at least this many times, else no copy. A number from 4 (below 4 the conversion never pays).
+#   max_bytes: the largest copy taken, in bytes. A larger activation is read as f32.
+[capabilities]
+card	capability	in_hardware	reached	correct	ratio	source
+AMD Radeon Pro 5500M	pk-mul-f16	yes	yes	yes	2.03	lane probe K2 2026-10-18 (MacBookPro16,1); LLVM GCNFeatures FeatureVOP3PInsts
+AMD Radeon Pro 5500M	dot2-f32-f16	yes	no	unknown	0.89	LLVM FeatureDot10Insts in the gfx1012 list; lane probe K3 (nested fma form)
+AMD Radeon Pro 5500M	dot4-i32-i8	yes	unknown	no	-	LLVM FeatureDot1Insts; lane probe K4: wrong result at iteration 1
+AMD Radeon Pro 5500M	dot8-i32-i4	yes	unknown	unknown	-	LLVM FeatureDot1Insts; not probed from Metal
+AMD Radeon Pro 5500M	matrix8x8	no	no	no	-	supportsFamily Apple7 = 0
+AMD Radeon Pro Vega 64	pk-mul-f16	yes	unknown	unknown	-	LLVM FeatureGFX9 FeatureVOP3PInsts; lane probe not run on this card
+AMD Radeon Pro Vega 64	dot2-f32-f16	no	no	no	-	LLVM: dot features start at gfx906
+AMD Radeon Pro Vega 64	dot4-i32-i8	no	no	no	-	LLVM: dot features start at gfx906
+AMD Radeon Pro Vega 64	dot8-i32-i4	no	no	no	-	LLVM: dot features start at gfx906
+AMD Radeon Pro Vega 64	matrix8x8	no	no	no	-	supportsFamily Apple7 = 0
+AMD Radeon HD - FirePro D700	pk-mul-f16	no	unknown	unknown	-	GCN 1.0 has no fp16 arithmetic; lane probe not run on this card
+AMD Radeon HD - FirePro D700	dot2-f32-f16	no	no	no	-	GCN 1.0
+AMD Radeon HD - FirePro D700	dot4-i32-i8	no	no	no	-	GCN 1.0
+AMD Radeon HD - FirePro D700	dot8-i32-i4	no	no	no	-	GCN 1.0
+AMD Radeon HD - FirePro D700	matrix8x8	no	no	no	-	supportsFamily Apple7 = 0
+Intel(R) UHD Graphics 630	pk-mul-f16	yes	yes	yes	1.93	lane probe K2 2026-10-18 (Intel UHD 630)
+Intel(R) UHD Graphics 630	dot4-i32-i8	no	unknown	yes	-	lane probe K4 correct 1..20, not timed; Gen9.5 has no DP4A
+
+[lanes]
+lane	source	file	family	route	weight	activation	operand	holds	entry	capability	class	origin	default	seam_us	id	reason	test
+lane-fma-f32	metal	lanes/metal/lane-fma-f32.metal	matmul	mv-scalar	any	any	f32	wider	-	-	exact	ours	on	0	0	every card multiplies in fp32, which holds f32, f16 and bf16 exactly	test-backend-ops -o MUL_MAT
+lane-fma-f32	metal	lanes/metal/lane-fma-f32.metal	matmul	mv-grouped	any	any	f32	wider	-	-	exact	ours	on	0	0	every card multiplies in fp32, which holds f32, f16 and bf16 exactly	test-backend-ops -o MUL_MAT
+lane-fma-f32	metal	lanes/metal/lane-fma-f32.metal	matmul	mm-tiled	any	any	f32	wider	-	-	exact	ours	on	0	0	every card multiplies in fp32, which holds f32, f16 and bf16 exactly	test-backend-ops -o MUL_MAT
+lane-matrix8x8-bf16	metal	lanes/metal/lane-matrix8x8-bf16.metal	matmul	mm-matrix	bf16	any	bf16	narrower	-	-	narrows	upstream	on	0	0	upstream stages a bf16 weight and its activation as bfloat tiles for the matrix unit; kept as shipped	test-backend-ops -o MUL_MAT -p type_a=bf16 on Apple Silicon
+lane-matrix8x8-f16	metal	lanes/metal/lane-matrix8x8-f16.metal	matmul	mm-matrix	any	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages both operands as half tiles for the matrix unit; kept as shipped	test-backend-ops -o MUL_MAT on Apple Silicon
+lane-matrix8x8-bf16	metal	lanes/metal/lane-matrix8x8-bf16.metal	flash-attn	fa-matrix	bf16	any	bf16	narrower	-	-	narrows	upstream	on	0	0	upstream stages the query, bf16 keys and values as bfloat tiles; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT on Apple Silicon
+lane-matrix8x8-f32	metal	lanes/metal/lane-matrix8x8-f32.metal	flash-attn	fa-matrix	f32	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages the query as half tiles, f32 keys and values as float; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT on Apple Silicon
+lane-matrix8x8-f16	metal	lanes/metal/lane-matrix8x8-f16.metal	flash-attn	fa-matrix	any	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages the query as half tiles for the matrix unit; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT on Apple Silicon
+lane-fma-f32	metal	flash-attn/flash-attn-vec.metal	flash-attn	fa-vec	any	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages the query as half4 and forms products in fp32; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT
+lane-fma-f32	metal	flash-attn/flash-attn-intel.metal	flash-attn	fa-intel-tiled	any	any	f16	narrower	-	-	narrows	upstream	on	0	0	upstream stages K and V tiles as half; kept as shipped	test-backend-ops -o FLASH_ATTN_EXT on an Intel GPU
+lane-fma-f32	metal	lanes/metal/lane-fma-f32.metal	flash-attn	fa-scalar	any	any	f32	wider	-	-	exact	ours	on	0	0	every card multiplies in fp32, which holds f32, f16 and bf16 exactly	test-backend-ops -o FLASH_ATTN_EXT
+
+[copies]
+card	family	route	copy	applies	min_rereads	max_bytes	reason	test
+AMD Radeon Pro 5500M	matmul	mm-tiled	bf16	no	4	268435456	not measured on this card; bfloat is a shader type here	test-backend-ops -o MUL_MAT at a tiled shape, against the CPU at bf16
+AMD Radeon Pro Vega 64	matmul	mm-tiled	bf16	no	4	268435456	not measured on this card; bfloat is a shader type here	test-backend-ops -o MUL_MAT at a tiled shape, against the CPU at bf16
+AMD Radeon HD - FirePro D700	matmul	mm-tiled	bf16	no	4	268435456	not measured on this card; bf16 is held as 16-bit words (no bfloat in its shader language)	test-backend-ops -o MUL_MAT at a tiled shape, against the CPU at bf16

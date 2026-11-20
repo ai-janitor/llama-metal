@@ -1,0 +1,203 @@
+# The matmul tables of the Metal backend: which multiply kernels exist, and how the work is divided per card and weight.
+# A line that is exactly [name] starts a section; the next row is that section's header and is required as written.
+# Cells are separated by one tab. - = absent. No file is read at run time: the generators below run when CMake configures.
+#
+# [tiles]: the batch route and the tiled kernel's work plan, per card and weight type, and every work plan the tiled
+# kernel is compiled for. matmul/gen-tiles.cmake turns the rows into batch-routes-table.h (ggml_metal_batch_route_decide,
+# matmul/batch-route.cpp), tiled-plan-table.h (ggml_metal_tiled_tune_load, matmul/tiled-plan.cpp), and the compiled plans:
+# tiled-compiled-table.h and tiled-plans.metal (one compiled copy of the kernel per distinct set of the eleven values,
+# every weight entry named <entry>_lay_<the eleven values>; the default plan first, then in the order a plan first appears).
+# A row has one of three roles:
+#   tuned: what was measured on one card for one weight type: its batch thresholds, its plan, or both.
+#   default: the plan every card runs that has no tuned plan. Exactly one row.
+#   candidate: a plan compiled so it can be measured (llama-metal-tiled-sweep), selected by no card yet.
+# The plan of a card and weight: its tuned row for the type, else its tuned row for any, else the default. A tuned plan
+# is used only when the card reports the wave width and group memory written in its row, and the plan passes the checks
+# of ggml_metal_tiled_plan_check; else the default plan runs. The thresholds of a row do not depend on that check.
+# GGML_METAL_KQ_EXT_ROWS=0 or GGML_METAL_KQ_HW_ROWS=0 in the environment ignores every threshold.
+# To change a threshold: measure prompt speed on the card at the column counts around the change, write the numbers in
+# route_source, leave column counts that were not measured on the route they had, run route_test on the card.
+# To make a card run a plan: run llama-metal-tiled-sweep on it and add the row it prints. To try a new plan: add a
+# candidate row; the build refuses values the kernel cannot run and names the condition.
+# Columns
+#   card: tuned rows: the card's name as Metal reports it, exactly: the text after "found device: " in the log of any run
+#       on that card (for example: AMD Radeon Pro Vega 64). A name that differs by one character matches no card. Other rows: any.
+#   weight: tuned rows: the weight type, a type of [formats], or any = every type (any is allowed only for a row with a
+#       plan and no threshold). One row per card and weight. Other rows: any.
+#   plan: the plan's name: <bm>x<bn>_t<threads>, then _<what else differs> when two plans share those three (s16 = 16 sums
+#       per thread, w64 = 64-thread warp tiles). Lower-case letters, digits and _. One name per set of values. - on a
+#       tuned row = the row holds thresholds only.
+#   role: tuned | default | candidate.
+#   ext_from: columns from which the small-batch kernel takes the op: 2 to 9, or - = the format's start (2, or 4 for K-quants). Only for a type that has a small-batch kernel.
+#   tiled_from: columns from which the tiled kernel takes the op where it can run it, ahead of the small-batch kernel: a number from 2 (at most 9 digits), above ext_from, without a leading zero. - = the small-batch kernel keeps every count it takes, and the tiled kernel takes what is left above 8 columns. Only for a type that has a tiled kernel.
+#   wave: tuned rows: threads of one wave on the card when the row was measured (the log line "probed simd_width"). Other rows: -.
+#   group_bytes: tuned rows: bytes of threadgroup memory the card allows (MTLDevice maxThreadgroupMemoryLength). Other rows: -.
+#       The plan of a tuned row must run on that shape: threads a whole number of wave, (bm + bn) * (bk / 2 + pad) * 8 bytes within group_bytes.
+#   warp: threads of one warp tile, 1 to 1024; divides threads.
+#   threads: threads per threadgroup, 1 to 1024; a whole number of the card's waves.
+#   bm: output rows per threadgroup tile, 1 to 1024.
+#   bn: output columns per threadgroup tile, 1 to 1024.
+#   bk: K step, 32 (the block size the weight loaders are written for).
+#   wm: output rows per warp tile, 1 to 1024.
+#   wn: output columns per warp tile, 1 to 1024.
+#   wmiter: row passes per warp tile, 1 to 8.
+#   tm: rows of sums per thread per pass, 2 to 8, even.
+#   tn: columns of sums per thread per pass, 1 to 16.
+#   pad: float2 slots added to each buffer row, 0 to 64.
+#       The eleven values from warp to pad are the fields of struct ggml_metal_tiled_plan (matmul/tiled-plan.h), in its
+#       order; all are given with a plan and all are - without one. Whole numbers without a leading zero. At most 16 plans.
+#   route_source: the measurement behind the thresholds: date, model, the numbers, which counts were not measured. Free text, no tab. - without a threshold.
+#   route_test: the command that proves the thresholds on the card; required with a threshold. Free text, no tab. - without a threshold.
+#   plan_source: tuned rows: the measurement behind the plan (date, the numbers with the plan and with the default). Other rows: why the plan is compiled. Free text, no tab. - without a plan.
+#   plan_test: tuned rows: the command that proves the plan on the card; required with a plan. Free text, no tab. Other rows: -.
+#
+# [formats]: per-format facts of the matvec and matmul kernels, one row per weight type. matmul/gen-formats.cmake turns
+# the rows into mv-formats-table.h, read through ggml_metal_mv_format (matmul/formats.h).
+# To add a weight type: add its kernel instantiations in matmul/, then its row. A cell says yes only when that kernel exists.
+#   weight ([formats]): the weight type, a ggml type name in lower case with K upper (for example q4_K, iq4_xs, f16). One row per type.
+#   nsg: simdgroups per threadgroup, equal to N_SG_<type> in ggml-metal-impl.h (checked when the host code compiles). - = the geometry comes from the tensor (float types).
+#   nr0: rows per rows_per unit, equal to N_R0_<type> in ggml-metal-impl.h (checked the same way). - together with nsg.
+#   rows_per: the unit nr0 counts in: simdgroup | threadgroup.
+#   smem: threadgroup memory of the matvec kernel: none | bytes (the bytes cell) | lane-floats (one float per lane) | row-sums.
+#   bytes: the fixed threadgroup memory in bytes, a number from 1, when smem is bytes; else 0.
+#   nr0_from_pipeline: yes | no. yes = the kernel takes its row count from the pipeline. A [matvec_shapes] row needs yes for its weight.
+#   reduce_recompile_below_32: yes | no. yes = below simd width 32 the kernel is compiled again with the shared-memory reduce.
+#   matvec: yes | no. A matvec kernel exists. no = the one-column route does not take the type.
+#   ext: the small-batch kernel: no | small (taken from 2 columns) | kquant (taken from the card's column count, [tiles]).
+#   tiled: yes | no. A tiled matmul loader exists. no = the tiled route does not take the type.
+#   w64_fallback: yes | no. A width-64 kernel without simd intrinsics exists.
+#   grouped: yes | no. The type joins a grouped matvec.
+#   shape_rows: yes | no. The type takes per-shape rows.
+#   act_bf16: yes | no. A kernel reads a bf16 activation with this weight type. no = the op is refused and runs on the CPU.
+#   act_f16: the same for an f16 activation: yes | no | mm. mm = only the matrix kernel (kernel_mul_mm_<type>_f16) reads it, so the op is taken only where the matrix route takes it (matrix hardware, above the column threshold). Else it runs on the CPU.
+#   ext_wide: yes | no. yes = on a card without matrix hardware the small-batch kernel takes any column count. no = it stops at 8 columns.
+#
+# [matvec_defaults]: per card, how the one-column (matvec) kernels run. matmul/gen-matvec.cmake compiles the rows in
+# (matvec-rows.h); device/init.m reads the row of the card it runs on (ggml_metal_matvec_default_row_of). A cell that is
+# - leaves the backend's default; a card with no row runs every default. One row per card.
+# To change a cell: measure decode speed on the card with and without it, same output, and write the numbers in evidence.
+#   simd_sum_w64_ok: yes | no | -. The simd reduction gave correct sums at wave width 64 on the card. For the reader: no code reads it.
+#   mv_reduce: the tail of a matvec's row sum on the shared-memory path: serial | tree | - (serial).
+#   f_scalar_w64: on | off | - (off). on = the f16 and bf16 scalar matvec runs at wave width 64 instead of the width-64 fallback.
+#   mv_group: seq | off | - (off). seq = the 2 to 4 Q8_0 matvecs that read one activation run in one launch.
+#   q8_load_bytes: bytes per weight load of the Q8_0 matvec: 1 | 4 (aligned words) | - (1).
+#   q8_rows8_min: the smallest row count of a single Q8_0 matvec that runs 8 whole rows per simdgroup, a number above 0, or - = never.
+#   q8_act_load_bytes: bytes per activation load of the Q8_0 matvec: 4 | 16 (two aligned loads per lane; needs q8_load_bytes 4) | - (4).
+#   mv_group_red: on | off | - (off). on = the grouped K-quant matvec stores every row before the row sums.
+#   evidence: [matvec_defaults]: the measurement behind each cell. Free text, no tab.
+#
+# [matvec_shapes]: per card and K-quant weight shape, how many rows a simdgroup works and in which loop form.
+# matmul/gen-matvec.cmake compiles the rows in (matvec-rows.h, ggml_metal_hw_mv_rows); ggml_metal_mv_hw_row
+# (matmul/dispatch.h) takes the first row of the card that fits the op, in file order, so a prep row stands before the
+# row without prep for the same shape. A shape with no row runs the format's rows per simdgroup. The rows of one card
+# stand together. GGML_METAL_KQ_HW_ROWS=0 ignores every row, GGML_METAL_KQ_PREP=0 the prep rows, GGML_METAL_KQ_COLS=0 the rows of 2 to 4 columns.
+# wave and group_bytes are the card's shape when the row was measured, for the reader: no code compares them.
+# To add a row: time the kernel on the card at that shape with each rows value, same bytes out, and write the numbers in source.
+#   kind: single = one matvec of this weight | group = the grouped launch whose members all have this weight type and shape (only a type whose [formats] row says grouped yes).
+#   k: the weight's input columns (its first dimension), a number above 0.
+#   m: the weight's output rows (its second dimension), a number above 0. With 2 to 4 columns: a whole number of nr0 x nsg rows (nsg of [formats]), since the column kernel reads whole threadgroups of weight rows.
+#   cols: activation columns in the launch: 1, or 2 to 4 = a decode batch of that many columns (kind single, q4_K or q6_K).
+#   prep: on | off. on = the row applies only where the tensor's Q4_K block headers were unpacked at load (q4_K only), and names the tensor for that. A prep row stands before the row without prep for the same shape.
+#   form: the loop form of a 2 to 4 column row, - with one column. a = activations held across the rows of a pass | w = weights
+#       held, activations reloaded per row | ap, wp = the same with the weights kept packed | ha, hap = paired halves (each half
+#       of a 64-thread wave works nr0 / 2 rows; 2 or 3 columns, nr0 from 2, wave 64 only), hap with the weights kept packed.
+#   source: the measurement behind the row: the time before and after, the thread limit, that the bytes are the same. Free text, no tab.
+#       In [matvec_shapes], weight is q4_K | q5_K | q6_K and nr0 is the rows per simdgroup: 1 | 2 | 4 | 8.
+[tiles]
+card	weight	plan	role	ext_from	tiled_from	wave	group_bytes	warp	threads	bm	bn	bk	wm	wn	wmiter	tm	tn	pad	route_source	route_test	plan_source	plan_test
+AMD Radeon Pro 5500M	q8_0	-	tuned	-	64	32	65536	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, Qwen 0.8B Q8_0, llama-bench prompt t/s, 5 repetitions: 64 columns 593.3 -> 642.2, 32 columns 573.9 -> 395.3 / 33-63 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q8_0	-	-
+AMD Radeon Pro 5500M	q4_K	-	tuned	-	64	32	65536	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, Qwen 4B Q4_K_M (all its K-quant types switched together), llama-bench prompt t/s, 5 repetitions: 64 columns 53.9 -> 78.9, 32 columns 55.6 -> 44.1 / 33-63 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q4_K	-	-
+AMD Radeon Pro 5500M	q5_K	-	tuned	-	64	32	65536	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q5_K	-	-
+AMD Radeon Pro 5500M	q6_K	-	tuned	-	64	32	65536	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q6_K	-	-
+AMD Radeon Pro Vega 64	q8_0	-	tuned	-	128	64	65536	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, Qwen 0.8B Q8_0, llama-bench prompt t/s, 5 repetitions: 128 columns 746.1 -> 898.6, 64 columns 713.5 -> 512.2 / 65-127 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q8_0	-	-
+AMD Radeon Pro Vega 64	q4_K	64x128_t256	tuned	9	32	64	65536	32	256	64	128	32	32	32	2	4	2	1	measured 2026-11-19, prefill crossover sweep, Qwen 4B Q4_K_M (all its K-quant types switched together), llama-bench prompt t/s, 5 repetitions: 4 columns 46.0 -> 80.9 and 8 columns 53.0 -> 90.2 one column at a time, 32 columns 58.8 -> 81.0 tiled, 16 columns 55.7 -> 44.6 tiled / 9-15 and 17-31 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q4_K	measured 2026-11-20, Qwen 4B Q4_K_M, 512-token prompt (llama-completion -n 1, flash attention off), the plan forced for q4_K with GGML_METAL_TEST_TILED_PLAN, one run per session in three sessions: default plan 280.83 -> this plan 339.47, 280.92 -> 339.36, 280.80 -> 339.25 prompt t/s (+20.8 %); output bytes equal to the default plan on 2 shapes; alternating rounds and per-kernel times not yet run	mul_mat_dump q4_K 2560 512 2560 OUT kernel_mul_mat_tiled_q4_K_lay_32_256_64_128_32_32_32_2_4_2_1, then the prompt speed with and without GGML_METAL_TEST_TILED_PLAN=q4_K:64x64_t128
+AMD Radeon Pro Vega 64	q5_K	-	tuned	9	32	64	65536	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q5_K	-	-
+AMD Radeon Pro Vega 64	q6_K	-	tuned	9	32	64	65536	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q6_K	-	-
+AMD Radeon HD - FirePro D700	q8_0	-	tuned	-	64	64	32768	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, Qwen 0.8B Q8_0, llama-bench prompt t/s, 5 repetitions: 64 columns 201.5 -> 266.2, 32 columns 189.4 -> 154.6 / 33-63 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q8_0	-	-
+AMD Radeon HD - FirePro D700	q4_K	-	tuned	9	32	64	32768	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, Qwen 4B Q4_K_M (all its K-quant types switched together), llama-bench prompt t/s, 5 repetitions: 4 columns 24.0 -> 30.0 and 8 columns 15.8 -> 27.3 one column at a time, 32 columns 16.6 -> 30.1 tiled, 16 columns 16.3 -> 15.9 tiled / 9-15 and 17-31 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q4_K	-	-
+AMD Radeon HD - FirePro D700	q5_K	-	tuned	9	32	64	32768	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q5_K	-	-
+AMD Radeon HD - FirePro D700	q6_K	-	tuned	9	32	64	32768	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, the same runs as q4_K on this card (types not measured apart)	test-backend-ops -o MUL_MAT -p type_a=q6_K	-	-
+any	any	64x64_t128	default	-	-	-	-	32	128	64	64	32	32	32	2	4	2	1	-	-	the rule's default: the layout the kernel carried as literals before the work plan	-
+any	any	64x64_t256_s16	candidate	-	-	-	-	32	256	64	64	32	32	16	1	4	2	1	-	-	sweep candidate: 256 threads with 16 sums per thread (more waves at the same group memory)	-
+any	any	64x64_t128_w64	candidate	-	-	-	-	64	128	64	64	32	32	64	2	4	2	1	-	-	sweep candidate: a warp tile of one 64-wide wave (32 x 64)	-
+any	any	64x128_t512_s16	candidate	-	-	-	-	32	512	64	128	32	32	16	1	4	2	1	-	-	sweep candidate: the 128-column token tile with 512 threads and 16 sums per thread (64x128_t256 and 64x64_t256_s16 together)	-
+any	any	64x256_t512	candidate	-	-	-	-	32	512	64	256	32	32	32	2	4	2	1	-	-	sweep candidate: a 256-column token tile, 512 threads (is 128 the best tile width)	-
+
+[formats]
+weight	nsg	nr0	rows_per	smem	bytes	nr0_from_pipeline	reduce_recompile_below_32	matvec	ext	tiled	w64_fallback	grouped	shape_rows	act_bf16	act_f16	ext_wide
+f32	-	-	threadgroup	row-sums	0	no	no	yes	small	yes	yes	no	no	no	yes	yes
+f16	-	-	threadgroup	row-sums	0	no	no	yes	small	yes	yes	no	no	no	yes	no
+bf16	-	-	threadgroup	row-sums	0	no	no	yes	no	yes	no	no	no	yes	no	no
+q4_0	2	2	simdgroup	none	0	yes	no	yes	small	yes	yes	no	no	no	mm	yes
+q4_1	2	2	simdgroup	none	0	yes	no	yes	small	yes	yes	no	no	no	mm	yes
+q5_0	2	2	simdgroup	none	0	yes	no	yes	small	yes	yes	no	no	no	mm	yes
+q5_1	2	2	simdgroup	none	0	yes	no	yes	small	yes	yes	no	no	no	mm	yes
+q8_0	2	4	threadgroup	row-sums	0	no	no	yes	small	yes	yes	no	no	no	mm	yes
+mxfp4	2	2	simdgroup	lane-floats	0	no	yes	yes	small	yes	no	no	no	no	mm	no
+q2_K	2	2	simdgroup	none	0	no	no	yes	no	yes	no	no	no	no	mm	no
+q3_K	2	2	simdgroup	none	0	no	no	yes	no	yes	yes	no	no	no	mm	no
+q4_K	2	2	simdgroup	none	0	yes	no	yes	kquant	yes	yes	yes	yes	no	mm	yes
+q5_K	2	2	simdgroup	none	0	yes	no	yes	kquant	yes	yes	no	yes	no	mm	yes
+q6_K	2	2	simdgroup	none	0	yes	no	yes	kquant	yes	yes	yes	yes	no	mm	yes
+iq2_xxs	2	2	simdgroup	bytes	2176	no	no	yes	no	yes	no	no	no	no	mm	no
+iq2_xs	2	2	simdgroup	bytes	4224	no	no	yes	no	yes	no	no	no	no	mm	no
+iq3_xxs	2	2	simdgroup	bytes	1152	no	no	yes	no	yes	no	no	no	no	mm	no
+iq3_s	2	2	simdgroup	bytes	2048	no	no	yes	no	yes	no	no	no	no	mm	no
+iq2_s	2	2	simdgroup	none	0	no	no	yes	no	yes	no	no	no	no	mm	no
+iq1_s	2	2	simdgroup	none	0	no	no	yes	no	yes	no	no	no	no	mm	no
+iq1_m	2	2	simdgroup	none	0	no	no	yes	no	yes	no	no	no	no	mm	no
+iq4_nl	2	2	simdgroup	lane-floats	0	no	no	yes	small	yes	no	no	no	no	mm	yes
+iq4_xs	2	2	simdgroup	lane-floats	0	no	no	yes	no	yes	no	no	no	no	mm	no
+q1_0	2	2	simdgroup	none	0	no	no	yes	no	no	no	no	no	no	mm	no
+q2_0	2	2	simdgroup	none	0	no	no	yes	no	no	no	no	no	no	mm	no
+tq1_0	2	2	simdgroup	none	0	no	no	yes	no	no	no	no	no	no	mm	no
+tq2_0	2	2	simdgroup	none	0	no	no	yes	no	no	no	no	no	no	mm	no
+nvfp4	2	2	simdgroup	none	0	no	no	yes	no	no	no	no	no	no	mm	no
+f8_e4m3	2	2	simdgroup	none	0	no	no	yes	no	no	no	no	no	no	no	no
+
+[matvec_defaults]
+card	wave	group_bytes	simd_sum_w64_ok	mv_reduce	f_scalar_w64	mv_group	q8_load_bytes	q8_rows8_min	q8_act_load_bytes	mv_group_red	evidence
+AMD Radeon HD - FirePro D700	64	32768	yes	tree	on	seq	4	16384	16	on	simd_sum_w64_ok: MUL_MAT correct on the card. mv_reduce: tree measured -1.60 ms per token, thread limit 1024. f_scalar_w64: f16 scalar tests 383 of 383, text equal, -0.100 ms. mv_group: 25.85 -> 23.42 ms per token, logits equal. q8 loads and q8_rows8_min: the shipped values. mv_group_red: grouped pair 372.4 -> 315.7 us, bytes same.
+AMD Radeon Pro 5500M	32	65536	-	-	off	seq	1	-	-	-	Wave 32: the width-64 cells do not apply (simd_sum_w64_ok, mv_reduce -; f_scalar_w64 off, its guard is for width 64). mv_group: 5 rounds median 11.64 -> 10.94 ms per token, logits equal. q8_load_bytes: the shipped value.
+AMD Radeon Pro Vega 64	64	65536	yes	serial	on	seq	4	-	-	-	simd_sum_w64_ok: MUL_MAT correct on 8 types. mv_reduce: serial, tree measured slower (+0.645 ms per token). f_scalar_w64: f16 scalar tests 383 of 383, text equal, -0.320 ms. mv_group: 7.72 -> 7.29 ms per token, logits equal. q8_load_bytes: the shipped value.
+
+[matvec_shapes]
+card	wave	group_bytes	kind	weight	k	m	cols	prep	nr0	form	source
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	248320	1	off	8	-	measured on the card (5951 -> 4838 us, th_max 1024, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	4096	1	on	8	-	measured on the card (117.7 -> 104.9 us, th_max 1024, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	4096	1	off	8	-	measured on the card (115.9 -> 107.9 us, th_max 1024, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	9216	2560	1	on	4	-	measured on the card (184.3 -> 161.1 us, th_max 1024 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	4096	2560	1	on	2	-	measured on the card (107.5 -> 91.8 us, th_max 768 = master, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	group	q4_K	2560	9216	1	on	8	-	measured on the card (398.4 -> 376.2 us, th_max 1024, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q5_K	2560	8192	1	off	8	-	measured on the card (312.1 -> 237.0 us; th_max 512 under the default 768: owner's exception of 2026-11-18 to the rule that a row never lowers the thread limit, for this card only, the faster form is kept)
+AMD Radeon HD - FirePro D700	64	32768	single	q5_K	4096	2560	1	off	8	-	measured on the card (133.5 -> 107.1 us; th_max 512 under the default 768: owner's exception of 2026-11-18 to the rule that a row never lowers the thread limit, for this card only, the faster form is kept)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	9216	2	on	4	ha	measured on the card (landed 2 rows ap 324.0 -> 268.4 us for 2 columns, 9 rounds fastest, th_max 512 = before, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	8192	2	off	4	ha	measured on the card (landed 2 rows ap 292.7 -> 257.5 us for 2 columns, 9 rounds fastest, th_max 512 = before, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	4096	2560	2	on	2	a	measured on the card (177.44 -> 127.67 us for 2 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	9216	2560	2	off	2	ap	measured on the card (319.22 -> 289.87 us for 2 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	4096	2	on	4	ha	measured on the card (landed 2 rows ap 153.8 -> 132.7 us for 2 columns, 9 rounds fastest, th_max 512 = before, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	1024	2	off	2	ap	measured on the card (70.07 -> 57.47 us for 2 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	8192	2	off	4	ha	measured on the card (landed 2 rows wp 347.3 -> 287.4 us for 2 columns, 9 rounds fastest, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	9216	2560	2	off	2	ap	measured on the card (515.84 -> 320.13 us for 2 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	1024	2	off	2	a	measured on the card (85.17 -> 63.53 us for 2 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	248320	2	off	4	ha	measured on the card (landed 2 rows a 8730 -> 7259 us for 2 columns, 5 rounds fastest, th_max 512 = before, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	9216	3	on	4	ha	measured on the card (landed 8 rows ap 402.4 -> 371.9 us for 3 columns, 9 rounds fastest, th_max 512 = before, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	4096	3	on	4	ha	measured on the card (one-column kernel per column 233.7 -> 182.7 us for 3 columns, 9 rounds fastest, th_max 512 vs 1024, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	1024	3	off	2	ha	measured on the card (one-column kernel per column 90.4 -> 79.8 us for 3 columns, 9 rounds fastest, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	8192	3	off	4	ha	measured on the card (landed 8 rows a 460.5 -> 411.7 us for 3 columns, 9 rounds fastest, th_max 512 = before, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	4096	2560	3	on	4	ap	measured on the card (250.99 -> 192.87 us for 3 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	9216	2560	3	on	4	ap	measured on the card (525.56 -> 368.2 us for 3 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	8192	3	off	2	ha	measured on the card (landed 1 row ap 533.2 -> 432.4 us for 3 columns, 9 rounds fastest, th_max 512 = before, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	9216	2560	3	off	2	ap	measured on the card (695.88 -> 442.15 us for 3 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	1024	3	off	2	ap	measured on the card (126.24 -> 87.92 us for 3 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	248320	3	off	4	ha	measured on the card (landed 2 rows ap 15694 -> 14303 us for 3 columns, 3 rounds fastest, th_max 512 = before, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	9216	4	on	2	a	measured on the card (920.46 -> 648.53 us for 4 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	8192	4	off	1	w	measured on the card (819.45 -> 682.77 us for 4 columns, 5 rounds, th_max 768 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	4096	2560	4	on	2	ap	measured on the card (340.51 -> 256.7 us for 4 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	9216	2560	4	on	2	ap	measured on the card (712.92 -> 484.77 us for 4 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	4096	4	on	2	ap	measured on the card (305.15 -> 268.53 us for 4 columns, 5 rounds, th_max 512 vs 1024, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q4_K	2560	1024	4	off	1	w	measured on the card (139.41 -> 121.5 us for 4 columns, 5 rounds, th_max 768 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	8192	4	off	2	wp	measured on the card (974.08 -> 695.08 us for 4 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	9216	2560	4	off	2	wp	measured on the card (952.26 -> 691.67 us for 4 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	1024	4	off	1	w	measured on the card (126.48 -> 95.64 us for 4 columns, 5 rounds, th_max 512 vs 768, bytes same)
+AMD Radeon HD - FirePro D700	64	32768	single	q6_K	2560	248320	4	off	1	ap	measured on the card (21826.63 -> 19510 us for 4 columns, 5 rounds, th_max 512 vs 1024, bytes same)

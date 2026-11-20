@@ -1,12 +1,53 @@
 #import "device/ggml-metal-device-internal.h"
+#include <pthread.h>
 #include "ggml-metal-probe.h"
 #include "lanes/select.h"
 #include "matmul/batch-route.h"
+#include "matmul/tiled-plan.h"
 GGML_METAL_FAMILY(device) // overload of MTLGPUFamilyMetalX (not available in some environments)
+
+// The wave width of the card, read from a compiled pipeline of lib (kernel_concat_f32 has no function constants;
+// every kernel of a device has the same width).
+static void ggml_metal_device_probe_wave(ggml_metal_device_t dev, ggml_metal_library_t lib) {
+    struct ggml_metal_pipeline_with_params probe =
+        ggml_metal_library_compile_pipeline(lib, "kernel_concat_f32", "kernel_concat_f32", NULL);
+    if (probe.pipeline) {
+        const int tw = ggml_metal_pipeline_thread_execution_width(probe);
+        if (tw > 0) {
+            dev->profile.simd_width = (uint32_t) tw;
+            dev->card.wave          = (uint32_t) tw;
+            dev->card.wave_probed   = 1;
+            lib->simd_width         = tw;
+            GGML_LOG_INFO("%s: probed simd_width = %d\n", __func__, tw);
+        }
+    }
+}
+
+// One lock for every device: a library is built and probed by one caller at a time.
+static pthread_mutex_t ggml_metal_device_library_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+ggml_metal_library_t ggml_metal_device_ensure_library(ggml_metal_device_t dev) {
+    pthread_mutex_lock(&ggml_metal_device_library_mutex);
+    if (dev->library == NULL) {
+        ggml_metal_library_t lib = ggml_metal_library_init(dev);
+        if (lib != NULL) {
+            // probed first, published after: a reader of dev->library never sees a library without its width
+            ggml_metal_device_probe_wave(dev, lib);
+            // tuning-load-after-probe: the card's tuning rows are loaded once its probed facts (the wave width) are
+            // in the object, so a row may depend on them; before this the object holds no rows.
+            ggml_metal_tiled_tune_load(&dev->card, dev->profile.name);
+            dev->library = lib;
+        }
+    }
+    ggml_metal_library_t res = dev->library;
+    pthread_mutex_unlock(&ggml_metal_device_library_mutex);
+    return res;
+}
 static const NSInteger MTLGPUFamilyMetal3_GGML = 5001;
 static const NSInteger MTLGPUFamilyMetal4_GGML = 5002;
 
-// PCI vendor and device id of a Metal device, from its IORegistry parents; 0 when not found.
+// The PCI vendor id of a Metal device, from its IORegistry parents; 0 when not found. It tells the maker only: a card's
+// table rows are keyed by its Metal name.
 static uint32_t ggml_metal_pci_prop(io_registry_entry_t entry, CFStringRef key) {
     CFTypeRef data = IORegistryEntrySearchCFProperty(entry, kIOServicePlane, key, kCFAllocatorDefault,
                                                      kIORegistryIterateRecursively | kIORegistryIterateParents);
@@ -21,15 +62,14 @@ static uint32_t ggml_metal_pci_prop(io_registry_entry_t entry, CFStringRef key) 
     return value;
 }
 
-static void ggml_metal_pci_id(id<MTLDevice> mtl_device, uint32_t * vendor, uint32_t * device_id) {
-    *vendor    = 0;
-    *device_id = 0;
+static uint32_t ggml_metal_pci_vendor(id<MTLDevice> mtl_device) {
+    uint32_t vendor = 0;
     io_registry_entry_t entry = IOServiceGetMatchingService(MACH_PORT_NULL, IORegistryEntryIDMatching(mtl_device.registryID));
     if (entry) {
-        *vendor    = ggml_metal_pci_prop(entry, CFSTR("vendor-id"));
-        *device_id = ggml_metal_pci_prop(entry, CFSTR("device-id"));
+        vendor = ggml_metal_pci_prop(entry, CFSTR("vendor-id"));
         IOObjectRelease(entry);
     }
+    return vendor;
 }
 
 ggml_metal_device_t ggml_metal_device_init(int device) {
@@ -218,9 +258,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             ggml_metal_device_placement_init(dev);
 
             // Profile: identity
-            uint32_t pci_vendor = 0;
-            uint32_t pci_device = 0;
-            ggml_metal_pci_id(dev->mtl_device, &pci_vendor, &pci_device);
+            const uint32_t pci_vendor = ggml_metal_pci_vendor(dev->mtl_device);
             dev->profile.vendor = GGML_GPU_VENDOR_UNKNOWN;
             if (pci_vendor == 0x1002) dev->profile.vendor = GGML_GPU_VENDOR_AMD;
             if (pci_vendor == 0x8086) dev->profile.vendor = GGML_GPU_VENDOR_INTEL;
@@ -244,6 +282,10 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->profile.simd_width                  = 32; // default; probed below after library init
             dev->profile.max_threads_per_threadgroup = (uint32_t)dev->mtl_device.maxThreadsPerThreadgroup.width;
             dev->profile.shared_mem_size             = (uint32_t)dev->mtl_device.maxThreadgroupMemoryLength;
+            dev->card.wave      = 32; // default; probed below after library init
+            ggml_metal_tiled_tune_load(&dev->card, ""); // no entries until the library is built and the card probed
+            ggml_metal_tiled_test_arm();
+            dev->card.group_mem = (uint32_t)dev->mtl_device.maxThreadgroupMemoryLength;
             dev->profile.max_threadgroups_per_dispatch = (dev->profile.vendor == GGML_GPU_VENDOR_INTEL) ? 512 : 0;
 
             // Profile: cache hierarchy (defaults to unknown)
@@ -411,64 +453,64 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                 }
             }
 
-            // PCI-keyed hardware row (generated header); a -1 field keeps the value set above.
-            for (int i = 0; i < ggml_metal_hw_rows_n; i++) {
-                const struct ggml_metal_hw_row * row = &ggml_metal_hw_rows[i];
-                if (row->pci_vendor != pci_vendor || row->pci_device != pci_device) {
-                    continue;
+            // The card's rows, by its Metal name: data/device.tsv [devices] and data/matmul.tsv [matvec_defaults]
+            // (generated headers); a -1 field keeps the value set above.
+            {
+                const struct ggml_metal_device_row * row = ggml_metal_device_row_of(dev->profile.name);
+                const struct ggml_metal_matvec_default_row * mv = ggml_metal_matvec_default_row_of(dev->profile.name);
+                if (row != NULL) {
+                    GGML_METAL_PROBE_ONLY(ggml_metal_probe_choose_mode(dev, row);)
+                    if (row->compute_units   >= 0) dev->profile.compute_units   = (uint32_t) row->compute_units;
+                    if (row->l1_cache_per_cu >= 0) dev->profile.l1_cache_per_cu = (uint32_t) row->l1_cache_per_cu;
+                    if (row->l2_cache_total  >= 0) dev->profile.l2_cache_total  = (uint32_t) row->l2_cache_total;
+                    if (row->local_bw        >= 0) dev->profile.local_bandwidth = (uint64_t) row->local_bw;
+                    if (row->transfer_bw     >= 0) dev->profile.transfer_bandwidth = (uint64_t) row->transfer_bw;
+                    if (row->attn_gate_fuse  >= 0) dev->profile.attn_gate_fuse  = (uint32_t) row->attn_gate_fuse;
+                    if (row->conv_l2_fold    >= 0) dev->profile.conv_l2_fold    = (uint32_t) row->conv_l2_fold;
+                    if (row->add_norm_fuse   >= 0) dev->profile.add_norm_fuse   = (uint32_t) row->add_norm_fuse;
+                    if (row->cb_seq          >= 0) dev->profile.cb_seq          = (uint32_t) row->cb_seq;
+                    if (row->set_nowait      >= 0) dev->profile.set_nowait      = (uint32_t) row->set_nowait;
+                    if (row->staging_keep    >= 0) dev->profile.staging_keep    = (uint32_t) row->staging_keep;
                 }
-                if (row->compute_units   >= 0) dev->profile.compute_units   = (uint32_t) row->compute_units; GGML_METAL_PROBE_ONLY(ggml_metal_probe_choose_mode(dev, pci_vendor, pci_device);)
-                if (row->l1_cache_per_cu >= 0) dev->profile.l1_cache_per_cu = (uint32_t) row->l1_cache_per_cu;
-                if (row->l2_cache_total  >= 0) dev->profile.l2_cache_total  = (uint32_t) row->l2_cache_total;
-                if (row->local_bw        >= 0) dev->profile.local_bandwidth = (uint64_t) row->local_bw;
-                if (row->mv_reduce       >= 0) dev->profile.mv_reduce       = (uint32_t) row->mv_reduce;
-                if (row->f_scalar_w64    >= 0) dev->profile.f_scalar_w64    = (uint32_t) row->f_scalar_w64;
-                if (row->mv_group        >= 0) dev->profile.mv_group        = (uint32_t) row->mv_group;
-                if (row->attn_gate_fuse  >= 0) dev->profile.attn_gate_fuse  = (uint32_t) row->attn_gate_fuse;
-                if (row->conv_l2_fold    >= 0) dev->profile.conv_l2_fold    = (uint32_t) row->conv_l2_fold;
-                if (row->add_norm_fuse   >= 0) dev->profile.add_norm_fuse   = (uint32_t) row->add_norm_fuse;
-                if (row->cb_seq          >= 0) dev->profile.cb_seq          = (uint32_t) row->cb_seq;
-                if (row->q8_load_bytes   >= 0) dev->profile.q8_load_bytes   = (uint32_t) row->q8_load_bytes;
-                if (row->q8_rows8_min    >= 0) dev->profile.q8_rows8_min    = (uint32_t) row->q8_rows8_min;
-                if (row->q8_act_load_bytes >= 0) dev->profile.q8_act_load_bytes = (uint32_t) row->q8_act_load_bytes;
-                if (row->set_nowait      >= 0) dev->profile.set_nowait      = (uint32_t) row->set_nowait;
-                if (row->staging_keep    >= 0) dev->profile.staging_keep    = (uint32_t) row->staging_keep;
-                // GGML_METAL_GROUP_RED=0 keeps the grouped K-quant matvec on the row-at-a-time sums.
-                if (row->mv_group_red    >= 0) dev->profile.mv_group_red    = (uint32_t) row->mv_group_red;
-                {
+                if (mv != NULL) {
+                    if (mv->mv_reduce         >= 0) dev->profile.mv_reduce         = (uint32_t) mv->mv_reduce;
+                    if (mv->f_scalar_w64      >= 0) dev->profile.f_scalar_w64      = (uint32_t) mv->f_scalar_w64;
+                    if (mv->mv_group          >= 0) dev->profile.mv_group          = (uint32_t) mv->mv_group;
+                    if (mv->q8_load_bytes     >= 0) dev->profile.q8_load_bytes     = (uint32_t) mv->q8_load_bytes;
+                    if (mv->q8_rows8_min      >= 0) dev->profile.q8_rows8_min      = (uint32_t) mv->q8_rows8_min;
+                    if (mv->q8_act_load_bytes >= 0) dev->profile.q8_act_load_bytes = (uint32_t) mv->q8_act_load_bytes;
+                    if (mv->mv_group_red      >= 0) dev->profile.mv_group_red      = (uint32_t) mv->mv_group_red;
+                    // GGML_METAL_GROUP_RED=0 keeps the grouped K-quant matvec on the row-at-a-time sums.
                     const char * red_env = getenv("GGML_METAL_GROUP_RED");
                     if (red_env && strcmp(red_env, "0") == 0) {
                         dev->profile.mv_group_red = 0;
                     }
                 }
-                GGML_LOG_INFO("%s: hw row 0x%04x:0x%04x %s: CUs=%u, L1=%u KB/CU, L2=%u KB, BW=%.0f GB/s, mv_reduce=%u, f_scalar_w64=%u, mv_group=%u, attn_gate_fuse=%u, conv_l2_fold=%u, add_norm_fuse=%u, cb_seq=%u, q8_load_bytes=%u, q8_rows8_min=%u, q8_act_load_bytes=%u, set_nowait=%u, staging_keep=%u, mv_group_red=%u\n",
-                    __func__, pci_vendor, pci_device, row->chip,
-                    dev->profile.compute_units, dev->profile.l1_cache_per_cu / 1024,
-                    dev->profile.l2_cache_total / 1024, dev->profile.local_bandwidth / 1e9, dev->profile.mv_reduce, dev->profile.f_scalar_w64, dev->profile.mv_group, dev->profile.attn_gate_fuse, dev->profile.conv_l2_fold, dev->profile.add_norm_fuse, dev->profile.cb_seq, dev->profile.q8_load_bytes, dev->profile.q8_rows8_min, dev->profile.q8_act_load_bytes, dev->profile.set_nowait, dev->profile.staging_keep, dev->profile.mv_group_red);
-                break;
+                if (row != NULL || mv != NULL) {
+                    GGML_LOG_INFO("%s: hw row %s (%s): CUs=%u, L1=%u KB/CU, L2=%u KB, BW=%.0f GB/s, mv_reduce=%u, f_scalar_w64=%u, mv_group=%u, attn_gate_fuse=%u, conv_l2_fold=%u, add_norm_fuse=%u, cb_seq=%u, q8_load_bytes=%u, q8_rows8_min=%u, q8_act_load_bytes=%u, set_nowait=%u, staging_keep=%u, mv_group_red=%u\n",
+                        __func__, dev->profile.name, row != NULL ? row->chip : "",
+                        dev->profile.compute_units, dev->profile.l1_cache_per_cu / 1024,
+                        dev->profile.l2_cache_total / 1024, dev->profile.local_bandwidth / 1e9, dev->profile.mv_reduce, dev->profile.f_scalar_w64, dev->profile.mv_group, dev->profile.attn_gate_fuse, dev->profile.conv_l2_fold, dev->profile.add_norm_fuse, dev->profile.cb_seq, dev->profile.q8_load_bytes, dev->profile.q8_rows8_min, dev->profile.q8_act_load_bytes, dev->profile.set_nowait, dev->profile.staging_keep, dev->profile.mv_group_red);
+                }
             }
 
-            dev->profile.lane_ok = ggml_metal_lane_ok_mask(pci_vendor, pci_device);
-            dev->profile.pci_vendor = pci_vendor;
-            dev->profile.pci_device = pci_device;
+            dev->profile.lane_ok = ggml_metal_lane_ok_mask(dev->profile.name);
+            ggml_metal_tiled_test_arm();
 
-            // Per-shape matvec rows of this card (generated header; the rows of one card are contiguous).
-            // GGML_METAL_KQ_HW_ROWS=0 ignores them; GGML_METAL_KQ_PREP=0, GGML_METAL_KQ_COLS=0, GGML_METAL_KQ_EXT_ROWS=0 (the rows of matmul/batch-routes.tsv) switch one part off.
+            // Per-shape matvec rows of this card: data/matmul.tsv [matvec_shapes] (generated header; the rows of one card stand together).
+            // GGML_METAL_KQ_HW_ROWS=0 ignores them; GGML_METAL_KQ_PREP=0, GGML_METAL_KQ_COLS=0, GGML_METAL_KQ_EXT_ROWS=0 (the rows of data/matmul.tsv [tiles]) switch one part off.
             {
                 const char * rows_env = getenv("GGML_METAL_KQ_HW_ROWS");
                 const char * prep_env = getenv("GGML_METAL_KQ_PREP");
                 const char * cols_env = getenv("GGML_METAL_KQ_COLS");
                 const char * ext_env  = getenv("GGML_METAL_KQ_EXT_ROWS");
                 if (!(rows_env && strcmp(rows_env, "0") == 0)) {
-                    for (int i = 0; i < ggml_metal_hw_mv_rows_n; i++) {
-                        const struct ggml_device_mv_row * row = &ggml_metal_hw_mv_rows[i];
-                        if (row->pci_vendor != pci_vendor || row->pci_device != pci_device) {
-                            continue;
-                        }
-                        if (dev->profile.mv_rows == NULL) {
-                            dev->profile.mv_rows = row;
-                        }
-                        dev->profile.n_mv_rows++;
+                    uint32_t n_rows = 0;
+                    const struct ggml_device_mv_row * rows = ggml_metal_mv_rows_of(dev->profile.name, &n_rows);
+                    dev->profile.mv_rows   = rows;
+                    dev->profile.n_mv_rows = n_rows;
+                    for (uint32_t i = 0; i < n_rows; i++) {
+                        const struct ggml_device_mv_row * row = &rows[i];
                         if (row->prep == 1 && !(prep_env && strcmp(prep_env, "0") == 0)) {
                             dev->profile.kq_prep = 1;
                         }
@@ -478,7 +520,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
                     }
                 }
                 if (dev->profile.n_mv_rows > 0) {
-                    GGML_LOG_INFO("%s: hw mv rows 0x%04x:0x%04x: %u rows, kq_prep=%u, kq_cols=%u, ext_min rows=%u\n", __func__, pci_vendor, pci_device, dev->profile.n_mv_rows, dev->profile.kq_prep, dev->profile.kq_cols, (unsigned) ((ext_env && strcmp(ext_env, "0") == 0) ? 0 : ggml_metal_batch_rows_count(pci_vendor, pci_device)));
+                    GGML_LOG_INFO("%s: hw mv rows %s: %u rows, kq_prep=%u, kq_cols=%u, ext_min rows=%u\n", __func__, dev->profile.name, dev->profile.n_mv_rows, dev->profile.kq_prep, dev->profile.kq_cols, (unsigned) ((ext_env && strcmp(ext_env, "0") == 0) ? 0 : ggml_metal_batch_rows_count(dev->profile.name)));
                 }
             }
 
@@ -502,7 +544,8 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             snprintf(dev->props.name, sizeof(dev->props.name), "MTL%d:%s", device, [[dev->mtl_device name] UTF8String]);
             // desc set after family probing below
 
-            dev->library = ggml_metal_library_init(dev);
+            // built and probed for the wave width in one step (see ggml_metal_device_ensure_library)
+            ggml_metal_device_ensure_library(dev);
             if (!dev->library) {
                 GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
             }
@@ -515,18 +558,6 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             // We compile a simple kernel (kernel_concat_f32 has no function constants) and read
             // threadExecutionWidth from the resulting pipeline state. All kernels on a given
             // device share the same SIMD group width, so one probe is sufficient.
-            if (dev->library) {
-                struct ggml_metal_pipeline_with_params probe =
-                    ggml_metal_library_compile_pipeline(dev->library, "kernel_concat_f32", "kernel_concat_f32", NULL);
-                if (probe.pipeline) {
-                    const int tw = ggml_metal_pipeline_thread_execution_width(probe);
-                    if (tw > 0) {
-                        dev->profile.simd_width  = (uint32_t) tw;
-                        dev->library->simd_width = tw;
-                        GGML_LOG_INFO("%s: probed simd_width = %d\n", __func__, tw);
-                    }
-                }
-            }
 
             if (dev->props.use_residency_sets) {
                 dev->rsets = ggml_metal_rsets_init();
@@ -672,6 +703,7 @@ ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev) {
     return dev->library;
 }
 
+
 struct ggml_metal_event {
     void * obj; // id<MTLSharedEvent> — shared events support cross-device signaling
 
@@ -744,6 +776,10 @@ const struct ggml_device_profile * ggml_metal_device_get_profile(ggml_metal_devi
     return &dev->profile;
 }
 
+const struct ggml_metal_card * ggml_metal_device_get_card(ggml_metal_device_t dev) {
+    return &dev->card;
+}
+
 void ggml_metal_device_set_model_profile(ggml_metal_device_t dev,
         uint32_t n_embd, uint32_t n_ff, uint32_t n_layer,
         uint32_t n_head, uint32_t n_head_kv) {
@@ -762,22 +798,16 @@ const struct ggml_model_profile * ggml_metal_device_get_model_profile(ggml_metal
 
 
 #ifdef GGML_METAL_PROBES
-void ggml_metal_probe_choose_mode(ggml_metal_device_t dev, uint32_t vendor, uint32_t device) {
-    if (!ggml_metal_probe_enabled()) {
+// The sampling mode of a probe build, from the card's row of data/device.tsv [devices]: only where the timestamp counter worked.
+void ggml_metal_probe_choose_mode(ggml_metal_device_t dev, const struct ggml_metal_device_row * row) {
+    if (!ggml_metal_probe_enabled() || row->probe_timestamp != 1) {
         return;
     }
     id<MTLDevice> mtl = dev->mtl_device;
-    for (unsigned i = 0; i < sizeof(ggml_metal_probe_hw_rows)/sizeof(*ggml_metal_probe_hw_rows); ++i) {
-        const struct ggml_metal_probe_hw_row * row = &ggml_metal_probe_hw_rows[i];
-        if (row->vendor != vendor || row->device != device || row->timestamp != 1) {
-            continue;
-        }
-        if (row->dispatch == 1 && [mtl supportsCounterSampling:MTLCounterSamplingPointAtDispatchBoundary]) {
-            dev->probe_gpu_mode = GGML_METAL_PROBE_DISPATCH;
-        } else if (row->stage == 1 && [mtl supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
-            dev->probe_gpu_mode = GGML_METAL_PROBE_ENCODER;
-        }
-        return;
+    if (row->probe_dispatch == 1 && [mtl supportsCounterSampling:MTLCounterSamplingPointAtDispatchBoundary]) {
+        dev->probe_gpu_mode = GGML_METAL_PROBE_DISPATCH;
+    } else if (row->probe_stage == 1 && [mtl supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+        dev->probe_gpu_mode = GGML_METAL_PROBE_ENCODER;
     }
 }
 #endif

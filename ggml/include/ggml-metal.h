@@ -113,6 +113,19 @@ GGML_BACKEND_API int ggml_backend_metal_test_candidate_loader_version(void);
 // Thread-safe; makes no GPU call.
 GGML_BACKEND_API int ggml_backend_metal_test_dispatch_receipt(char * buf, size_t len, int reset);
 
+// The work plans of the tiled matmul kernel compiled into this build (the rows of ggml-metal/data/matmul.tsv [tiles]),
+// for a tool that measures them: their count, and the id of plan i (NULL outside 0 .. count - 1). Plan 0 is the default.
+// has_weight: 1 when the tiled kernel has an entry for this weight type. None of them opens a device.
+GGML_BACKEND_API int          ggml_backend_metal_tiled_plan_count(void);
+GGML_BACKEND_API const char * ggml_backend_metal_tiled_plan_id(int i);
+GGML_BACKEND_API int          ggml_backend_metal_tiled_has_weight(enum ggml_type type);
+// The eleven values of plan i in the column order of the table (warp to pad), written to values[0 .. 10]: returns 11,
+// or 0 outside the plans or when n < 11.
+GGML_BACKEND_API int          ggml_backend_metal_tiled_plan_values(int i, int32_t * values, int n);
+// The shape a tuned row records for a card: the wave width probed on this Metal device and the threadgroup memory it
+// allows. Returns 1, or 0 when dev is NULL or its wave width has not been probed (no backend was initialized on it).
+GGML_BACKEND_API int          ggml_backend_metal_tiled_card_shape(ggml_backend_dev_t dev, uint32_t * wave, uint32_t * group_bytes);
+
 #ifdef GGML_METAL_TEST_OBSERVER
 // Test-only observation API. It is absent from production builds.
 struct ggml_backend_metal_test_tensor_range {

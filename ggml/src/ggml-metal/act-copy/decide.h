@@ -1,6 +1,6 @@
 #pragma once
 
-// Whether an op converts its activations once to the model's precision. The rows are act-copy/act-copy.tsv.
+// Whether an op converts its activations once to the model's precision. The rows are data/arithmetic.tsv [copies].
 #include "ggml.h"
 
 #include <stdint.h>
@@ -9,12 +9,12 @@
 extern "C" {
 #endif
 
-// One row of act-copy/act-copy.tsv. family / route are the lane enums of lanes/select.h.
+// One row of data/arithmetic.tsv [copies]. family / route are the lane enums of lanes/select.h; card = the card's Metal
+// device name, compared whole.
 struct ggml_metal_act_copy_row {
     int          family;
     int          route;
-    uint32_t     pci_vendor;
-    uint32_t     pci_device;
+    const char * card;
     int          copy;        // ggml_type of the copy
     int          applies;
     int          min_rereads;
@@ -40,7 +40,7 @@ const struct ggml_metal_act_copy_row * ggml_metal_act_copy_rows_get(int * n);
 // precision GGML_TYPE_COUNT = not known. The copy is never narrower than the model's precision: a row is
 // matched on copy == precision only.
 const struct ggml_metal_act_copy_row * ggml_metal_act_copy_decide_in(
-        const struct ggml_metal_act_copy_row * rows, int n, uint32_t pci_vendor, uint32_t pci_device,
+        const struct ggml_metal_act_copy_row * rows, int n, const char * card,
         int family, int route, enum ggml_type precision, enum ggml_type src, int64_t rereads, uint64_t bytes, int * why);
 
 const char * ggml_metal_act_copy_why_name(int why);

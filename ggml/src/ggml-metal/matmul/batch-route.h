@@ -1,7 +1,7 @@
 #pragma once
 
-// Which kernel takes a matmul with several activation columns. The per-card rows are matmul/batch-routes.tsv,
-// turned into batch-routes-table.h at configure time. No device and no Metal here: the host test compiles this as is.
+// Which kernel takes a matmul with several activation columns. The per-card rows are the thresholds of the tuned rows
+// of data/matmul.tsv [tiles], turned into batch-routes-table.h at configure time. No device and no Metal here: the host test compiles this as is.
 #include "formats.h"
 
 #include <stdbool.h>
@@ -13,10 +13,9 @@ extern "C" {
 
 enum mv_batch_route { MV_BATCH_NONE, MV_BATCH_EXT, MV_BATCH_TILED };
 
-// One row of batch-routes.tsv; 0 in a column count = the cell is "-".
+// The thresholds of one tuned row; card = the card's Metal device name, compared whole; 0 in a column count = the cell is "-".
 struct mv_batch_row {
-    uint32_t       pci_vendor;
-    uint32_t       pci_device;
+    const char *   card;
     enum ggml_type type;
     int            ext_from;
     int            tiled_from;
@@ -41,10 +40,10 @@ const struct mv_batch_row * ggml_metal_batch_rows_get(int * n);
 
 // The row of (card, weight type), or NULL.
 const struct mv_batch_row * ggml_metal_batch_row_in(
-        const struct mv_batch_row * rows, int n, uint32_t pci_vendor, uint32_t pci_device, enum ggml_type type);
+        const struct mv_batch_row * rows, int n, const char * card, enum ggml_type type);
 
 // Rows of this card.
-int ggml_metal_batch_rows_count(uint32_t pci_vendor, uint32_t pci_device);
+int ggml_metal_batch_rows_count(const char * card);
 
 // The route of one op. NONE = neither kernel: the matrix, one-column or fallback route decides.
 enum mv_batch_route ggml_metal_batch_route_decide(const struct mv_batch_in * in);

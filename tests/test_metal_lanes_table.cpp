@@ -1,8 +1,10 @@
 // Lane wiring table checks, host only: no GPU, no model.
-// usage: test_metal_lanes_table <path to ggml/src/ggml-metal>
+// usage: test_metal_lanes_table <path to ggml/src/ggml-metal> [<reason> <test>: the texts the matmul mm-tiled row must hold]
 #include "lanes/select.h"
+#include "lanes-table.h" // the generated capability names (enum ggml_metal_lane_cap)
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -29,8 +31,8 @@ static int check_defaults(const std::vector<ggml_metal_lane_row> & rows, bool pr
 }
 
 int main(int argc, char ** argv) {
-    if (argc != 2) {
-        std::printf("usage: %s <ggml-metal source dir>\n", argv[0]);
+    if (argc != 2 && argc != 4) {
+        std::printf("usage: %s <ggml-metal source dir> [<reason> <test>]\n", argv[0]);
         return 2;
     }
     int n = 0, ncap = 0;
@@ -55,11 +57,90 @@ int main(int argc, char ** argv) {
     // 3. every card with rows, and a card with none, gets an exact or upstream row for every request
     std::vector<uint32_t> masks = { 0u };
     for (int i = 0; i < ncap; ++i) {
-        masks.push_back(ggml_metal_lane_ok_mask(caps[i].pci_vendor, caps[i].pci_device));
+        masks.push_back(ggml_metal_lane_ok_mask(caps[i].card));
     }
-    if (ggml_metal_lane_ok_mask(0x106b, 0x0001) != 0) {
+    if (ggml_metal_lane_ok_mask("Apple M1") != 0 || ggml_metal_lane_ok_mask("") != 0 || ggml_metal_lane_ok_mask(nullptr) != 0) {
         std::printf("FAIL a card with no capability rows has lanes\n");
         failures++;
+    }
+    // 3a. the shipped capabilities, written here apart from the table: the name each card reports to Metal and how many
+    // capabilities are reached and correct on it, and
+    // which capabilities those are. A name one character off, in another case or with a space gets none.
+    const uint32_t pk = 1u << GGML_METAL_LANE_CAP_PK_MUL_F16;
+    static const struct { const char * card; int usable; uint32_t set; } expected[] = {
+        { "AMD Radeon Pro 5500M", 1, pk }, { "Intel(R) UHD Graphics 630", 1, pk }, { "AMD Radeon Pro Vega 64", 0, 0 }, { "AMD Radeon HD - FirePro D700", 0, 0 },
+        { "AMD Radeon Pro 5500", 0, 0 }, { "amd radeon pro 5500m", 0, 0 }, { "AMD Radeon Pro 5500M ", 0, 0 }, { "Intel(R) UHD Graphics 63", 0, 0 },
+    };
+    for (const auto & e : expected) {
+        const uint32_t mask = ggml_metal_lane_ok_mask(e.card);
+        int bits = 0;
+        for (int b = 0; b < 32; ++b) bits += (mask >> b) & 1u;
+        if (bits != e.usable) {
+            std::printf("FAIL card '%s': %d usable capabilities, expected %d\n", e.card, bits, e.usable);
+            failures++;
+        }
+        if (mask != e.set) {
+            std::printf("FAIL card '%s': capability set 0x%x, expected 0x%x\n", e.card, mask, e.set);
+            failures++;
+        }
+    }
+    // 3b. every shipped capability row, written here apart from the table, in its order: card, capability, in_hardware, reached, correct
+    static const struct { const char * card; int capability; int in_hardware, reached, correct; } pinned[] = {
+        { "AMD Radeon Pro 5500M", GGML_METAL_LANE_CAP_PK_MUL_F16, 1, 1, 1 },
+        { "AMD Radeon Pro 5500M", GGML_METAL_LANE_CAP_DOT2_F32_F16, 1, 0, -1 },
+        { "AMD Radeon Pro 5500M", GGML_METAL_LANE_CAP_DOT4_I32_I8, 1, -1, 0 },
+        { "AMD Radeon Pro 5500M", GGML_METAL_LANE_CAP_DOT8_I32_I4, 1, -1, -1 },
+        { "AMD Radeon Pro 5500M", GGML_METAL_LANE_CAP_MATRIX8X8, 0, 0, 0 },
+        { "AMD Radeon Pro Vega 64", GGML_METAL_LANE_CAP_PK_MUL_F16, 1, -1, -1 },
+        { "AMD Radeon Pro Vega 64", GGML_METAL_LANE_CAP_DOT2_F32_F16, 0, 0, 0 },
+        { "AMD Radeon Pro Vega 64", GGML_METAL_LANE_CAP_DOT4_I32_I8, 0, 0, 0 },
+        { "AMD Radeon Pro Vega 64", GGML_METAL_LANE_CAP_DOT8_I32_I4, 0, 0, 0 },
+        { "AMD Radeon Pro Vega 64", GGML_METAL_LANE_CAP_MATRIX8X8, 0, 0, 0 },
+        { "AMD Radeon HD - FirePro D700", GGML_METAL_LANE_CAP_PK_MUL_F16, 0, -1, -1 },
+        { "AMD Radeon HD - FirePro D700", GGML_METAL_LANE_CAP_DOT2_F32_F16, 0, 0, 0 },
+        { "AMD Radeon HD - FirePro D700", GGML_METAL_LANE_CAP_DOT4_I32_I8, 0, 0, 0 },
+        { "AMD Radeon HD - FirePro D700", GGML_METAL_LANE_CAP_DOT8_I32_I4, 0, 0, 0 },
+        { "AMD Radeon HD - FirePro D700", GGML_METAL_LANE_CAP_MATRIX8X8, 0, 0, 0 },
+        { "Intel(R) UHD Graphics 630", GGML_METAL_LANE_CAP_PK_MUL_F16, 1, 1, 1 },
+        { "Intel(R) UHD Graphics 630", GGML_METAL_LANE_CAP_DOT4_I32_I8, 0, -1, 1 },
+    };
+    const int npinned = (int) (sizeof(pinned) / sizeof(pinned[0]));
+    if (ncap != npinned) {
+        std::printf("FAIL pinned rows: the table has %d capability rows, %d are written here\n", ncap, npinned);
+        failures++;
+    }
+    for (int i = 0; i < ncap && i < npinned; ++i) {
+        const auto & p = pinned[i];
+        if (std::strcmp(caps[i].card, p.card) != 0 || caps[i].capability != p.capability || caps[i].in_hardware != p.in_hardware || caps[i].reached != p.reached || caps[i].correct != p.correct) {
+            std::printf("FAIL pinned row %d: '%s' capability %d is %d %d %d, written here: '%s' capability %d is %d %d %d\n", i + 1,
+                    caps[i].card, caps[i].capability, caps[i].in_hardware, caps[i].reached, caps[i].correct, p.card, p.capability, p.in_hardware, p.reached, p.correct);
+            failures++;
+        }
+    }
+    // 3c. with two more arguments: the reason and test texts of the matmul mm-tiled row, as the table holds them
+    if (argc == 4) {
+        bool found = false;
+        for (const auto & row : rows) {
+            if (row.family != GGML_METAL_LANE_FAMILY_MATMUL || row.route != GGML_METAL_LANE_ROUTE_MM_TILED) continue;
+            found = true;
+            if (std::strcmp(row.reason, argv[2]) != 0 || std::strcmp(row.test, argv[3]) != 0) {
+                std::printf("FAIL texts of the mm-tiled row: reason '%s' test '%s'\n", row.reason, row.test);
+                failures++;
+            }
+        }
+        if (!found) {
+            std::printf("FAIL texts: the table has no matmul mm-tiled row\n");
+            failures++;
+        }
+    }
+    // every capability row belongs to one of the four cards named above
+    for (int i = 0; i < ncap; ++i) {
+        bool known = false;
+        for (int e = 0; e < 4; ++e) known = known || std::strcmp(caps[i].card, expected[e].card) == 0;
+        if (!known) {
+            std::printf("FAIL capability row of card '%s' is not a card of this test\n", caps[i].card);
+            failures++;
+        }
     }
     const enum ggml_type acts[] = { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 };
     int picks = 0;

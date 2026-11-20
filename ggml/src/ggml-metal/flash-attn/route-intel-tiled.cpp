@@ -1,7 +1,7 @@
 #include "../ops/ggml-metal-ops-internal.h"
 #include "fa-shared.h"
 
-// Intel tiled route: K/V tiled into threadgroup memory. Its row of routes.tsv names the head size it has kernels for.
+// Intel tiled route: K/V tiled into threadgroup memory. Its row of attention.tsv names the head size it has kernels for.
 int ggml_metal_fa_route_intel_tiled(ggml_metal_op_t ctx, int idx, const struct fa_shared & s) {
     ggml_tensor * op = ctx->node(idx);
     ggml_metal_library_t lib = ctx->lib;
@@ -141,5 +141,5 @@ int ggml_metal_fa_route_intel_tiled(ggml_metal_op_t ctx, int idx, const struct f
         return 1;
     }
 
-    GGML_ABORT("flash attention: the Intel tiled route has no kernel for this head size; see the head cell of routes.tsv");
+    GGML_ABORT("flash attention: the Intel tiled route has no kernel for this head size; see the head cell of attention.tsv");
 }

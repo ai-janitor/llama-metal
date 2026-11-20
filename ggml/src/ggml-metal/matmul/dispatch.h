@@ -20,6 +20,9 @@ static inline const struct ggml_device_mv_row * ggml_metal_mv_hw_row(
     }
     for (uint32_t i = 0; i < profile->n_mv_rows; i++) {
         const struct ggml_device_mv_row * row = &profile->mv_rows[i];
+        if ((row->form & 4) != 0 && profile->simd_width != 64) {
+            continue; // paired halves are the two halves of a 64-thread wave
+        }
         if (row->kind == kind && row->type == (int32_t) type && row->ne00 == ne00 && row->ne01 == ne01 && row->cols == cols && (row->prep != 1 || prep_ok)) {
             return row;
         }
@@ -84,7 +87,7 @@ static inline enum mv_batch_route ggml_metal_batch_route(ggml_metal_op_t ctx, in
     int n_rows = 0;
     const struct mv_batch_row * rows = ggml_metal_batch_rows_get(&n_rows);
     const struct mv_batch_row * row = ggml_metal_batch_rows_off() ? nullptr
-        : ggml_metal_batch_row_in(rows, n_rows, profile->pci_vendor, profile->pci_device, type);
+        : ggml_metal_batch_row_in(rows, n_rows, profile->name, type);
 
     struct mv_batch_in in = {};
     in.fmt             = ggml_metal_mv_format(type);
@@ -110,6 +113,9 @@ int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx);
 
 // Matrix-matrix multiplication — simdgroup_mm (Apple Silicon) and tiled (AMD/Intel).
 int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx);
+// Test hook GGML_METAL_TEST_TILED_PLAN (matmul/dispatch-matmul.cpp): a route other than the matmul route took nodes
+// idx .. idx + n - 1; the mul_mat nodes among them that the hook applies to are counted under that route's name.
+void ggml_metal_tiled_test_route(ggml_metal_op_t ctx, int idx, int n, const char * route);
 
 // Scalar mul_mv — workhorse for single-token generation (batch=1).
 int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx);

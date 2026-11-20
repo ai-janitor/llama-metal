@@ -17,11 +17,11 @@ GGML_METAL_FAMILY(matmul) int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx
 
     // 1. Grouped: fuse consecutive q4_K/q6_K matvecs
     n = dispatch_mul_mat_grouped(ctx, idx);
-    if (n > 0) return n;
+    if (n > 0) { ggml_metal_tiled_test_route(ctx, idx, n, "grouped"); return n; }
 
     // 2. Ext: small-batch mul_mv_ext kernels (BS=2..8)
     n = dispatch_mul_mat_ext(ctx, idx);
-    if (n > 0) return n;
+    if (n > 0) { ggml_metal_tiled_test_route(ctx, idx, n, "ext"); return n; }
 
     // 3. Matmul: simdgroup_mm or tiled matmul for large batches
     n = dispatch_mul_mat_matmul(ctx, idx);
@@ -29,11 +29,11 @@ GGML_METAL_FAMILY(matmul) int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx
 
     // 4. Scalar: per-type matvec (the workhorse for single-token generation)
     n = dispatch_mul_mat_scalar(ctx, idx);
-    if (n > 0) return n;
+    if (n > 0) { ggml_metal_tiled_test_route(ctx, idx, n, "scalar"); return n; }
 
     // 5. GCN fallback: f32/f16/bf16 on AMD GCN where scalar shmem_reduce is broken
     n = dispatch_mul_mat_gcn(ctx, idx);
-    if (n > 0) return n;
+    if (n > 0) { ggml_metal_tiled_test_route(ctx, idx, n, "gcn"); return n; }
 
     GGML_ASSERT(false && "mul_mat: no dispatch path available");
     return 1;

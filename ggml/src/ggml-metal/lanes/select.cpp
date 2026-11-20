@@ -2,6 +2,8 @@
 
 #include "lanes-table.h"
 
+#include <cstring>
+
 const struct ggml_metal_lane_row * ggml_metal_lane_rows_get(int * n) {
     *n = (int) (sizeof(ggml_metal_lane_rows) / sizeof(ggml_metal_lane_rows[0]));
     return ggml_metal_lane_rows;
@@ -12,10 +14,13 @@ const struct ggml_metal_lane_cap_row * ggml_metal_lane_cap_rows_get(int * n) {
     return ggml_metal_lane_cap_rows;
 }
 
-uint32_t ggml_metal_lane_ok_mask(uint32_t pci_vendor, uint32_t pci_device) {
+uint32_t ggml_metal_lane_ok_mask(const char * card) {
     uint32_t mask = 0;
+    if (card == nullptr) {
+        return mask;
+    }
     for (const auto & row : ggml_metal_lane_cap_rows) {
-        if (row.pci_vendor == pci_vendor && row.pci_device == pci_device && row.reached == 1 && row.correct == 1) {
+        if (std::strcmp(row.card, card) == 0 && row.reached == 1 && row.correct == 1) {
             mask |= 1u << row.capability;
         }
     }

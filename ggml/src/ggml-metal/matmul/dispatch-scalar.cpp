@@ -661,6 +661,9 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
         }
     }
     // A cols row of this card takes a 2-4 column decode batch of this weight in one launch (grid 1 in y).
+    const int nr0_single = nr0_dynamic;
+    const bool kq_prep_single = kq_prep;
+    const ggml_metal_buffer_id bid_kq_prep_single = bid_kq_prep;
     int ncols = 0;
     int col_form = 0;
     if (kquant_rows && type != GGML_TYPE_Q5_K && ne11 >= 2 && ne11 <= 4 && !use_residual && !src1_trans_mv && op->src[1]->type == GGML_TYPE_F32 &&
@@ -676,8 +679,8 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
         if (cols_row != nullptr || cols_test) {
             ncols = ne11;
             col_form = cols_row != nullptr ? cols_row->form : test_form;
-            if (ne11 == 4) {
-                col_form &= 3; // paired halves take 2 or 3 columns
+            if (ne11 == 4 || profile->simd_width != 64) {
+                col_form &= 3; // paired halves take 2 or 3 columns and are the two halves of a 64-thread wave
             }
             nr0_dynamic = cols_row != nullptr ? cols_row->nr0 : test_nr0;
             kq_prep = cols_row != nullptr ? cols_row->prep == 1 : bid_cols.metal != nullptr;
@@ -685,6 +688,24 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
         }
     }
     auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, src1_trans_mv, nr0_dynamic, use_residual, kq_prep, ncols, col_form);
+
+    // The column kernel is held to the pipeline as compiled, whatever the row or the test switch asked for.
+    if (pipeline.pipeline && ncols > 0) {
+        const int rows_per_tg = pipeline.nr0 * pipeline.nsg;
+        if (rows_per_tg <= 0 || ne01 % rows_per_tg != 0) {
+            // it loads every weight row of a threadgroup before the output bound: a partial last threadgroup takes the per-column launch
+            ncols = 0;
+            col_form = 0;
+            nr0_dynamic = nr0_single;
+            kq_prep = kq_prep_single;
+            bid_kq_prep = bid_kq_prep_single;
+            pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, src1_trans_mv, nr0_dynamic, use_residual, kq_prep, ncols, col_form);
+        } else if ((col_form & 4) != 0 && ggml_metal_pipeline_thread_execution_width(pipeline) != 64) {
+            // paired halves split the wave at thread 32: a pipeline compiled to another width takes the ordinary column form
+            col_form &= 3;
+            pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, src1_trans_mv, nr0_dynamic, use_residual, kq_prep, ncols, col_form);
+        }
+    }
 
     if (!pipeline.pipeline) {
         return 0;
@@ -934,6 +955,7 @@ int ggml_metal_op_norm_matvec(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BE
     }
     ggml_metal_encoder_set_dispatch_shape(enc, args.ne00, total*rows_per_group);
     ggml_metal_encoder_dispatch_threadgroups(enc, total, 1, 1, width, 1, 1);
+    ggml_metal_tiled_test_route(ctx, idx, 2 + nmat, "norm-matvec");
     return 2 + nmat;
 }
 

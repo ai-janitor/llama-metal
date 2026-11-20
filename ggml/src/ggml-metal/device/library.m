@@ -120,6 +120,15 @@ int ggml_metal_pipeline_thread_execution_width(struct ggml_metal_pipeline_with_p
 }
 
 ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
+    // Test hook, inert unless set: GGML_METAL_TEST_LIBRARY_FAIL_FIRST makes the first library build of the process
+    // fail, so the retry in the context init can be exercised.
+    if (getenv("GGML_METAL_TEST_LIBRARY_FAIL_FIRST")) {
+        static atomic_flag test_library_failed = ATOMIC_FLAG_INIT;
+        if (!atomic_flag_test_and_set(&test_library_failed)) {
+            GGML_LOG_ERROR("%s: error: library build failed (forced by GGML_METAL_TEST_LIBRARY_FAIL_FIRST)\n", __func__);
+            return NULL;
+        }
+    }
     id<MTLLibrary> library = nil;
     id<MTLDevice> device = ggml_metal_device_get_obj(dev);
 
@@ -375,6 +384,11 @@ void ggml_metal_library_free(ggml_metal_library_t lib) {
 }
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_metal_library_t lib, const char * name) {
+    // No library (its build failed): no pipeline. Callers treat an empty pipeline as "this kernel is not available".
+    if (lib == NULL) {
+        struct ggml_metal_pipeline_with_params none = { .pipeline = nil };
+        return none;
+    }
     [lib->lock lock];
 
     struct ggml_metal_pipeline_with_params res = {
@@ -409,6 +423,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline(ggml_meta
 }
 
 struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_metal_library_t lib, const char * base, const char * name, ggml_metal_cv_t cv) {
+    // No library (its build failed): no pipeline. Callers treat an empty pipeline as "this kernel is not available".
+    if (lib == NULL) {
+        struct ggml_metal_pipeline_with_params none = { .pipeline = nil };
+        return none;
+    }
     struct ggml_metal_pipeline_with_params res = {
         /*.pipeline =*/ nil,
         /*.nsg      =*/ 0,

@@ -4,6 +4,7 @@
 # decline (no kernel for the head size), and the walk goes on. No row matches = the op is not taken here. No file is read at run time.
 # To add a route: write flash-attn/route-<name>.cpp, add its name to the generator and the router, then add its row.
 # In every condition column, any = the column does not restrict the row.
+# The first row is the header and is required as written: the generator reads the cells by position.
 # Columns
 #   order: the place in the walk, counting up from 1 with no gap.
 #   route: intel-tiled | scalar | matrix | vec. The encoder the row selects.

@@ -30,9 +30,9 @@ enum ggml_gpu_connection {
 // Per-shape matvec row of a card: a K-quant weight of this type and shape runs nr0 rows per simdgroup.
 // kind 0 = single matvec, 1 = grouped launch of such members; prep 1 = only with headers prepared at load;
 // cols 1 = one activation column, 2-4 = a decode batch of that many columns in one launch, in loop form "form".
+// card = the card's Metal device name, compared whole.
 struct ggml_device_mv_row {
-    uint32_t pci_vendor;
-    uint32_t pci_device;
+    const char * card;
     int32_t  kind;
     int32_t  type; // ggml_type
     int64_t  ne00;
@@ -46,7 +46,7 @@ struct ggml_device_mv_row {
 struct ggml_device_profile {
     // Identity
     enum ggml_gpu_vendor vendor;
-    char name[64];
+    char name[64]; // the device's name; 63 bytes are kept, so a name of 63 bytes here may be a longer one cut short (table rows hold at most 62)
 
     // Memory path
     bool     shared_memory;       // true = unified/UMA, false = discrete
@@ -108,7 +108,7 @@ struct ggml_device_profile {
     // 1 = the grouped K-quant matvec stores every row before the row sums, lane k sums row k (from the hw row).
     uint32_t mv_group_red;
 
-    // Per-shape matvec rows of this card (generated hw mv rows): rows per simdgroup per K-quant weight shape; none = defaults.
+    // Per-shape matvec rows of this card (generated from data/matmul.tsv [matvec_shapes]): rows per simdgroup per K-quant weight shape; none = defaults.
     const struct ggml_device_mv_row * mv_rows;
     uint32_t n_mv_rows;
 
@@ -122,10 +122,6 @@ struct ggml_device_profile {
 
     // Bit i set = lane capability i is reached and correct on this card (generated capability rows); 0 = base lanes only.
     uint32_t lane_ok;
-
-    // PCI ids of the card, 0 when it has none (Apple Silicon): the key of per-card table rows.
-    uint32_t pci_vendor;
-    uint32_t pci_device;
 };
 
 #ifdef __cplusplus

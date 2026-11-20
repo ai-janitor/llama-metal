@@ -13,7 +13,8 @@
 
 #import "ggml-impl.h"
 #import "ggml-device-profile.h"
-#import "ggml-metal-hw-rows.h"
+#import "device-rows.h"  // generated from data/device.tsv [devices]
+#import "matvec-rows.h"  // generated from data/matmul.tsv [matvec_defaults] and [matvec_shapes]
 
 #include <Foundation/Foundation.h>
 
@@ -148,6 +149,7 @@ struct ggml_metal_device {
     struct ggml_metal_device_props props;
 
     struct ggml_device_profile profile;
+    struct ggml_metal_card       card;             // card object (card-object.h), filled at init
     struct ggml_model_profile  model_profile;  // set via ggml_backend_metal_set_model_profile()
 
     // virtual address for GPU memory allocations
@@ -190,7 +192,7 @@ struct ggml_metal_supports_table ggml_metal_supports_table_unary(void);
 void ggml_metal_device_placement_init(ggml_metal_device_t dev);
 
 #ifdef GGML_METAL_PROBES
-void ggml_metal_probe_choose_mode(ggml_metal_device_t dev, uint32_t vendor, uint32_t device);
+void ggml_metal_probe_choose_mode(ggml_metal_device_t dev, const struct ggml_metal_device_row * row);
 ggml_metal_profiler_t ggml_metal_probe_profiler_init(ggml_metal_device_t dev);
 bool ggml_metal_probe_profiler_begin(ggml_metal_profiler_t prof, int n_nodes);
 bool ggml_metal_probe_profiler_finish(ggml_metal_profiler_t prof);

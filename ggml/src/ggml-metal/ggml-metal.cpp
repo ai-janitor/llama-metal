@@ -270,6 +270,19 @@ static const char * ggml_backend_metal_device_get_name(ggml_backend_dev_t dev) {
     return props_dev->name;
 }
 
+int ggml_backend_metal_tiled_card_shape(ggml_backend_dev_t dev, uint32_t * wave, uint32_t * group_bytes) {
+    if (dev == nullptr || dev->context == nullptr || wave == nullptr || group_bytes == nullptr) {
+        return 0;
+    }
+    const struct ggml_metal_card * card = ggml_metal_device_get_card((ggml_metal_device_t) dev->context);
+    if (card == nullptr || card->wave_probed == 0) {
+        return 0;
+    }
+    *wave        = card->wave;
+    *group_bytes = card->group_mem;
+    return 1;
+}
+
 static const char * ggml_backend_metal_device_get_description(ggml_backend_dev_t dev) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 

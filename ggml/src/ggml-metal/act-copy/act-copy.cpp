@@ -52,7 +52,7 @@ void ggml_metal_act_copy_reserve(struct ggml_metal_act_copy * st, ggml_metal_dev
             const uint64_t bytes = (uint64_t) elem * (uint64_t) ggml_nelements(src);
             int why = 0;
             // the largest re-read count: the op's own count is checked when it is encoded
-            ggml_metal_act_copy_decide_in(rows, n, profile->pci_vendor, profile->pci_device, user.family, user.route,
+            ggml_metal_act_copy_decide_in(rows, n, profile->name, user.family, user.route,
                     st->precision, src->type, INT64_MAX, bytes, &why);
             if (why == GGML_METAL_ACT_COPY_APPLIES) need = std::max(need, (size_t) bytes);
         }
@@ -76,7 +76,7 @@ struct ggml_metal_act_plan ggml_metal_act_copy_plan(ggml_metal_op_t ctx, int idx
     const uint64_t bytes = (uint64_t) elem * (uint64_t) ggml_nelements(src);
     int n = 0;
     const struct ggml_metal_act_copy_row * rows = ggml_metal_act_copy_rows_get(&n);
-    plan.row = ggml_metal_act_copy_decide_in(rows, n, profile->pci_vendor, profile->pci_device, family, route,
+    plan.row = ggml_metal_act_copy_decide_in(rows, n, profile->name, family, route,
             st->precision, src->type, rereads, bytes, &plan.why);
     if (plan.why != GGML_METAL_ACT_COPY_APPLIES || st->buf == nullptr || bytes > st->size) {
         return plan;
@@ -104,8 +104,8 @@ struct ggml_metal_act_plan ggml_metal_act_copy_plan(ggml_metal_op_t ctx, int idx
     }
     if (first) {
         static const char * const steps[] = { "?", "native", "exact-other", "wider", "narrower" };
-        GGML_LOG_INFO("act-copy: family %d route %d weight %s on %04x:%04x: copy %s (%s) · lane %s step %s (%s)\n",
-                family, route, ggml_type_name(ctx->node(idx)->src[0]->type), profile->pci_vendor, profile->pci_device,
+        GGML_LOG_INFO("act-copy: family %d route %d weight %s on %s: copy %s (%s) · lane %s step %s (%s)\n",
+                family, route, ggml_type_name(ctx->node(idx)->src[0]->type), profile->name,
                 ggml_type_name(plan.type), plan.row->reason,
                 plan.lane ? plan.lane->lane : "none", steps[plan.lane ? plan.lane_step : 0], plan.lane ? plan.lane->reason : "no lane holds the type");
     }

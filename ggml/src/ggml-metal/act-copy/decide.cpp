@@ -3,13 +3,15 @@
 
 #include "act-copy-table.h"
 
+#include <cstring>
+
 const struct ggml_metal_act_copy_row * ggml_metal_act_copy_rows_get(int * n) {
     *n = (int) (sizeof(ggml_metal_act_copy_rows) / sizeof(ggml_metal_act_copy_rows[0]));
     return ggml_metal_act_copy_rows;
 }
 
 const struct ggml_metal_act_copy_row * ggml_metal_act_copy_decide_in(
-        const struct ggml_metal_act_copy_row * rows, int n, uint32_t pci_vendor, uint32_t pci_device,
+        const struct ggml_metal_act_copy_row * rows, int n, const char * card,
         int family, int route, enum ggml_type precision, enum ggml_type src, int64_t rereads, uint64_t bytes, int * why) {
     int step = GGML_METAL_ACT_COPY_APPLIES;
     const struct ggml_metal_act_copy_row * row = nullptr;
@@ -18,9 +20,9 @@ const struct ggml_metal_act_copy_row * ggml_metal_act_copy_decide_in(
     } else if (src != GGML_TYPE_F32) {
         step = GGML_METAL_ACT_COPY_NOT_F32;
     } else {
-        for (int i = 0; i < n; ++i) {
-            if (rows[i].family == family && rows[i].route == route && rows[i].pci_vendor == pci_vendor &&
-                rows[i].pci_device == pci_device && rows[i].copy == (int) precision) {
+        for (int i = 0; card != nullptr && i < n; ++i) {
+            if (rows[i].family == family && rows[i].route == route && rows[i].copy == (int) precision &&
+                std::strcmp(rows[i].card, card) == 0) {
                 row = &rows[i];
                 break;
             }

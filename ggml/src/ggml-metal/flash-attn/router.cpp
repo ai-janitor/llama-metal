@@ -84,7 +84,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE
         bid_dst, bid_pad, bid_blk, bid_tmp,
     };
 
-    // The rows of routes.tsv decide the route, in file order. Why each row is there is its note cell.
+    // The rows of attention.tsv decide the route, in file order. Why each row is there is its note cell.
     // GGML_METAL_FA_SCALAR set keeps the Intel tiled route out.
     const bool force_scalar = getenv("GGML_METAL_FA_SCALAR") != nullptr;
     const bool f_matrix  = profile->has_matrix_hw;
@@ -113,5 +113,5 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE
         }
     }
 
-    GGML_ABORT("flash attention: no row of routes.tsv matches");
+    GGML_ABORT("flash attention: no row of attention.tsv matches");
 }
