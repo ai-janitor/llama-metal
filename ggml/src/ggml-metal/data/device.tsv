@@ -4,23 +4,23 @@
 # Cells are separated by one tab. No file is read at run time: the generator below runs when CMake configures.
 #
 # [devices]: one row per card. device/gen-devices.cmake compiles the rows in (device-rows.h); device/init.m reads the
-# row of the card it runs on (ggml_metal_device_row_of) after its own sizing estimates, and a cell that is not - replaces
-# the estimate or the default. A card with no row keeps the estimates and defaults: sizes from the name fragments in
-# device/init.m when one matches, every switch off, one command buffer.
+# row of the card it runs on (ggml_metal_device_row_of): a written cell sets the value, a - leaves it not known (sizes)
+# or off (switches). A card with no row has no sizes, every switch off, one command buffer; rules that read a size
+# (the matvec cache rule reads l1_bytes_per_cu) then run their setting for an unmeasured card.
 # To add a card: run any prompt on it, copy its name from the log, write the cells you measured and - for the rest, and
 # say in evidence where each cell comes from (specification, measurement, estimate).
 # In the on | off | - columns, - leaves the switch as it is without a row (off).
 #   card: the card's name as Metal reports it, exactly: the text after "found device: " in the log of any run on that card
 #       (for example: AMD Radeon Pro Vega 64). A name that differs by one character matches no card. At most 62 bytes. One row per card.
 #   chip: the chip's name for the reader, printed in the log. Free text, no tab, or -.
-#   architecture: the chip's architecture label for the reader (for example gcn1, gcn5, rdna1). Free text, no tab, or -.
+#   architecture: the family of [families] the card belongs to (for example gcn1, gcn5, rdna1), or -.
 #   wave: threads of one wave on the card, as measured (the log line "probed simd_width"), or -. For the reader: the backend probes the width itself.
 #   group_bytes: bytes of threadgroup memory the card allows (MTLDevice maxThreadgroupMemoryLength), or -. For the reader: the backend asks the device.
-#   cu: compute units, a number above 0, or - = keep the estimate.
-#   l1_bytes_per_cu: level-1 cache per compute unit in bytes, or - = keep the estimate.
-#   l2_bytes: level-2 cache in bytes, or - = keep the estimate.
-#   local_Bps: memory bandwidth of the card in bytes per second, or - = keep the estimate.
-#   transfer_Bps: host to card transfer bandwidth in bytes per second, or - = keep the estimate.
+#   cu: compute units, a number above 0, or - = not known.
+#   l1_bytes_per_cu: level-1 cache per compute unit in bytes, or - = not known.
+#   l2_bytes: level-2 cache in bytes, or - = not known.
+#   local_Bps: memory bandwidth of the card in bytes per second, or - = not known.
+#   transfer_Bps: host to card transfer bandwidth in bytes per second, or - = not known.
 #   attn_gate_fuse: on | off | -. on = the attention gate's copy, sigmoid, copy and multiply run as one launch.
 #   conv_l2_fold: on | off | -. on = the conv_state launch also writes the split_l2 norms of its q and k heads.
 #   add_norm_fuse: on | off | -. on = a residual add, the rms norm of its sum and the weight multiply run as one launch.
@@ -32,8 +32,21 @@
 #   probe_blit: on | off | -. Counter sampling at blit boundaries worked. For the reader: no code reads it.
 #   probe_timestamp: on | off | -. The timestamp counter worked. A probe build samples only on a card whose row says on here.
 #   evidence: where each cell or group of cells comes from: specification, measurement (with its numbers) or estimate. Free text, no tab.
+#
+# [families]: one row per family of cards. A card is a member when its [devices] row names the family in architecture, or,
+# when it has no row or its row's architecture is -, when Metal reports the family's metal_name for it; and only while the
+# vendor the backend detected is the family's and the card reports the family's wave and group_bytes. A family has no settings of its own: rows keyed family:<name> in data/matmul.tsv are copies of a measured
+# member's rows, the candidates a sweep tries first on another member (ggml_metal_family_row_of, device-rows.h).
+#   family: the family's name: lower-case letters and digits (for example gcn1). One row per family.
+#   vendor: amd | apple | intel | nvidia.
+#   metal_name: the architecture name Metal reports for the family's cards (MTLDevice.architecture.name, macOS 14 and later), or - = not known. Two families never share a name.
+[families]
+family	vendor	metal_name	wave	group_bytes	evidence
+gcn1	amd	-	64	32768	wave and group_bytes: as the FirePro D700 reports them. metal_name: not read (the D700 runs macOS 12, which has no architecture name).
+gcn5	amd	-	64	65536	wave and group_bytes: as the Radeon Pro Vega 64 reports them. metal_name: not read on the card.
+rdna1	amd	-	32	65536	wave and group_bytes: as the Radeon Pro 5500M reports them. metal_name: not read on the card.
 [devices]
 card	chip	architecture	wave	group_bytes	cu	l1_bytes_per_cu	l2_bytes	local_Bps	transfer_Bps	attn_gate_fuse	conv_l2_fold	add_norm_fuse	cb_seq	set_nowait	staging_keep	probe_dispatch	probe_stage	probe_blit	probe_timestamp	evidence
-AMD Radeon HD - FirePro D700	FirePro D700 (GCN 1.0, Tahiti)	gcn1	64	32768	32	16384	786432	263000000000	-	on	on	on	4	on	on	on	off	on	on	wave: probed on the card. group_bytes: MTLDevice maxThreadgroupMemoryLength. cu, local_Bps: specification (techpowerup, FirePro D700). l1, l2: the sizing estimate of device/init.m, kept. Graph switches: each measured faster on the card with equal logits (ms per token 23.41 -> 22.99, 23.14 -> 22.93, 22.95 -> 22.79). cb_seq: the shipped value. Uploads and staging: measured 2026-11-17, eval 56.06 -> 57.34 and 56.13 t/s. Probes: measured on the card.
-AMD Radeon Pro 5500M	Radeon Pro 5500M (RDNA 1, Navi 14)	rdna1	32	65536	24	16384	4194304	192000000000	-	on	off	off	4	on	on	on	off	on	on	wave: probed on the card. group_bytes: MTLDevice maxThreadgroupMemoryLength. cu: specification (techpowerup, Radeon Pro 5500M). local_Bps: estimate, not verified. l1, l2: the sizing estimate of device/init.m, kept. attn_gate_fuse: measured, 5 rounds median 10.98 -> 10.58 ms per token, logits equal. conv_l2_fold: measured slower (10.22 -> 10.59 ms), off. add_norm_fuse: measured slower (10.39 -> 12.46 ms), off. cb_seq: the shipped value. Uploads and staging: measured 2026-11-17, eval 84.81 -> 92.08 and 90.86 t/s. Probes: measured on the card.
-AMD Radeon Pro Vega 64	Radeon Pro Vega 64 (GCN 5, Vega 10)	gcn5	64	65536	-	16384	4194304	-	-	on	on	on	4	on	on	on	off	on	on	wave: probed on the card. group_bytes: MTLDevice maxThreadgroupMemoryLength. cu, local_Bps: not verified, so the sizing estimate of device/init.m stays. l1, l2: that estimate, kept. Graph switches: each measured faster on the card with equal logits (ms per token 7.24 -> 7.13, 7.16 -> 7.09, 7.07 -> 6.97). cb_seq: the shipped value. Uploads and staging: measured 2026-11-17, eval 111.42 -> 114.63 and 116.39 t/s. Probes: measured on the card.
+AMD Radeon HD - FirePro D700	FirePro D700 (GCN 1.0, Tahiti)	gcn1	64	32768	32	16384	786432	263000000000	-	on	on	on	4	on	on	on	off	on	on	wave: probed on the card. group_bytes: MTLDevice maxThreadgroupMemoryLength. cu, local_Bps: specification (techpowerup, FirePro D700). l1, l2: the specification values the backend held in code before they were rows; not measured here. Graph switches: each measured faster on the card with equal logits (ms per token 23.41 -> 22.99, 23.14 -> 22.93, 22.95 -> 22.79). cb_seq: the shipped value. Uploads and staging: measured 2026-11-17, eval 56.06 -> 57.34 and 56.13 t/s. Probes: measured on the card.
+AMD Radeon Pro 5500M	Radeon Pro 5500M (RDNA 1, Navi 14)	rdna1	32	65536	24	16384	4194304	192000000000	-	on	off	off	4	on	on	on	off	on	on	wave: probed on the card. group_bytes: MTLDevice maxThreadgroupMemoryLength. cu: specification (techpowerup, Radeon Pro 5500M). local_Bps: estimate, not verified. l1, l2: the specification values the backend held in code before they were rows; not measured here. attn_gate_fuse: measured, 5 rounds median 10.98 -> 10.58 ms per token, logits equal. conv_l2_fold: measured slower (10.22 -> 10.59 ms), off. add_norm_fuse: measured slower (10.39 -> 12.46 ms), off. cb_seq: the shipped value. Uploads and staging: measured 2026-11-17, eval 84.81 -> 92.08 and 90.86 t/s. Probes: measured on the card.
+AMD Radeon Pro Vega 64	Radeon Pro Vega 64 (GCN 5, Vega 10)	gcn5	64	65536	64	16384	4194304	484000000000	-	on	on	on	4	on	on	on	off	on	on	wave: probed on the card. group_bytes: MTLDevice maxThreadgroupMemoryLength. cu 64, local_Bps 484 GB/s, l1, l2: the specification values the backend held in code for this card before they were rows; not verified here. Graph switches: each measured faster on the card with equal logits (ms per token 7.24 -> 7.13, 7.16 -> 7.09, 7.07 -> 6.97). cb_seq: the shipped value. Uploads and staging: measured 2026-11-17, eval 111.42 -> 114.63 and 116.39 t/s. Probes: measured on the card.

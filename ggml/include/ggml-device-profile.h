@@ -27,7 +27,7 @@ enum ggml_gpu_connection {
     GGML_GPU_CONNECTION_NETWORK    = 3,  // remote GPU over network
 };
 
-// Per-shape matvec row of a card: a K-quant weight of this type and shape runs nr0 rows per simdgroup.
+// Per-shape matvec row of a card: a K-quant weight of this type and shape (ne00 and ne01 -1 = every shape) runs nr0 rows per simdgroup.
 // kind 0 = single matvec, 1 = grouped launch of such members; prep 1 = only with headers prepared at load;
 // cols 1 = one activation column, 2-4 = a decode batch of that many columns in one launch, in loop form "form".
 // card = the card's Metal device name, compared whole.
@@ -41,6 +41,8 @@ struct ggml_device_mv_row {
     int32_t  prep;
     int32_t  cols;
     int32_t  form; // bit 0 = weights held (activations reloaded per row), bit 1 = weights kept packed
+    uint32_t wave;        // the wave and the threadgroup memory the card reported when the row was measured:
+    uint32_t group_bytes; // the row is used only while the card reports both
 };
 
 struct ggml_device_profile {
@@ -69,15 +71,6 @@ struct ggml_device_profile {
     uint32_t l1_cache_per_cu;     // L1 data cache per CU/SM, bytes (e.g., 16384 for GCN)
     uint32_t l2_cache_total;      // L2 cache total, bytes (e.g., 786432 for D700)
 
-    // Matvec row-sum tail on the shared-memory reduce path: 0 serial, 1 tree (from the hw row).
-    uint32_t mv_reduce;
-
-    // f16 scalar matvec at simd width 64: 1 runs it, 0 keeps the width-64 fallback (from the hw row).
-    uint32_t f_scalar_w64;
-
-    // Q8_0 matvecs that read one activation: 1 runs the 2-4 of them in one launch, 0 one launch each (from the hw row).
-    uint32_t mv_group;
-
     // Attention gate copy, sigmoid, output copy and multiply: 1 runs them as one launch, 0 one launch each (from the hw row).
     uint32_t attn_gate_fuse;
 
@@ -90,33 +83,11 @@ struct ggml_device_profile {
     // Command buffers after the first, encoded and committed in order on the calling thread (from the hw row); 0 keeps one buffer encoded as before.
     uint32_t cb_seq;
 
-    // Q8_0 matvec weight load width in bytes (from the hw row): 1 single bytes, 4 aligned words.
-    uint32_t q8_load_bytes;
-
-    // Smallest row count of a single Q8_0 matvec that runs 8 whole rows per simdgroup (from the hw row); 0 = never.
-    uint32_t q8_rows8_min;
-
-    // Q8_0 matvec activation load width in bytes (from the hw row): 4 single values, 16 two aligned loads per lane.
-    uint32_t q8_act_load_bytes;
-
     // Discrete card: 1 commits each input upload without waiting for it (the graph runs after it on the same queue), 0 waits (from the hw row).
     uint32_t set_nowait;
 
     // Discrete card: 1 keeps one logits staging buffer per context and reuses it every token, 0 makes a new one per read (from the hw row).
     uint32_t staging_keep;
-
-    // 1 = the grouped K-quant matvec stores every row before the row sums, lane k sums row k (from the hw row).
-    uint32_t mv_group_red;
-
-    // Per-shape matvec rows of this card (generated from data/matmul.tsv [matvec_shapes]): rows per simdgroup per K-quant weight shape; none = defaults.
-    const struct ggml_device_mv_row * mv_rows;
-    uint32_t n_mv_rows;
-
-    // 1 = Q4_K weight tensors named by a prep row get their block headers unpacked once at load.
-    uint32_t kq_prep;
-
-    // 1 = the rows with cols 2-4 apply (a decode batch of 2-4 columns in one launch).
-    uint32_t kq_cols;
 
     // Per-type column count where K-quants take mul_mv_ext on this card (generated rows); none = 4.
 

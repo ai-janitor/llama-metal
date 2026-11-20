@@ -2,6 +2,7 @@
 // a single Metal dispatch with more threadgroups to improve GPU occupancy.
 // Extracted from dispatch.cpp to keep each dispatch strategy in its own file.
 #include "dispatch.h"
+#include "matvec-plan.h"
 #include "tuning.h"
 #include "../lanes/select.h"
 #include "ggml-metal-probe.h"
@@ -28,6 +29,7 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_t enc = ctx->enc;
 
     const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
+    const struct ggml_metal_card * card = ggml_metal_device_get_card(ctx->dev);
     const struct ggml_model_profile  * model   = ggml_metal_device_get_model_profile(ctx->dev);
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
@@ -105,18 +107,38 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     // Always use shmem reduction for the grouped kernel — it's the safe
     // path on all devices. GCN needs it (simd_sum broken at NW=64),
     // RDNA doesn't need it but it works fine and keeps the kernel uniform.
-    const bool use_shmem_reduce = true;
-    // Grouped kernels retain their existing output path; FC606 is scalar Q4_K-only.
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, false, 0, false, false, 0, 0);
+    // The plan of a group member (matmul/matvec-plan.h): shared-memory sums, rows per simdgroup from the cache rule;
+    // the card's group row may replace them once the members are known (below).
+    struct ggml_metal_matvec_in in = {};
+    in.kind        = 1;
+    in.weight      = (int32_t) op->src[0]->type;
+    in.k           = ne00;
+    in.m           = ne01;
+    in.cols        = 1;
+    in.model_known = model != nullptr && model->populated ? 1 : 0;
+    in.act_bytes   = (uint32_t) ne00 * (uint32_t) sizeof(float);
+    const struct ggml_metal_matvec_plan plan = ggml_metal_matvec_plan_for(card, &in);
+    // The test hook GGML_METAL_TEST_MV_PLAN (matmul/matvec-plan.h): a plan forced on the single matvec of this weight
+    // keeps it out of a grouped launch; a plan forced on the group replaces the rows and prep chosen below.
+    const struct ggml_metal_matvec_forced * forced = ggml_metal_matvec_forced_env();
+    if (ggml_metal_matvec_forced_is_for(forced, 0, in.weight, ne00, ne01, ne11)) {
+        return 0;
+    }
+    const bool forced_here = ggml_metal_matvec_forced_is_for(forced, 1, in.weight, ne00, ne01, ne11) == 1;
+    // Grouped kernels retain their existing output path; FC606 is scalar Q4_K-only. This pipeline gives the
+    // simdgroup count and the wave width: it is the format's own one-column entry, at the format's row count.
+    struct ggml_metal_matvec_plan width_plan = plan;
+    width_plan.nr0     = fmt->nr0;
+    width_plan.nr0_set = 0;
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, &width_plan, false, false, nullptr);
 
     if (!pipeline.pipeline) {
         return 0;
     }
 
     const int nsg = pipeline.nsg;  // simdgroups per threadgroup (N_SG_Q4_K)
-    // NR0 selected from model+hardware profiles via tuning function.
-    // The grouped kernel is compiled with this NR0 as a function constant.
-    int nr0 = ggml_metal_compute_nr0(profile, model, ne00);
+    // The grouped kernel is compiled with the plan's rows per simdgroup as a function constant.
+    int nr0 = forced_here ? forced->nr0 : plan.nr0;
     const int mv_simd_w = ggml_metal_pipeline_thread_execution_width(pipeline);  // 64 on GCN
 
     // Base buffer IDs — all groups must be in the same Metal buffer.
@@ -143,6 +165,7 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     bid_src0_base = ggml_metal_get_buffer_id(op->src[0]);
     bid_dst_base  = ggml_metal_get_buffer_id(op);
 
+    bool whole = true; // every member's rows are whole threadgroups at nr0
     for (int g = 0; g < 8 && (idx + g) < ctx->n_nodes(); g++) {
         ggml_tensor * gop = ctx->node(idx + g);
         if (gop->op != GGML_OP_MUL_MAT) break;
@@ -155,6 +178,8 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
         if (gop->src[0]->ne[0] != ne00) break;  // K dimension must match
         if (gop->src[1]->ne[1] != 1) break;     // must be matvec (batch=1)
         if (g > 0 && !(gop->flags & GGML_TENSOR_FLAG_COMPUTE)) break;
+        // a matvec the test hook forces as a single launch is no member: the scan ends before it
+        if (g > 0 && ggml_metal_matvec_forced_is_for(forced, 0, (int32_t) gop->src[0]->type, gop->src[0]->ne[0], gop->src[0]->ne[1], (int32_t) gop->src[1]->ne[1])) break;
 
         // One activation buffer is bound for the entire group. Exact tensor
         // identity also prevents a later group's activation consuming an earlier
@@ -172,6 +197,7 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
         // Each TG covers nr0 * nsg rows = N_R0_KQUANT * N_SG_Q4_K rows.
         int gne01 = (int32_t)gop->src[0]->ne[1];
         int tg_count = (gne01 + nr0 * nsg - 1) / (nr0 * nsg);
+        whole = whole && gne01 % (nr0 * nsg) == 0;
 
         // Collect absolute offsets first: graph order need not match allocation
         // order. A later member can precede the first in either Metal buffer.
@@ -194,10 +220,19 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
         n_consumed++;
     }
 
-    if (pass == 0 && n_groups >= 2 && profile->n_mv_rows > 0 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+    if (forced_here && n_groups >= 2 && !whole) {
+        GGML_ABORT("GGML_METAL_TEST_MV_PLAN: with a forced row count m is a whole number of nr0 x nsg rows");
+    }
+    if (pass == 0 && !forced_here && !whole && nr0 != fmt->nr0) {
+        // the kernel loads every weight row of a threadgroup before the output bound: a member that would leave a
+        // partial threadgroup at these rows sends the launch back to the rows the kernel is compiled for
+        nr0 = fmt->nr0;
+        continue;
+    }
+    if (pass == 0 && n_groups >= 2 && (card->n_mv_rows > 0 || forced_here) && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
         // same type and shape on every member; headers prepared for all, in one run of one buffer
         bool same = true;
-        bool prep_ok = profile->kq_prep == 1 && op->src[0]->type == GGML_TYPE_Q4_K;
+        bool prep_ok = (card->kq_prep == 1 || (forced_here && forced->prep == 1)) && op->src[0]->type == GGML_TYPE_Q4_K;
         int first = 0; // the member with the lowest weight offset: the bindings start there
         ggml_metal_buffer_id member_prep[8] = {};
         for (int group = 0; group < n_groups; ++group) {
@@ -213,14 +248,29 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
             prep_ok = woff % 144 == 0 && member_prep[group].offs >= member_prep[first].offs &&
                       member_prep[group].offs - member_prep[first].offs == woff / 144 * 32;
         }
-        const struct ggml_device_mv_row * row = same ? ggml_metal_mv_hw_row(profile, 1, op->src[0]->type, ne00, op->src[0]->ne[1], 1, prep_ok) : nullptr;
-        if (row != nullptr) {
-            kq_prep = row->prep == 1;
+        struct ggml_metal_matvec_in row_in = in;
+        row_in.use_rows       = same ? 1 : 0;
+        row_in.prep_available = prep_ok ? 1 : 0;
+        if (forced_here) {
+            struct ggml_metal_matvec_plan forced_plan = {};
+            const char * why = same ? nullptr : "the members of the launch differ in weight type or shape";
+            if (!same || !ggml_metal_matvec_forced_plan(card, &row_in, forced, &forced_plan, &why)) {
+                GGML_ABORT("GGML_METAL_TEST_MV_PLAN: %s", why);
+            }
+            kq_prep = forced_plan.prep == 1;
             if (kq_prep) {
                 bid_kq_prep = member_prep[first];
             }
-            if (row->nr0 != nr0) {
-                nr0 = row->nr0;
+            break;
+        }
+        const struct ggml_metal_matvec_plan row_plan = ggml_metal_matvec_plan_for(card, &row_in);
+        if (row_plan.shape_row >= 0) {
+            kq_prep = row_plan.prep == 1;
+            if (kq_prep) {
+                bid_kq_prep = member_prep[first];
+            }
+            if (row_plan.nr0 != nr0) {
+                nr0 = row_plan.nr0;
                 continue;
             }
         }
@@ -228,6 +278,9 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     break;
     }
 
+    if (forced_here && n_groups >= 2 && !(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1)) {
+        GGML_ABORT("GGML_METAL_TEST_MV_PLAN: the grouped launch is not one plane of one f32 activation column");
+    }
     // Only use grouped dispatch if we found 2+ ops to fuse.
     // With 1 op, the overhead of the group lookup isn't worth it.
     if (n_groups < 2) {
@@ -266,7 +319,7 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     const int16_t selected_lane = ggml_metal_select_lane_id(
         profile, GGML_METAL_LANE_FAMILY_MATMUL, GGML_METAL_LANE_ROUTE_MV_GROUPED, op->src[0]->type, op->src[1]->type);
     // The card's hw row picks the reduce: every row stored before the row sums, or one row at a time.
-    const bool g_red = profile->mv_group_red == 1;
+    const bool g_red = plan.group_store_first == 1;
     const char * gbase = kq_prep ? (g_red ? "kernel_mul_mv_grouped_q4k_prep_red_f32" : "kernel_mul_mv_grouped_q4k_prep_f32")
                                  : (g_red ? "kernel_mul_mv_grouped_kquant_red_f32" : "kernel_mul_mv_grouped_kquant_f32");
     snprintf(gpipeline_name, sizeof(gpipeline_name),
@@ -283,6 +336,9 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
 
     if (!gpipeline.pipeline) {
         return 0;
+    }
+    if (ggml_metal_mv_receipt_requested()) {
+        fprintf(stderr, "MV_RECEIPT attempt=none fallback=none final=1:1:%d:0:%d:%s\n", nr0, kq_prep ? 1 : 0, gpipeline_name);
     }
 
     ggml_metal_encoder_set_pipeline(enc, gpipeline);

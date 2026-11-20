@@ -7,6 +7,16 @@
 // specializations additionally accept the pipeline's function-constant row count.
 // UNTIED: baseline rows/simdgroups are compile-time tuning constants, not device gates.
 
+// Dense float (f32, f16, bf16) matvec: N_R0_F rows per threadgroup in the regular entries; a weight of fewer than
+// N_F_SHORT_K input columns runs the short entry, N_F_SHORT_ROWS rows per threadgroup. data/matmul.tsv [formats]
+// holds the same three numbers (nr0, short_k, short_rows), checked when the host code compiles.
+#define N_R0_F 2
+#define N_R0_F32 N_R0_F
+#define N_R0_F16 N_R0_F
+#define N_R0_BF16 N_R0_F
+#define N_F_SHORT_K 32
+#define N_F_SHORT_ROWS 32
+
 #define N_R0_BASIC 2 // shared baseline specialization for basic quant kernels
 #define N_R0_Q4_0 N_R0_BASIC
 #define N_SG_Q4_0 2

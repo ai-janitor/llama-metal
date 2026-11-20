@@ -4,7 +4,58 @@
 #include "lanes/select.h"
 #include "matmul/batch-route.h"
 #include "matmul/tiled-plan.h"
+#include "matmul/matvec-plan.h"
+#include "device/device-sizes.h"
 GGML_METAL_FAMILY(device) // overload of MTLGPUFamilyMetalX (not available in some environments)
+
+// The card object's matvec settings and per-shape rows (data/matmul.tsv [matvec_defaults], [matvec_shapes]) and its family
+// (data/device.tsv [families]). Called when the device is set up, before the wave is probed (the default row only),
+// and again once the wave is probed: a card's own rows are used only while it reports the facts written in them.
+// GGML_METAL_GROUP_RED=0 keeps the grouped K-quant matvec on the row-at-a-time sums. GGML_METAL_KQ_HW_ROWS=0 ignores
+// the per-shape rows; GGML_METAL_KQ_PREP=0 and GGML_METAL_KQ_COLS=0 switch one part of them off.
+static void ggml_metal_device_matvec_load(ggml_metal_device_t dev) {
+    const char * red_env  = getenv("GGML_METAL_GROUP_RED");
+    const char * rows_env = getenv("GGML_METAL_KQ_HW_ROWS");
+    const char * prep_env = getenv("GGML_METAL_KQ_PREP");
+    const char * cols_env = getenv("GGML_METAL_KQ_COLS");
+    (void) ggml_metal_matvec_forced_env(); // the test hook GGML_METAL_TEST_MV_PLAN: a value that cannot be read aborts here
+    dev->card.l1_per_cu = dev->profile.l1_cache_per_cu;
+    ggml_metal_matvec_tune_load(&dev->card, dev->profile.name, !(rows_env && strcmp(rows_env, "0") == 0), !(prep_env && strcmp(prep_env, "0") == 0), !(cols_env && strcmp(cols_env, "0") == 0), !(red_env && strcmp(red_env, "0") == 0));
+
+    dev->card.family[0] = 0;
+    if (dev->card.wave_probed == 0) {
+        return;
+    }
+    char metal_name[64] = "";
+#if defined(__MAC_14_0) && __MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_14_0
+    if (@available(macOS 14.0, *)) {
+        NSString * arch = dev->mtl_device.architecture.name;
+        if (arch != nil) {
+            snprintf(metal_name, sizeof(metal_name), "%s", [arch UTF8String]);
+        }
+    }
+#endif
+    const char * vendor = dev->profile.vendor == GGML_GPU_VENDOR_AMD    ? "amd"
+                        : dev->profile.vendor == GGML_GPU_VENDOR_APPLE  ? "apple"
+                        : dev->profile.vendor == GGML_GPU_VENDOR_INTEL  ? "intel"
+                        : dev->profile.vendor == GGML_GPU_VENDOR_NVIDIA ? "nvidia" : "";
+    const struct ggml_metal_family_row * fam = ggml_metal_family_row_of(dev->profile.name, vendor, metal_name, dev->card.wave, dev->card.group_mem);
+    if (fam != NULL) {
+        snprintf(dev->card.family, sizeof(dev->card.family), "%s", fam->name);
+    }
+    uint32_t n_candidates = 0;
+    ggml_metal_family_mv_rows_of(dev->card.family, &n_candidates);
+    const char * ext_env = getenv("GGML_METAL_KQ_EXT_ROWS");
+    GGML_LOG_INFO("%s: matvec settings %s: mv_sum=%u, mv_reduce=%u, f_scalar_w64=%u, mv_group=%u, q8_load_bytes=%u, q8_rows8_min=%u, q8_act_load_bytes=%u, mv_group_red=%u, l1_share_cut=%.2f, rows=%u/%u/%u, f_nsg_max=%u, f_k_per_sg=%u\n", __func__, dev->profile.name,
+        dev->card.mv_sum, dev->card.mv_reduce, dev->card.f_scalar_w64, dev->card.mv_group, dev->card.q8_load_bytes, dev->card.q8_rows8_min, dev->card.q8_act_load_bytes, dev->card.mv_group_red,
+        (double) dev->card.l1_share_cut, dev->card.mv_rows_below, dev->card.mv_rows_from, dev->card.mv_rows_unknown, dev->card.f_nsg_max, dev->card.f_k_per_sg);
+    if (dev->card.n_mv_rows > 0) {
+        GGML_LOG_INFO("%s: hw mv rows %s: %u rows, kq_prep=%u, kq_cols=%u, ext_min rows=%u\n", __func__, dev->profile.name, dev->card.n_mv_rows, dev->card.kq_prep, dev->card.kq_cols, (unsigned) ((ext_env && strcmp(ext_env, "0") == 0) ? 0 : ggml_metal_batch_rows_count(dev->profile.name)));
+    }
+    if (dev->card.family[0] != 0) {
+        GGML_LOG_INFO("%s: family %s (Metal architecture name '%s'): %u candidate shape rows for a sweep, not applied\n", __func__, dev->card.family, metal_name, n_candidates);
+    }
+}
 
 // The wave width of the card, read from a compiled pipeline of lib (kernel_concat_f32 has no function constants;
 // every kernel of a device has the same width).
@@ -36,6 +87,7 @@ ggml_metal_library_t ggml_metal_device_ensure_library(ggml_metal_device_t dev) {
             // tuning-load-after-probe: the card's tuning rows are loaded once its probed facts (the wave width) are
             // in the object, so a row may depend on them; before this the object holds no rows.
             ggml_metal_tiled_tune_load(&dev->card, dev->profile.name);
+            ggml_metal_device_matvec_load(dev);
             dev->library = lib;
         }
     }
@@ -272,13 +324,10 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             // Profile: memory path
             dev->profile.shared_memory      = dev->props.has_unified_memory;
             dev->profile.vram_size           = dev->props.max_working_set_size;
-            dev->profile.local_bandwidth     = 0;
-            dev->profile.transfer_bandwidth  = 0;
 
             // Profile: compute tier
             dev->profile.has_matrix_hw               = dev->props.has_simdgroup_mm;
             dev->profile.has_simd_reduction          = dev->props.has_simdgroup_reduction;
-            dev->profile.compute_units               = 0;
             dev->profile.simd_width                  = 32; // default; probed below after library init
             dev->profile.max_threads_per_threadgroup = (uint32_t)dev->mtl_device.maxThreadsPerThreadgroup.width;
             dev->profile.shared_mem_size             = (uint32_t)dev->mtl_device.maxThreadgroupMemoryLength;
@@ -288,241 +337,28 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->card.group_mem = (uint32_t)dev->mtl_device.maxThreadgroupMemoryLength;
             dev->profile.max_threadgroups_per_dispatch = (dev->profile.vendor == GGML_GPU_VENDOR_INTEL) ? 512 : 0;
 
-            // Profile: cache hierarchy (defaults to unknown)
-            dev->profile.l1_cache_per_cu     = 0;
-            dev->profile.l2_cache_total      = 0;
-            dev->profile.mv_reduce           = 0;
-            dev->profile.f_scalar_w64        = 0;
-            dev->profile.mv_group            = 0;
-            dev->profile.attn_gate_fuse      = 0;
-            dev->profile.conv_l2_fold        = 0;
-            dev->profile.add_norm_fuse       = 0;
-            dev->profile.cb_seq              = 0;
-            dev->profile.q8_load_bytes       = 1;
-            dev->profile.q8_rows8_min        = 0;
-            dev->profile.q8_act_load_bytes   = 4;
-            dev->profile.set_nowait          = 0;
-            dev->profile.staging_keep        = 0;
-            dev->profile.mv_group_red        = 0;
-            dev->profile.mv_rows             = NULL;
-            dev->profile.n_mv_rows           = 0;
-            dev->profile.kq_prep             = 0;
-            dev->profile.kq_cols             = 0;
-
-            // =========================================================================
-            // Hardware constants lookup table.
-            // =========================================================================
-            // Metal doesn't expose cache sizes, bandwidth, or CU counts through its
-            // API. We maintain a static table of known hardware indexed by the device
-            // name string returned by [MTLDevice name].
-            //
-            // Apple's Metal GPU ecosystem is finite — every Mac/iPhone/iPad GPU that
-            // supports Metal is enumerable. When adding a new GPU, add an entry here
-            // with specs from the vendor's documentation or hardware databases.
-            //
-            // Fields:
-            //   name_match:      substring to match against [MTLDevice name]
-            //   compute_units:   CUs/SMs/EUs on this GPU
-            //   l1_cache_per_cu: L1 data cache per CU in bytes
-            //   l2_cache_total:  shared L2 cache in bytes
-            //   local_bw:        VRAM bandwidth in bytes/sec
-            //   transfer_bw:     host<->GPU bandwidth in bytes/sec (PCIe/TB)
-            //
-            // Sources:
-            //   GCN: AMD GCN Architecture whitepaper, techpowerup.com
-            //   RDNA: AMD RDNA Architecture whitepaper
-            //   Apple: Apple GPU programming guide, anandtech reviews
+            // The card's row of data/device.tsv [devices], by its Metal name: sizes and scheduling settings
+            // (device/device-sizes.h). A card without a row leaves them not known (0).
             {
-                struct hw_entry {
-                    const char * name_match;       // substring to match in device name
-                    uint32_t     compute_units;
-                    uint32_t     l1_cache_per_cu;  // bytes
-                    uint32_t     l2_cache_total;   // bytes
-                    uint64_t     local_bw;         // bytes/sec
-                    uint64_t     transfer_bw;      // bytes/sec
-                };
-
-                // Table of known Metal GPUs.
-                // Ordered most-specific first — first match wins.
-                static const struct hw_entry hw_table[] = {
-                    // =====================================================================
-                    // AMD GCN (Mac Pro 2013, Retina iMac, MacBook Pro 2015)
-                    // Architecture: GCN 1.0 (Tahiti), wavefront=64, 16 KB L1/CU, 768 KB L2
-                    // =====================================================================
-                    { "D700",       32, 16384,  768*1024,  264000000000ULL, 0 },  // 6 GB GDDR5, 264 GB/s
-                    { "D500",       24, 16384,  768*1024,  176000000000ULL, 0 },  // 3 GB GDDR5, 176 GB/s
-                    { "D300",       12, 16384,  512*1024,  132000000000ULL, 0 },  // 2 GB GDDR5, 132 GB/s
-
-                    // =====================================================================
-                    // AMD Polaris (eGPU, iMac 2017-2019, MacBook Pro 2017)
-                    // Architecture: GCN 4.0, wavefront=64, 16 KB L1/CU, 2 MB L2
-                    // =====================================================================
-                    { "RX 580",     36, 16384,  2048*1024, 256000000000ULL, 0 },  // 8 GB GDDR5, 256 GB/s
-                    { "RX 570",     32, 16384,  2048*1024, 224000000000ULL, 0 },  // 4 GB GDDR5, 224 GB/s
-                    { "560",        16, 16384,  2048*1024, 112000000000ULL, 0 },  // Polaris 21
-                    { "555",        12, 16384,  1024*1024,  80000000000ULL, 0 },
-                    { "Pro 580",    36, 16384,  2048*1024, 256000000000ULL, 0 },
-                    { "Pro 575",    36, 16384,  2048*1024, 256000000000ULL, 0 },
-                    { "Pro 570",    32, 16384,  2048*1024, 224000000000ULL, 0 },
-                    { "Pro 560",    16, 16384,  2048*1024, 112000000000ULL, 0 },
-
-                    // =====================================================================
-                    // AMD Vega (iMac Pro 2017, eGPU)
-                    // Architecture: GCN 5.0 (Vega), wavefront=64, 16 KB L1/CU, 4 MB L2
-                    // =====================================================================
-                    { "Vega 64",    64, 16384,  4096*1024, 484000000000ULL, 0 },  // 16 GB HBM2
-                    { "Vega 56",    56, 16384,  4096*1024, 410000000000ULL, 0 },  // 8 GB HBM2
-                    { "Vega 48",    48, 16384,  4096*1024, 394000000000ULL, 0 },  // Vega Pro in iMac Pro
-                    { "Vega II",    64, 16384,  4096*1024, 1024000000000ULL,0 },  // 32 GB HBM2 (MPX)
-                    { "Vega 20",    20, 16384,  4096*1024, 394000000000ULL, 0 },  // MacBook Pro 2018
-
-                    // =====================================================================
-                    // AMD RDNA 1 (MacBook Pro 2019, iMac 2019-2020)
-                    // Architecture: RDNA 1, wavefront=32, 16 KB L1/CU, 4 MB L2
-                    // =====================================================================
-                    { "5500M",      22, 16384,  4096*1024, 192000000000ULL, 0 },  // 8 GB GDDR6
-                    { "5500 XT",    22, 16384,  4096*1024, 192000000000ULL, 0 },
-                    { "5300M",      20, 16384,  4096*1024, 192000000000ULL, 0 },  // 4 GB GDDR6
-                    { "5300",       20, 16384,  4096*1024, 192000000000ULL, 0 },
-                    { "5700 XT",    40, 16384,  4096*1024, 448000000000ULL, 0 },  // 16 GB GDDR6 (MPX)
-                    { "5700",       36, 16384,  4096*1024, 448000000000ULL, 0 },
-
-                    // =====================================================================
-                    // AMD RDNA 2 (Mac Pro 2023 MPX modules, eGPU)
-                    // Architecture: RDNA 2, wavefront=32, 16 KB L1/CU, 4 MB L2
-                    // Note: W6000 series used in Mac Pro tower
-                    // =====================================================================
-                    { "W6900X",     80, 16384,  16384*1024, 512000000000ULL, 0 },  // 32 GB GDDR6
-                    { "W6800X",     60, 16384,  16384*1024, 512000000000ULL, 0 },  // 32 GB GDDR6
-                    { "W6600X",     28, 16384,  8192*1024,  256000000000ULL, 0 },  // 8 GB GDDR6
-
-                    // =====================================================================
-                    // Apple Silicon — unified memory, cache sizes from die analysis
-                    // L1: 128 KB per GPU core (Apple's "core" ≠ SM; one core ≈ 128 ALUs)
-                    // SLC (System-Level Cache) acts as L2 for GPU, shared with CPU/NPU
-                    // =====================================================================
-                    { "M1 Ultra",   64, 131072, 48*1024*1024, 800000000000ULL, 0 },
-                    { "M1 Max",     32, 131072, 24*1024*1024, 400000000000ULL, 0 },
-                    { "M1 Pro",     16, 131072, 24*1024*1024, 200000000000ULL, 0 },
-                    { "M1",          8, 131072, 16*1024*1024, 68000000000ULL,  0 },  // base M1
-
-                    { "M2 Ultra",   76, 131072, 48*1024*1024, 800000000000ULL, 0 },
-                    { "M2 Max",     38, 131072, 24*1024*1024, 400000000000ULL, 0 },
-                    { "M2 Pro",     19, 131072, 24*1024*1024, 200000000000ULL, 0 },
-                    { "M2",         10, 131072, 16*1024*1024, 100000000000ULL, 0 },
-
-                    { "M3 Max",     40, 131072, 36*1024*1024, 400000000000ULL, 0 },
-                    { "M3 Pro",     18, 131072, 24*1024*1024, 150000000000ULL, 0 },
-                    { "M3",         10, 131072, 24*1024*1024, 100000000000ULL, 0 },
-
-                    { "M4 Max",     40, 131072, 48*1024*1024, 546000000000ULL, 0 },
-                    { "M4 Pro",     20, 131072, 24*1024*1024, 273000000000ULL, 0 },
-                    { "M4",         10, 131072, 16*1024*1024, 120000000000ULL, 0 },
-
-                    // =====================================================================
-                    // Intel (MacBook Air/Pro 2012-2020, iMac, Mac Mini, Mac Pro)
-                    // Integrated GPUs with shared system memory.
-                    // L1/L2 not meaningful for dispatch tuning on these low-perf parts.
-                    // =====================================================================
-                    { "UHD 630",    24, 0, 0, 42000000000ULL,  0 },
-                    { "Iris Plus",  48, 0, 0, 34000000000ULL,  0 },
-                    { "Iris Pro",   48, 0, 0, 25000000000ULL,  0 },
-                    { "HD 6000",    48, 0, 0, 25000000000ULL,  0 },
-                    { "HD 5000",    40, 0, 0, 25000000000ULL,  0 },
-                    { "HD 4000",    16, 0, 0, 21000000000ULL,  0 },
-                };
-
-                const int n_hw_entries = sizeof(hw_table) / sizeof(hw_table[0]);
-                NSString * dev_name = [dev->mtl_device name];
-
-                for (int i = 0; i < n_hw_entries; i++) {
-                    if ([dev_name containsString:[NSString stringWithUTF8String:hw_table[i].name_match]]) {
-                        dev->profile.compute_units   = hw_table[i].compute_units;
-                        dev->profile.l1_cache_per_cu = hw_table[i].l1_cache_per_cu;
-                        dev->profile.l2_cache_total  = hw_table[i].l2_cache_total;
-                        dev->profile.local_bandwidth = hw_table[i].local_bw;
-                        dev->profile.transfer_bandwidth = hw_table[i].transfer_bw;
-                        GGML_LOG_INFO("%s: hw profile: CUs=%u, L1=%u KB/CU, L2=%u KB, BW=%.0f GB/s\n",
-                            __func__,
-                            hw_table[i].compute_units,
-                            hw_table[i].l1_cache_per_cu / 1024,
-                            hw_table[i].l2_cache_total / 1024,
-                            hw_table[i].local_bw / 1e9);
-                        break;
-                    }
-                }
-            }
-
-            // The card's rows, by its Metal name: data/device.tsv [devices] and data/matmul.tsv [matvec_defaults]
-            // (generated headers); a -1 field keeps the value set above.
-            {
-                const struct ggml_metal_device_row * row = ggml_metal_device_row_of(dev->profile.name);
-                const struct ggml_metal_matvec_default_row * mv = ggml_metal_matvec_default_row_of(dev->profile.name);
+                const struct ggml_metal_device_row * row = ggml_metal_device_sizes_load(&dev->profile, dev->profile.name);
                 if (row != NULL) {
                     GGML_METAL_PROBE_ONLY(ggml_metal_probe_choose_mode(dev, row);)
-                    if (row->compute_units   >= 0) dev->profile.compute_units   = (uint32_t) row->compute_units;
-                    if (row->l1_cache_per_cu >= 0) dev->profile.l1_cache_per_cu = (uint32_t) row->l1_cache_per_cu;
-                    if (row->l2_cache_total  >= 0) dev->profile.l2_cache_total  = (uint32_t) row->l2_cache_total;
-                    if (row->local_bw        >= 0) dev->profile.local_bandwidth = (uint64_t) row->local_bw;
-                    if (row->transfer_bw     >= 0) dev->profile.transfer_bandwidth = (uint64_t) row->transfer_bw;
-                    if (row->attn_gate_fuse  >= 0) dev->profile.attn_gate_fuse  = (uint32_t) row->attn_gate_fuse;
-                    if (row->conv_l2_fold    >= 0) dev->profile.conv_l2_fold    = (uint32_t) row->conv_l2_fold;
-                    if (row->add_norm_fuse   >= 0) dev->profile.add_norm_fuse   = (uint32_t) row->add_norm_fuse;
-                    if (row->cb_seq          >= 0) dev->profile.cb_seq          = (uint32_t) row->cb_seq;
-                    if (row->set_nowait      >= 0) dev->profile.set_nowait      = (uint32_t) row->set_nowait;
-                    if (row->staging_keep    >= 0) dev->profile.staging_keep    = (uint32_t) row->staging_keep;
                 }
-                if (mv != NULL) {
-                    if (mv->mv_reduce         >= 0) dev->profile.mv_reduce         = (uint32_t) mv->mv_reduce;
-                    if (mv->f_scalar_w64      >= 0) dev->profile.f_scalar_w64      = (uint32_t) mv->f_scalar_w64;
-                    if (mv->mv_group          >= 0) dev->profile.mv_group          = (uint32_t) mv->mv_group;
-                    if (mv->q8_load_bytes     >= 0) dev->profile.q8_load_bytes     = (uint32_t) mv->q8_load_bytes;
-                    if (mv->q8_rows8_min      >= 0) dev->profile.q8_rows8_min      = (uint32_t) mv->q8_rows8_min;
-                    if (mv->q8_act_load_bytes >= 0) dev->profile.q8_act_load_bytes = (uint32_t) mv->q8_act_load_bytes;
-                    if (mv->mv_group_red      >= 0) dev->profile.mv_group_red      = (uint32_t) mv->mv_group_red;
-                    // GGML_METAL_GROUP_RED=0 keeps the grouped K-quant matvec on the row-at-a-time sums.
-                    const char * red_env = getenv("GGML_METAL_GROUP_RED");
-                    if (red_env && strcmp(red_env, "0") == 0) {
-                        dev->profile.mv_group_red = 0;
-                    }
-                }
-                if (row != NULL || mv != NULL) {
-                    GGML_LOG_INFO("%s: hw row %s (%s): CUs=%u, L1=%u KB/CU, L2=%u KB, BW=%.0f GB/s, mv_reduce=%u, f_scalar_w64=%u, mv_group=%u, attn_gate_fuse=%u, conv_l2_fold=%u, add_norm_fuse=%u, cb_seq=%u, q8_load_bytes=%u, q8_rows8_min=%u, q8_act_load_bytes=%u, set_nowait=%u, staging_keep=%u, mv_group_red=%u\n",
-                        __func__, dev->profile.name, row != NULL ? row->chip : "",
+                if (row != NULL) {
+                    GGML_LOG_INFO("%s: hw row %s (%s): CUs=%u, L1=%u KB/CU, L2=%u KB, BW=%.0f GB/s, attn_gate_fuse=%u, conv_l2_fold=%u, add_norm_fuse=%u, cb_seq=%u, set_nowait=%u, staging_keep=%u\n",
+                        __func__, dev->profile.name, row->chip,
                         dev->profile.compute_units, dev->profile.l1_cache_per_cu / 1024,
-                        dev->profile.l2_cache_total / 1024, dev->profile.local_bandwidth / 1e9, dev->profile.mv_reduce, dev->profile.f_scalar_w64, dev->profile.mv_group, dev->profile.attn_gate_fuse, dev->profile.conv_l2_fold, dev->profile.add_norm_fuse, dev->profile.cb_seq, dev->profile.q8_load_bytes, dev->profile.q8_rows8_min, dev->profile.q8_act_load_bytes, dev->profile.set_nowait, dev->profile.staging_keep, dev->profile.mv_group_red);
+                        dev->profile.l2_cache_total / 1024, dev->profile.local_bandwidth / 1e9, dev->profile.attn_gate_fuse, dev->profile.conv_l2_fold, dev->profile.add_norm_fuse, dev->profile.cb_seq, dev->profile.set_nowait, dev->profile.staging_keep);
                 }
             }
 
             dev->profile.lane_ok = ggml_metal_lane_ok_mask(dev->profile.name);
             ggml_metal_tiled_test_arm();
 
-            // Per-shape matvec rows of this card: data/matmul.tsv [matvec_shapes] (generated header; the rows of one card stand together).
-            // GGML_METAL_KQ_HW_ROWS=0 ignores them; GGML_METAL_KQ_PREP=0, GGML_METAL_KQ_COLS=0, GGML_METAL_KQ_EXT_ROWS=0 (the rows of data/matmul.tsv [tiles]) switch one part off.
-            {
-                const char * rows_env = getenv("GGML_METAL_KQ_HW_ROWS");
-                const char * prep_env = getenv("GGML_METAL_KQ_PREP");
-                const char * cols_env = getenv("GGML_METAL_KQ_COLS");
-                const char * ext_env  = getenv("GGML_METAL_KQ_EXT_ROWS");
-                if (!(rows_env && strcmp(rows_env, "0") == 0)) {
-                    uint32_t n_rows = 0;
-                    const struct ggml_device_mv_row * rows = ggml_metal_mv_rows_of(dev->profile.name, &n_rows);
-                    dev->profile.mv_rows   = rows;
-                    dev->profile.n_mv_rows = n_rows;
-                    for (uint32_t i = 0; i < n_rows; i++) {
-                        const struct ggml_device_mv_row * row = &rows[i];
-                        if (row->prep == 1 && !(prep_env && strcmp(prep_env, "0") == 0)) {
-                            dev->profile.kq_prep = 1;
-                        }
-                        if (row->cols > 1 && !(cols_env && strcmp(cols_env, "0") == 0)) {
-                            dev->profile.kq_cols = 1;
-                        }
-                    }
-                }
-                if (dev->profile.n_mv_rows > 0) {
-                    GGML_LOG_INFO("%s: hw mv rows %s: %u rows, kq_prep=%u, kq_cols=%u, ext_min rows=%u\n", __func__, dev->profile.name, dev->profile.n_mv_rows, dev->profile.kq_prep, dev->profile.kq_cols, (unsigned) ((ext_env && strcmp(ext_env, "0") == 0) ? 0 : ggml_metal_batch_rows_count(dev->profile.name)));
-                }
-            }
+            // The matvec settings and rows before the wave is probed: the default row. They are loaded again when the
+            // library is built and the wave known (ggml_metal_device_ensure_library).
+            dev->card.wave_probed = 0;
+            ggml_metal_device_matvec_load(dev);
 
             // Model profile: initialized to defaults (populated=false).
             // Will be populated later via ggml_backend_metal_set_model_profile()
@@ -534,6 +370,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->props.op_offload_min_batch_size  = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
             dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
+
             dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;
             if (@available(macOS 10.12, iOS 16.0, *)) {
                 dev->props.max_working_set_size   = dev->mtl_device.recommendedMaxWorkingSetSize;

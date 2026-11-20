@@ -2,6 +2,7 @@
 // Extracted from dispatch.cpp — handles all quant types with shmem_reduce
 // for non-32-wide GPUs (Intel NW<32, AMD NW=64).
 #include "dispatch.h"
+#include "matvec-plan.h"
 #include "tuning.h"
 #include "ggml-metal-probe.h"
 #include <algorithm>
@@ -402,12 +403,12 @@ static int dispatch_mul_mat_q8_lab(ggml_metal_op_t ctx, int idx) {
 // A single Q8_0 matvec with at least the hw row's q8_rows8_min rows: 8 whole rows per simdgroup, word loads.
 // Taken only where its lane sums pair up exactly as the default kernel's tree does, so the output bytes are the same.
 // Returns 1 when encoded, 0 to fall through.
-static int dispatch_mul_mat_q8_rows8(ggml_metal_op_t ctx, int idx) {
+static int dispatch_mul_mat_q8_rows8(ggml_metal_op_t ctx, int idx, const struct ggml_metal_matvec_plan * plan) {
     const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
     ggml_tensor * op = ctx->node(idx);
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
-    if (profile->q8_rows8_min == 0 || src0->ne[1] < (int64_t) profile->q8_rows8_min) {
+    if (plan->q8_rows8_min <= 0 || src0->ne[1] < (int64_t) plan->q8_rows8_min) {
         return 0;
     }
     if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
@@ -420,12 +421,12 @@ static int dispatch_mul_mat_q8_rows8(ggml_metal_op_t ctx, int idx) {
         return 0;
     }
     const int width = (int) profile->simd_width;
-    const int nsg = N_SG_Q8_0, nr0 = 8, lanes_per_block = 4;
+    const int nsg = plan->nsg, nr0 = 8, lanes_per_block = 4;
     // same bytes as the default kernel: tree row sum, and one block per lane there (blocks = nsg x width / lanes per block)
-    if (width != 64 || profile->mv_reduce != 1 || src0->ne[0] != (int64_t) nsg*(width/lanes_per_block)*32) {
+    if (width != 64 || plan->reduce != 2 || src0->ne[0] != (int64_t) nsg*(width/lanes_per_block)*32) {
         return 0;
     }
-    if (ggml_metal_q8_load_bytes(profile, src0) != 4) {
+    if (ggml_metal_q8_load_bytes(plan->q8_load_pref, src0) != 4) {
         return 0;
     }
     char name[256];
@@ -455,6 +456,9 @@ static int dispatch_mul_mat_q8_rows8(ggml_metal_op_t ctx, int idx) {
     args.ne1  = (int32_t) op->ne[1];
     args.nr0  = nr0;
 
+    if (ggml_metal_mv_receipt_requested()) {
+        fprintf(stderr, "MV_RECEIPT attempt=none fallback=none final=0:1:%d:0:0:%s\n", nr0, name);
+    }
     ggml_metal_encoder_t enc = ctx->enc;
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -468,10 +472,10 @@ static int dispatch_mul_mat_q8_rows8(ggml_metal_op_t ctx, int idx) {
 }
 
 // The 2-4 Q8_0 matvecs that read one activation, packed by the graph optimizer, in one launch (hw row mv_group).
-static int dispatch_mul_mat_q8_group(ggml_metal_op_t ctx, int idx) {
+static int dispatch_mul_mat_q8_group(ggml_metal_op_t ctx, int idx, const struct ggml_metal_matvec_plan * plan) {
     const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
     ggml_tensor * op = ctx->node(idx);
-    if (profile->mv_group != 1 || !ctx->use_fusion || !op->src[1] || !ggml_metal_norm_matvec_mm_ok(op, op->src[1])) {
+    if (plan->q8_group != 1 || !ctx->use_fusion || !op->src[1] || !ggml_metal_norm_matvec_mm_ok(op, op->src[1])) {
         return 0;
     }
     const ggml_tensor * act = op->src[1];
@@ -486,17 +490,17 @@ static int dispatch_mul_mat_q8_group(ggml_metal_op_t ctx, int idx) {
     }
 
     const int  width = (int) profile->simd_width;
-    const bool sr    = width != 32;
-    const int  nsg   = N_SG_Q8_0;
-    const int  nr0   = N_R0_Q8_0;
-    const int  tail  = (sr && profile->mv_reduce == 1) ? 1 : 0;
+    const bool sr    = plan->reduce != 0;
+    const int  nsg   = plan->nsg;
+    const int  nr0   = plan->nr0;
+    const int  tail  = plan->reduce == 2 ? 1 : 0;
 
     char name[256];
     snprintf(name, sizeof(name), "kernel_mul_mvg_q8_0_f32_k=%d_nsg=%d_sr=%d_nr0=%d_tail=%d", nmat, nsg, sr ? 1 : 0, nr0, tail);
     // word loads only when every matrix of the group can take them
     int q8_load = 4;
     for (int k = 0; k < nmat; k++) {
-        if (ggml_metal_q8_load_bytes(profile, mm[k]->src[0]) != 4) {
+        if (ggml_metal_q8_load_bytes(plan->q8_load_pref, mm[k]->src[0]) != 4) {
             q8_load = 1;
         }
     }
@@ -505,7 +509,7 @@ static int dispatch_mul_mat_q8_group(ggml_metal_op_t ctx, int idx) {
         snprintf(name + used, sizeof(name) - used, "_q8load=%d", q8_load);
     }
     // the matrices of a group share one activation
-    const int q8_act = ggml_metal_q8_act_load_bytes(profile, mm[0]->src[1]);
+    const int q8_act = ggml_metal_q8_act_load_bytes(plan->q8_act_pref, mm[0]->src[1]);
     if (q8_act != 4) {
         const size_t used = strlen(name);
         snprintf(name + used, sizeof(name) - used, "_q8act=%d", q8_act);
@@ -554,6 +558,9 @@ static int dispatch_mul_mat_q8_group(ggml_metal_op_t ctx, int idx) {
         }
     }
 
+    if (ggml_metal_mv_receipt_requested()) {
+        fprintf(stderr, "MV_RECEIPT attempt=none fallback=none final=1:1:%d:0:0:%s\n", nr0, name);
+    }
     ggml_metal_encoder_t enc = ctx->enc;
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -589,21 +596,33 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
     // Not reproduced later (f16 and bf16 pass on 64-wide cards); f16 and bf16 run scalar where the hw row says f_scalar_w64.
     const bool scalar_f_broken = (profile->simd_width == 64 &&
         (op->src[0]->type == GGML_TYPE_F32 ||
-         ((op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) && profile->f_scalar_w64 != 1)));
+         ((op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16) && ggml_metal_device_get_card(ctx->dev)->f_scalar_w64 != 1)));
 
     if (scalar_f_broken) {
         return 0;
     }
 
-    if (profile->mv_group == 1 && op->src[0]->type == GGML_TYPE_Q8_0) {
-        const int n = dispatch_mul_mat_q8_group(ctx, idx);
-        if (n > 0) {
-            return n;
+    // Q8_0: the grouped launch and the 8-row launch take their grouping, row sum, simdgroups and load widths from
+    // the matvec work plan of this multiply.
+    if (op->src[0]->type == GGML_TYPE_Q8_0) {
+        struct ggml_metal_matvec_in q8_in = {};
+        q8_in.weight      = (int32_t) GGML_TYPE_Q8_0;
+        q8_in.k           = op->src[0]->ne[0];
+        q8_in.m           = op->src[0]->ne[1];
+        q8_in.cols        = 1;
+        q8_in.use_rows    = 1;
+        q8_in.model_known = model != nullptr && model->populated ? 1 : 0;
+        q8_in.act_bytes   = (uint32_t) op->src[0]->ne[0] * (uint32_t) sizeof(float);
+        const struct ggml_metal_matvec_plan q8_plan = ggml_metal_matvec_plan_for(ggml_metal_device_get_card(ctx->dev), &q8_in);
+        if (q8_plan.ok && q8_plan.q8_group == 1) {
+            const int n = dispatch_mul_mat_q8_group(ctx, idx, &q8_plan);
+            if (n > 0) {
+                return n;
+            }
         }
-    }
-
-    if (op->src[0]->type == GGML_TYPE_Q8_0 && dispatch_mul_mat_q8_rows8(ctx, idx) == 1) {
-        return 1;
+        if (q8_plan.ok && dispatch_mul_mat_q8_rows8(ctx, idx, &q8_plan) == 1) {
+            return 1;
+        }
     }
     if (ggml_metal_q8_lab_requested() && op->src[0]->type == GGML_TYPE_Q8_0) {
         const int n = dispatch_mul_mat_q8_lab(ctx, idx);
@@ -624,95 +643,127 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
     const int16_t r2 = ne12/ne02;
     const int16_t r3 = ne13/ne03;
 
-    // Compute optimal NR0 from model + hardware profile.
-    // For basic quant types (q4_0..q5_1), this drives the function constant FC_mul_mv_nr0,
-    // giving the kernel a dynamic NR0 at compile time (8 for small models, 4 for large).
-    // For k-quant types, the function constant is set but ignored — they still use the
-    // template parameter (NR0 override requires changing all k-quant entry points too).
+    // The matvec work plan of this multiply (matmul/matvec-plan.h): the rule reads the weight type's values, the card's
+    // defaults and rows. Rows per simdgroup of a K-quant: the external rows file first, then the card's shape row.
     const ggml_type type = op->src[0]->type;
     const struct mv_format_row * type_row = ggml_metal_mv_format(type);
     const bool kquant_rows = type_row != nullptr && type_row->shape_rows;
-    int nr0_dynamic = kquant_rows ? ggml_metal_mv_nr0_from_rows(type, ne00, ne01) : ggml_metal_compute_nr0_basic(profile, model, ne00);
 
-    const bool use_shmem_reduce = (profile->simd_width != 32);
     const bool src1_trans_mv = ggml_is_transposed(op->src[1]);
     ggml_tensor * residual = ggml_metal_match_q4_k_residual_add(ctx, idx, op);
     const bool use_residual = residual != nullptr;
 
-    // Per-shape row of this card (hw mv rows); a row of the rows file above wins. A Q4_K weight with headers prepared
-    // at load (one plane, one f32 column, no residual epilogue) may take a prep row: its entry point reads them at 5.
-    bool kq_prep = false;
+    // A Q4_K weight with headers prepared at load (one plane, one f32 column, no residual epilogue) may take a prep
+    // row: its entry point reads them at 5.
+    const bool kq_prep_test = kquant_rows && ggml_metal_kq_prep_test_requested();
     ggml_metal_buffer_id bid_kq_prep = { nullptr, 0 };
-    if (kquant_rows) {
-        const bool kq_prep_test = ggml_metal_kq_prep_test_requested();
-        if (type == GGML_TYPE_Q4_K && !use_residual && !src1_trans_mv && op->src[1]->type == GGML_TYPE_F32 &&
-            ne02 == 1 && ne03 == 1 && ne11 == 1 && ne12 == 1 && ne13 == 1 && (profile->kq_prep == 1 || kq_prep_test)) {
-            bid_kq_prep = ggml_metal_get_kq_prep_id(op->src[0]);
+    if (kquant_rows && type == GGML_TYPE_Q4_K && !use_residual && !src1_trans_mv && op->src[1]->type == GGML_TYPE_F32 &&
+        ne02 == 1 && ne03 == 1 && ne11 == 1 && ne12 == 1 && ne13 == 1 && (ggml_metal_device_get_card(ctx->dev)->kq_prep == 1 || kq_prep_test)) {
+        bid_kq_prep = ggml_metal_get_kq_prep_id(op->src[0]);
+    }
+
+    struct ggml_metal_matvec_in in = {};
+    in.kind           = 0;
+    in.weight         = (int32_t) type;
+    in.k              = ne00;
+    in.m              = ne01;
+    in.cols           = 1;
+    in.prep_available = bid_kq_prep.metal != nullptr ? 1 : 0;
+    in.use_rows       = 1;
+    in.model_known    = model != nullptr && model->populated ? 1 : 0;
+    in.act_bytes      = (uint32_t) ne00 * (uint32_t) sizeof(float);
+    in.rows_file_nr0  = kquant_rows ? ggml_metal_mv_nr0_from_rows(type, ne00, ne01) : 0;
+    struct ggml_metal_matvec_plan plan = ggml_metal_matvec_plan_for(ggml_metal_device_get_card(ctx->dev), &in);
+    if (kq_prep_test && bid_kq_prep.metal != nullptr) {
+        plan.prep = 1;
+    }
+
+    // The test hook GGML_METAL_TEST_MV_PLAN (matmul/matvec-plan.h) names this multiply: its plan replaces the rule's.
+    const struct ggml_metal_matvec_forced * forced = ggml_metal_matvec_forced_env();
+    const bool forced_here = ggml_metal_matvec_forced_is_for(forced, 0, (int32_t) type, ne00, ne01, ne11) == 1;
+    if (forced_here) {
+        if (use_residual || src1_trans_mv || op->src[1]->type != GGML_TYPE_F32 || ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1) {
+            GGML_ABORT("GGML_METAL_TEST_MV_PLAN: the multiply is not one plane of f32 activation columns without a fused add");
         }
-        if (nr0_dynamic == 0) {
-            const struct ggml_device_mv_row * row = ggml_metal_mv_hw_row(profile, 0, type, ne00, ne01, 1, bid_kq_prep.metal != nullptr);
-            if (row != nullptr) {
-                nr0_dynamic = row->nr0;
-                kq_prep = row->prep == 1;
-            }
-        }
-        if (kq_prep_test && bid_kq_prep.metal != nullptr) {
-            kq_prep = true;
+        bid_kq_prep = forced->prep == 1 ? ggml_metal_get_kq_prep_id(op->src[0]) : ggml_metal_buffer_id{ nullptr, 0 };
+        struct ggml_metal_matvec_in forced_in = in;
+        forced_in.cols           = ne11;
+        forced_in.prep_available = bid_kq_prep.metal != nullptr ? 1 : 0;
+        const char * why = nullptr;
+        if (!ggml_metal_matvec_forced_plan(ggml_metal_device_get_card(ctx->dev), &forced_in, forced, &plan, &why)) {
+            GGML_ABORT("GGML_METAL_TEST_MV_PLAN: %s", why);
         }
     }
-    // A cols row of this card takes a 2-4 column decode batch of this weight in one launch (grid 1 in y).
-    const int nr0_single = nr0_dynamic;
-    const bool kq_prep_single = kq_prep;
+
+    // A column row of this card takes a 2-4 column decode batch of this weight in one launch (grid 1 in y). The
+    // one-column plan is kept: a column plan the compiled pipeline cannot run falls back to it.
+    const struct ggml_metal_matvec_plan plan_single = plan;
     const ggml_metal_buffer_id bid_kq_prep_single = bid_kq_prep;
-    int ncols = 0;
-    int col_form = 0;
-    if (kquant_rows && type != GGML_TYPE_Q5_K && ne11 >= 2 && ne11 <= 4 && !use_residual && !src1_trans_mv && op->src[1]->type == GGML_TYPE_F32 &&
+    if (!forced_here && kquant_rows && type != GGML_TYPE_Q5_K && ne11 >= 2 && ne11 <= 4 && !use_residual && !src1_trans_mv && op->src[1]->type == GGML_TYPE_F32 &&
         ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
         int test_nr0 = 0;
         int test_form = 0;
         const bool cols_test = ggml_metal_kq_cols_test(&test_nr0, &test_form);
         ggml_metal_buffer_id bid_cols = { nullptr, 0 };
-        if (type == GGML_TYPE_Q4_K && (profile->kq_prep == 1 || ggml_metal_kq_prep_test_requested())) {
+        if (type == GGML_TYPE_Q4_K && (ggml_metal_device_get_card(ctx->dev)->kq_prep == 1 || ggml_metal_kq_prep_test_requested())) {
             bid_cols = ggml_metal_get_kq_prep_id(op->src[0]);
         }
-        const struct ggml_device_mv_row * cols_row = ggml_metal_mv_hw_row(profile, 0, type, ne00, ne01, ne11, bid_cols.metal != nullptr);
-        if (cols_row != nullptr || cols_test) {
-            ncols = ne11;
-            col_form = cols_row != nullptr ? cols_row->form : test_form;
-            if (ne11 == 4 || profile->simd_width != 64) {
-                col_form &= 3; // paired halves take 2 or 3 columns and are the two halves of a 64-thread wave
-            }
-            nr0_dynamic = cols_row != nullptr ? cols_row->nr0 : test_nr0;
-            kq_prep = cols_row != nullptr ? cols_row->prep == 1 : bid_cols.metal != nullptr;
+        struct ggml_metal_matvec_in cols_in = in;
+        cols_in.cols           = ne11;
+        cols_in.prep_available = bid_cols.metal != nullptr ? 1 : 0;
+        const struct ggml_metal_matvec_plan cols_plan = ggml_metal_matvec_plan_for(ggml_metal_device_get_card(ctx->dev), &cols_in);
+        if (cols_plan.cols > 1) {
+            plan = cols_plan;
+            bid_kq_prep = bid_cols;
+        } else if (cols_test) {
+            // the test switch asks for a column launch without a row: its values are not checked here, the pipeline as compiled decides below
+            plan.cols      = ne11;
+            plan.form      = test_form;
+            plan.nr0       = test_nr0;
+            plan.nr0_set   = 1;
+            plan.prep      = bid_cols.metal != nullptr ? 1 : 0;
+            plan.shape_row = -1;
             bid_kq_prep = bid_cols;
         }
-    }
-    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, src1_trans_mv, nr0_dynamic, use_residual, kq_prep, ncols, col_form);
-
-    // The column kernel is held to the pipeline as compiled, whatever the row or the test switch asked for.
-    if (pipeline.pipeline && ncols > 0) {
-        const int rows_per_tg = pipeline.nr0 * pipeline.nsg;
-        if (rows_per_tg <= 0 || ne01 % rows_per_tg != 0) {
-            // it loads every weight row of a threadgroup before the output bound: a partial last threadgroup takes the per-column launch
-            ncols = 0;
-            col_form = 0;
-            nr0_dynamic = nr0_single;
-            kq_prep = kq_prep_single;
-            bid_kq_prep = bid_kq_prep_single;
-            pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, src1_trans_mv, nr0_dynamic, use_residual, kq_prep, ncols, col_form);
-        } else if ((col_form & 4) != 0 && ggml_metal_pipeline_thread_execution_width(pipeline) != 64) {
-            // paired halves split the wave at thread 32: a pipeline compiled to another width takes the ordinary column form
-            col_form &= 3;
-            pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, use_shmem_reduce, src1_trans_mv, nr0_dynamic, use_residual, kq_prep, ncols, col_form);
+        if (plan.cols > 1 && (ne11 == 4 || profile->simd_width != 64)) {
+            plan.form &= 3; // paired halves take 2 or 3 columns and are the two halves of a 64-thread wave
         }
     }
+    char pipeline_name[256];
+    char * name_out = ggml_metal_mv_receipt_requested() ? pipeline_name : nullptr;
+    auto pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, &plan, src1_trans_mv, use_residual, name_out);
 
+    // The column kernel is held to the pipeline as compiled, whatever the row or the test switch asked for.
+    const struct ggml_metal_matvec_plan plan_attempt = plan;
+    int fallback = GGML_METAL_MATVEC_FALLBACK_NONE;
+    int fallback_rows = 0;
+    int fallback_wave = 0;
+    if (pipeline.pipeline && plan.cols > 1) {
+        fallback_rows = pipeline.nr0 * pipeline.nsg;
+        fallback_wave = ggml_metal_pipeline_thread_execution_width(pipeline);
+        struct ggml_metal_matvec_plan next = plan;
+        fallback = ggml_metal_matvec_plan_fallback(&plan, &plan_single, ne01, pipeline.nr0, pipeline.nsg, fallback_wave, &next);
+        if (fallback != GGML_METAL_MATVEC_FALLBACK_NONE) {
+            plan = next;
+            if (fallback == GGML_METAL_MATVEC_FALLBACK_TAIL) {
+                bid_kq_prep = bid_kq_prep_single; // a partial last threadgroup takes the per-column launch
+            }
+            pipeline = ggml_metal_library_get_pipeline_mul_mv(lib, op, &plan, src1_trans_mv, use_residual, name_out);
+        }
+    }
+    const bool kq_prep = plan.prep == 1;
+    const int ncols = plan.cols > 1 ? plan.cols : 0;
+
+    if (forced_here && (!pipeline.pipeline || fallback != GGML_METAL_MATVEC_FALLBACK_NONE || pipeline.nr0 != forced->nr0)) {
+        GGML_ABORT("GGML_METAL_TEST_MV_PLAN: the compiled pipeline cannot run the forced plan (%s, rows per simdgroup %d)",
+            !pipeline.pipeline ? "no pipeline" : fallback == GGML_METAL_MATVEC_FALLBACK_TAIL ? "m is not whole threadgroups of it" :
+            fallback == GGML_METAL_MATVEC_FALLBACK_WIDTH ? "its wave is not 64" : "it runs another row count", pipeline.pipeline ? pipeline.nr0 : 0);
+    }
     if (!pipeline.pipeline) {
         return 0;
     }
 
-    // NR0 comes from the pipeline (which used our nr0_dynamic override for basic types,
-    // or the hardcoded N_R0_* default for other types).
+    // The launch geometry comes from the pipeline as compiled for the plan.
     const int nr0 = pipeline.nr0;
     const int nr1 = pipeline.nr1;
     const int nsg = pipeline.nsg;
@@ -746,6 +797,21 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
         /*.grid_x          =*/ 0,  // set below after grid computation
     };
 
+    // the receipt of a launch that is encoded: the pipeline named is the one bound below
+    if (ggml_metal_mv_receipt_requested()) {
+        char attempt[64] = "none";
+        if (plan_attempt.cols > 1) {
+            snprintf(attempt, sizeof(attempt), "%d:%d:%d:%d", plan_attempt.cols, plan_attempt.nr0, plan_attempt.form, plan_attempt.prep);
+        }
+        char why[96] = "none";
+        if (fallback == GGML_METAL_MATVEC_FALLBACK_TAIL) {
+            snprintf(why, sizeof(why), "tail: m %d is not a whole number of %d", ne01, fallback_rows);
+        } else if (fallback == GGML_METAL_MATVEC_FALLBACK_WIDTH) {
+            snprintf(why, sizeof(why), "width: compiled wave %d", fallback_wave);
+        }
+        fprintf(stderr, "MV_RECEIPT attempt=%s fallback=%s final=0:%d:%d:%d:%d:%s\n", attempt, why,
+            plan.cols, pipeline.nr0, plan.form, plan.prep, pipeline_name);
+    }
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
@@ -768,7 +834,7 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
     //         while other quant types use nr0*nsg (more rows per TG).
     // grid_y: src1 rows (batch dimension), 1 for matvec.
     // grid_z: attention heads × batch (3rd and 4th tensor dimensions).
-    const int32_t grid_x = ggml_metal_mv_rows_per_threadgroup(op->src[0]->type)
+    const int32_t grid_x = plan.rows_per_threadgroup
                            ? ((ne01 + nr0 - 1) / nr0)
                            : ((ne01 + nr0*nsg - 1) / (nr0*nsg));
     const int32_t grid_y = ncols > 0 ? 1 : ((ne11 + nr1 - 1) / nr1);

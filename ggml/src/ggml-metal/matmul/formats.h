@@ -23,7 +23,7 @@ enum mv_act_kind { MV_ACT_NO, MV_ACT_YES, MV_ACT_MM };
 
 struct mv_format_row {
     enum ggml_type    type;
-    int               nsg;                  // simdgroups per threadgroup; 0 = the geometry comes from the tensor
+    int               nsg;                  // simdgroups per threadgroup; 0 = they come from the tensor (the dense float types)
     int               nr0;                  // rows per simdgroup, or per threadgroup when rows_per_threadgroup
     bool              rows_per_threadgroup;
     enum mv_smem_kind smem;
@@ -39,6 +39,8 @@ struct mv_format_row {
     bool              act_bf16;             // a kernel reads a bf16 activation with this weight type
     enum mv_act_kind  act_f16;              // the same for an f16 activation
     bool              ext_wide;             // without matrix hardware the small-batch kernel takes any column count
+    int               short_k;              // dense float types: below this many input columns the short entry runs; 0 = the type has none
+    int               short_rows;           // rows per threadgroup of the short entry
 };
 
 #include "mv-formats-table.h"
@@ -51,6 +53,12 @@ static inline const struct mv_format_row * ggml_metal_mv_format(enum ggml_type t
         }
     }
     return NULL;
+}
+
+// True when a dense float matvec of k input columns runs the short entry (one simdgroup, short_rows rows per
+// threadgroup, no threadgroup memory). The rule, the entry lookup and the memory sizing all ask here.
+static inline bool ggml_metal_mv_float_short(const struct mv_format_row * row, int64_t k) {
+    return row != NULL && row->short_k > 0 && k < row->short_k;
 }
 
 // True when the matrix route takes the op. The router and the supports predicate both ask here.

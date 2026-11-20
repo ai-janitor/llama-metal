@@ -64,6 +64,7 @@ ggml_add_backend_library(ggml-metal
                          act-copy/decide.cpp
                          matmul/batch-route.cpp
                          matmul/tiled-plan.cpp
+                         matmul/matvec-plan.cpp
                          act-copy/act-copy.cpp
                          ssm/pipeline-ssm.cpp
                          flash-attn/pipeline-flash-attn.cpp
@@ -169,6 +170,7 @@ execute_process(
     COMMAND ${CMAKE_COMMAND}
             -DTABLE=${GGML_METAL_DATA_DIR}/matmul.tsv
             -DOUT=${MV_FORMATS_DIR}/matvec-rows.h
+            -DDEVICES=${CMAKE_CURRENT_SOURCE_DIR}/data/device.tsv
             -P ${CMAKE_CURRENT_SOURCE_DIR}/matmul/gen-matvec.cmake
     RESULT_VARIABLE MV_MATVEC_RC)
 if (NOT MV_MATVEC_RC EQUAL 0)

@@ -34,7 +34,7 @@ int main() {
     static const device_want devices[] = {
         { D700,  "FirePro D700 (GCN 1.0, Tahiti)",      "gcn1",  64, 32768, 32, 16384,  786432, 263000000000LL, -1, 1, 1, 1, 4, 1, 1, 1, 0, 1, 1 },
         { M5500, "Radeon Pro 5500M (RDNA 1, Navi 14)",  "rdna1", 32, 65536, 24, 16384, 4194304, 192000000000LL, -1, 1, 0, 0, 4, 1, 1, 1, 0, 1, 1 },
-        { VEGA,  "Radeon Pro Vega 64 (GCN 5, Vega 10)", "gcn5",  64, 65536, -1, 16384, 4194304,             -1, -1, 1, 1, 1, 4, 1, 1, 1, 0, 1, 1 },
+        { VEGA,  "Radeon Pro Vega 64 (GCN 5, Vega 10)", "gcn5",  64, 65536, 64, 16384, 4194304, 484000000000LL, -1, 1, 1, 1, 4, 1, 1, 1, 0, 1, 1 },
     };
     static const default_want defaults[] = {
         { D700,   1,  1, 1, 1, 4, 16384, 16,  1 },

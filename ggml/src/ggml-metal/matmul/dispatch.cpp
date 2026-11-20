@@ -12,6 +12,33 @@
 #include "dispatch.h"
 #include "tuning.h"
 #include "ggml-metal-probe.h"
+
+const struct ggml_metal_matvec_forced * ggml_metal_matvec_forced_env(void) {
+    static struct ggml_metal_matvec_forced forced = {};
+    static const bool set = [] {
+        const char * text = std::getenv("GGML_METAL_TEST_MV_PLAN");
+        if (text == nullptr) {
+            return false;
+        }
+        char word[16] = "";
+        const char * why = nullptr;
+        if (!ggml_metal_matvec_forced_parse(text, &forced, word, &why)) {
+            GGML_ABORT("GGML_METAL_TEST_MV_PLAN: %s, got '%s'", why, text);
+        }
+        forced.weight = -1;
+        for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
+            const char * name = ggml_type_name((enum ggml_type) i);
+            if (name != nullptr && std::strcmp(name, word) == 0 && ggml_metal_mv_format((enum ggml_type) i) != nullptr) {
+                forced.weight = i;
+            }
+        }
+        if (forced.weight < 0) {
+            GGML_ABORT("GGML_METAL_TEST_MV_PLAN: '%s' is not a weight type with a matvec kernel", word);
+        }
+        return true;
+    }();
+    return set ? &forced : nullptr;
+}
 GGML_METAL_FAMILY(matmul) int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     int n;
 

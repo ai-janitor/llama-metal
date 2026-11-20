@@ -69,74 +69,8 @@
 #include "../ggml-metal-impl.h"
 #include "formats.h"
 
-// Compute optimal NR0 (rows per simdgroup) for a given matmul operation.
-//
-// NR0 controls activation data reuse in the L1 cache:
-//   - Each simdgroup loads the input vector (activation) once and multiplies
-//     it against NR0 different weight rows.
-//   - Higher NR0 = better L1 reuse (amortize activation load over more rows).
-//   - But higher NR0 = more accumulator registers (sumf[NR0]), which can
-//     reduce wavefront occupancy on register-limited GPUs.
-//   - And higher NR0 = the activation must stay in L1 for NR0 iterations,
-//     competing with weight data for cache lines.
-//
-// The key relationship: as activation_bytes approaches L1_size, NR0 should
-// decrease because there's less room for weight data alongside the activation.
-//
-// Parameters:
-//   hw        — hardware profile (L1 cache size, compute units, etc.)
-//   model     — model profile (n_embd, l1_pressure_ratio, etc.) — may be NULL
-//   ne00      — K dimension of THIS specific matmul (may be n_embd or n_ff)
-//
-// Returns: optimal NR0 value (2, 4, or 8 for k-quant types)
-static inline int ggml_metal_compute_nr0(
-        const struct ggml_device_profile * hw,
-        const struct ggml_model_profile  * model,
-        int ne00) {
-
-    // ---- Fallback: no model profile or no L1 data → hardcoded default ----
-    // This preserves exact current behavior for:
-    //   - Apple Silicon (L1 unknown in hw_table)
-    //   - Any code path that doesn't set a model profile
-    //   - Intel GPUs (L1 unknown)
-    if (!model || !model->populated || hw->l1_cache_per_cu == 0) {
-        return N_R0_KQUANT;  // current default: 4
-    }
-
-    // ---- Dynamic NR0 based on L1 pressure ----
-    // Use ne00 (the actual K dimension of this matmul) rather than model->n_embd,
-    // because FFN down-projections have ne00=n_ff which can be much larger.
-    const uint32_t act_bytes = (uint32_t)ne00 * (uint32_t)sizeof(float);
-    const float pressure = (float)act_bytes / (float)hw->l1_cache_per_cu;
-
-    // Decision thresholds (tuned on D700 with 16KB L1):
-    //
-    //   pressure < 0.3 (act < 5KB on D700):
-    //     Small model (0.6B, n_embd=1024, 4KB). Plenty of L1 room.
-    //     NR0=8: each activation load serves 8 dot products.
-    //     Register pressure: 8 float accumulators = 32 bytes, negligible.
-    //
-    //   pressure >= 0.3 (act >= 5KB on D700):
-    //     Medium to large model. NR0=4 proven optimal on D700 across 3B-9B range.
-    //     Even at pressure=1.0 (9B, activation=L1), NR0=4 beats NR0=2 because
-    //     the activation reuse benefit (4 dot products per load) outweighs the
-    //     cache pressure cost. NR0=2 was tested and regressed on 9B (6.87 vs 7.18).
-    if (pressure < 0.3f) {
-        return 8;
-    }
-    return 4;
-}
-
-// Compute optimal NR0 for basic quant types (q4_0, q4_1, q5_0, q5_1).
-// These use a different baseline NR0 than k-quants (currently 4 for both,
-// but basic types have different register pressure characteristics).
-// For now, delegates to the same logic as k-quants.
-static inline int ggml_metal_compute_nr0_basic(
-        const struct ggml_device_profile * hw,
-        const struct ggml_model_profile  * model,
-        int ne00) {
-    return ggml_metal_compute_nr0(hw, model, ne00);
-}
+// Rows per simdgroup from the card's L1 and the activation size (the cache rule) are part of the matvec work plan:
+// ggml_metal_matvec_plan_for (matmul/matvec-plan.cpp).
 
 // =============================================================================
 // Device-gated mat-vec tuning: nsg and nr0 per quant type

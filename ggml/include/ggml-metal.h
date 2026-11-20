@@ -126,6 +126,16 @@ GGML_BACKEND_API int          ggml_backend_metal_tiled_plan_values(int i, int32_
 // allows. Returns 1, or 0 when dev is NULL or its wave width has not been probed (no backend was initialized on it).
 GGML_BACKEND_API int          ggml_backend_metal_tiled_card_shape(ggml_backend_dev_t dev, uint32_t * wave, uint32_t * group_bytes);
 
+// For a tool that measures matvec work plans (ggml-metal/data/matmul.tsv [matvec_shapes]); neither opens a device.
+// has_rows: 1 when the matvec kernel of this weight type takes shape rows ([formats] shape_rows yes).
+// shape_row: row i of the cards' rows in file order: returns 1 and writes its kind (0 single, 1 group), weight type
+// and shape (k and m are -1 in an every-shape row), or returns 0 past the last row.
+GGML_BACKEND_API int          ggml_backend_metal_matvec_has_rows(enum ggml_type type);
+GGML_BACKEND_API int          ggml_backend_metal_matvec_shape_row(int i, int32_t * kind, enum ggml_type * weight, int64_t * k, int64_t * m);
+// card_row: 1 when the card of this Metal device name has a row with exactly this kind, weight type, written shape,
+// column count and prep (0 | 1); writes the row's rows per simdgroup and loop form (the form's number, 0 with one column).
+GGML_BACKEND_API int          ggml_backend_metal_matvec_card_row(const char * card, int32_t kind, enum ggml_type weight, int64_t k, int64_t m, int32_t cols, int32_t prep, int32_t * nr0, int32_t * form);
+
 #ifdef GGML_METAL_TEST_OBSERVER
 // Test-only observation API. It is absent from production builds.
 struct ggml_backend_metal_test_tensor_range {

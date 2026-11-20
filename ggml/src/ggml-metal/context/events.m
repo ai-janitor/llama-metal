@@ -7,7 +7,7 @@ GGML_METAL_FAMILY(context) void ggml_metal_graph_optimize(ggml_metal_t ctx, stru
     // nodes and prevent individual op timing measurement
     if (ctx->use_graph_optimize && ctx->profile < 2) {
         const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
-        ggml_graph_optimize(gf, profile->mv_group == 1, profile->attn_gate_fuse == 1);
+        ggml_graph_optimize(gf, ggml_metal_device_get_card(ctx->dev)->mv_group == 1, profile->attn_gate_fuse == 1);
     }
 
     //printf("%s: graph optimize took %.3f ms\n", __func__, (ggml_time_us() - t_start) / 1000.0);

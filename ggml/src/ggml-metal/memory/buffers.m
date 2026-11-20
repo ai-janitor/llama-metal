@@ -1,5 +1,6 @@
 #import "device/ggml-metal-device-internal.h"
 #include "ggml-metal-probe.h"
+#include "matmul/matvec-plan.h"
 GGML_METAL_FAMILY(memory) // bandwidth tracking counters
 struct ggml_metal_transfer_stats ggml_metal_xfer_stats = {0};
 
@@ -410,10 +411,14 @@ static struct ggml_metal_kq_prep_rec * ggml_metal_buffer_kq_find(ggml_metal_buff
 
 // Called for every tensor placed in the buffer, before any bytes arrive: a Q4_K weight whose shape has a prep row
 // on this card gets a place for its prepared block headers. GGML_METAL_KQ_PREP_TEST=1 takes every Q4_K tensor.
+// GGML_METAL_TEST_MV_PLAN with prep on takes the weights of the type and shape it names.
 void ggml_metal_buffer_kq_register(ggml_metal_buffer_t buf, const struct ggml_tensor * t) {
-    const struct ggml_device_profile * profile = &buf->dev->profile;
-    const bool test = ggml_metal_kq_prep_test();
-    if (buf->is_shared || buf->n_buffers != 1 || buf->kq_arena != nil || (profile->kq_prep != 1 && !test)) {
+    const struct ggml_metal_card * card = &buf->dev->card;
+    // the test hook GGML_METAL_TEST_MV_PLAN with prep on: the weight it names gets its headers too
+    const struct ggml_metal_matvec_forced * forced = ggml_metal_matvec_forced_env();
+    const bool test = ggml_metal_kq_prep_test() ||
+        (forced != NULL && forced->prep == 1 && forced->weight == (int32_t) t->type && forced->k == t->ne[0] && forced->m == t->ne[1]);
+    if (buf->is_shared || buf->n_buffers != 1 || buf->kq_arena != nil || (card->kq_prep != 1 && !test)) {
         return;
     }
     if (t->type != GGML_TYPE_Q4_K || t->view_src != NULL || t->data == NULL || t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] % 256 != 0) {
@@ -424,9 +429,9 @@ void ggml_metal_buffer_kq_register(ggml_metal_buffer_t buf, const struct ggml_te
         return;
     }
     bool wanted = test;
-    for (uint32_t i = 0; i < profile->n_mv_rows && !wanted; i++) {
-        const struct ggml_device_mv_row * row = &profile->mv_rows[i];
-        wanted = row->prep == 1 && row->type == (int32_t) t->type && row->ne00 == t->ne[0] && row->ne01 == t->ne[1];
+    for (uint32_t i = 0; i < card->n_mv_rows && !wanted; i++) {
+        const struct ggml_device_mv_row * row = &card->mv_rows[i];
+        wanted = row->prep == 1 && ggml_metal_matvec_row_fits(card, row, -1, (int32_t) t->type, t->ne[0], t->ne[1], -1);
     }
     if (!wanted || ggml_metal_buffer_kq_find(buf, t) != NULL) {
         return;

@@ -7,6 +7,7 @@
 #define GGML_METAL_MV_FORMATS_CHECK
 #include "tuning.h"
 #include "dispatch.h"
+#include "matvec-plan.h"
 #include "../lanes/select.h"
 #include "ggml-metal-probe.h"
 #include <cassert>
@@ -84,8 +85,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     return res;
 }
 
-int ggml_metal_q8_load_bytes(const struct ggml_device_profile * hw, const ggml_tensor * src0) {
-    if (!hw || hw->q8_load_bytes != 4 || src0->type != GGML_TYPE_Q8_0 || src0->nb[1] % 4 != 0) {
+int ggml_metal_q8_load_bytes(int pref, const ggml_tensor * src0) {
+    if (pref != 4 || src0->type != GGML_TYPE_Q8_0 || src0->nb[1] % 4 != 0) {
         return 1;
     }
     // A word read can reach 4 bytes past the last weight: keep that inside the buffer.
@@ -96,8 +97,8 @@ int ggml_metal_q8_load_bytes(const struct ggml_device_profile * hw, const ggml_t
     return 4;
 }
 
-int ggml_metal_q8_act_load_bytes(const struct ggml_device_profile * hw, const ggml_tensor * src1) {
-    if (!hw || hw->q8_act_load_bytes != 16 || src1->type != GGML_TYPE_F32 || src1->nb[1] % 16 != 0) {
+int ggml_metal_q8_act_load_bytes(int pref, const ggml_tensor * src1) {
+    if (pref != 16 || src1->type != GGML_TYPE_F32 || src1->nb[1] % 16 != 0) {
         return 4;
     }
     // A 16-byte load needs a 16-byte aligned address: the lane's eight values start at a multiple of 32 bytes in the row.
@@ -127,8 +128,9 @@ static size_t mv_format_smem(const struct mv_format_row * row, int simd_width, i
     return 0;
 }
 
-// kq_prep: the Q4_K entry point that reads block headers prepared at load (the caller binds them at 5); only for Q4_K x F32.
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, bool use_shmem_reduce, bool src1_trans, int nr0_override, bool use_residual, bool kq_prep, int ncols, int col_form) { GGML_METAL_ZONE_BEGIN(pipeline);
+// plan: the matvec work plan of this multiply (matmul/matvec-plan.h). Its prep = the Q4_K entry point that reads block
+// headers prepared at load (the caller binds them at 5). name_out (256 bytes, or NULL) receives the name of the pipeline returned.
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_metal_library_t lib, const ggml_tensor * op, const struct ggml_metal_matvec_plan * plan, bool src1_trans, bool use_residual, char * name_out) { GGML_METAL_ZONE_BEGIN(pipeline);
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
 
@@ -138,40 +140,37 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     int simd_width = ggml_metal_library_get_simd_width(lib);
     const struct ggml_device_profile * hw = ggml_metal_library_get_device_profile(lib);
 
-    int nsg = 0; // number of simdgroups
-    int nr0 = 0; // number of src0 rows per simdgroup
-    int nr1 = 1; // number of src1 rows per threadgroup
-
-    size_t smem = 0; // shared memory
-
     const ggml_type tsrc0 = op->src[0]->type;
     const ggml_type tsrc1 = op->src[1]->type;
     const int16_t selected_lane = ggml_metal_select_lane_id(
         hw, GGML_METAL_LANE_FAMILY_MATMUL, GGML_METAL_LANE_ROUTE_MV_SCALAR, tsrc0, tsrc1);
 
+    if (plan == nullptr || !plan->ok) {
+        GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
+        GGML_ABORT("not implemented");
+    }
+
+    // Simdgroups, rows, reduce, columns and prep come from the plan; the threadgroup memory is sized here.
+    bool use_shmem_reduce = plan->reduce != 0;
+    const bool kq_prep  = plan->prep == 1;
+    const int  ncols    = plan->cols > 1 ? plan->cols : 0;
+    const int  col_form = plan->form;
+    const int  nsg = plan->nsg; // number of simdgroups
+    const int  nr0 = plan->nr0; // number of src0 rows per simdgroup
+    const int  nr1 = 1;         // number of src1 rows per threadgroup
+
+    size_t smem = 0; // shared memory
+
     const char * suffix = "";
 
-    // --- Device-gated mat-vec tuning ---
-    // nsg and nr0 come from ggml_metal_get_mv_tuning(), which selects values
-    // based on hardware traits (vendor, simd_width, matrix_hw).
-    // D700 (GCN legacy): nsg=2, nr0=4 — validated 2026-03-29.
-    // Other devices: nsg=2, nr0=2 — safe upstream defaults.
-    // Per-type smem requirements are still handled in the switch below.
     switch (tsrc0) {
         case GGML_TYPE_F32:
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
             {
-                // Float types use their own nsg/nr0 logic (not device-gated yet)
-                if (ne00 < 32) {
-                    nsg = 1;
-                    nr0 = 32;
-                    nr1 = 1;
+                if (ggml_metal_mv_float_short(ggml_metal_mv_format(tsrc0), ne00)) {
                     suffix = "_short";
                 } else {
-                    nsg = std::min(4, (ne00 + 127) / 128);
-                    nr0 = 2;
-                    nr1 = 1;
                     // The shared-memory reduce (sr=1) sums nsg*NW partials per row.
                     smem = (size_t)(use_shmem_reduce ? nsg : 1)*simd_width*sizeof(float)*nr0;
                     suffix = ne00 % 4 == 0 ? "_4" : "";
@@ -184,36 +183,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
                     GGML_LOG_ERROR("Asserting on type %d\n", (int) tsrc0);
                     GGML_ABORT("not implemented");
                 }
-                struct mv_tuning t = ggml_metal_get_mv_tuning(hw, tsrc0);
-                nsg = t.nsg;
-                nr0 = t.nr0;
-                smem = mv_format_smem(row, simd_width, nsg, nr0, use_shmem_reduce);
+                // sized with the format's own row count; a K-quant whose rows were set is sized again below
+                smem = mv_format_smem(row, simd_width, nsg, row->nr0, use_shmem_reduce);
             }
     };
 
-    // Apply NR0 override from model/hardware profile tuning (dispatch-scalar.cpp).
-    // Applies to types whose kernels read the FC_mul_mv_nr0 function constant:
-    //   - basic quant types (q4_0, q4_1, q5_0, q5_1) via BASIC_MV_ENTRY macro
-    //   - q8_0 via dynamic dispatch in kernel_mul_mv_q8_0_f32
-    // All other types (k-quants, IQ, mxfp4, f16/f32/bf16) use hardcoded
-    // N_R0_* template parameters — overriding nr0 here would mismatch dispatch
-    // grid dimensions vs kernel-compiled NR0, producing corrupted output.
-    // Apply NR0 override ONLY for basic quant types (q4_0..q5_1).
-    // q8_0 is excluded: its kernel_mul_mv_q8_0_f32_impl uses a different structure
-    // (4 threads per quant block, separate row pointers) that produces wrong results
-    // when NR0 doesn't match the compiled template parameter. The dynamic dispatch
-    // added to the kernel entry point routes FC_mul_mv_nr0 to template instantiations,
-    // but the dispatch grid + shmem sizing assumes the pipeline nr0 matches.
-    // q8_0 keeps its compiled N_R0_Q8_0 (ggml-metal-impl.h); the rows override does not apply to it.
-    const struct mv_format_row * tsrc0_row = mv_format_row_of(tsrc0);
-    const bool supports_nr0_override = tsrc0_row && tsrc0_row->nr0_override;
-    if (nr0_override > 0 && supports_nr0_override) {
-        nr0 = nr0_override;
-        if (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K || tsrc0 == GGML_TYPE_Q6_K) {
-            smem = use_shmem_reduce
-                ? (size_t)nsg*simd_width*sizeof(float)*nr0
-                : (size_t)simd_width*sizeof(float)*nr0;
-        }
+    // A row count that a row or the cache rule set (plan->nr0_set) reaches only the kernels that read it: the basic
+    // quants through the function constant, the K-quants with shape rows through their entry's instances. The rule
+    // sets it for no other type.
+    if (plan->nr0_set && (tsrc0 == GGML_TYPE_Q4_K || tsrc0 == GGML_TYPE_Q5_K || tsrc0 == GGML_TYPE_Q6_K)) {
+        smem = use_shmem_reduce
+            ? (size_t)nsg*simd_width*sizeof(float)*nr0
+            : (size_t)simd_width*sizeof(float)*nr0;
     }
 
     if (ncols > 0) {
@@ -224,21 +205,24 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     // The residual epilogue changes buffer 3's destination and activates buffer 4,
     // so it must select a distinct cached function-constant specialization.
     // The hw row's mv_reduce picks the shared-memory reduce tail (1 = tree); other paths keep 0.
-    const int16_t mv_tail = (use_shmem_reduce && hw && hw->mv_reduce == 1) ? 1 : 0;
+    const int16_t mv_tail = plan->reduce == 2 ? 1 : 0;
     snprintf(name, 256, "%s_nsg=%d_sr=%d_st=%d_nr0=%d_lane=%d_residual=%d_tail=%d", base, nsg, use_shmem_reduce ? 1 : 0, src1_trans ? 1 : 0, nr0, selected_lane, use_residual ? 1 : 0, mv_tail);
     if (ncols > 0) {
         const size_t used = strlen(name);
         snprintf(name + used, 256 - used, "_nc=%d_cf=%d", ncols, col_form);
     }
-    const int q8_load = (tsrc1 == GGML_TYPE_F32 && !src1_trans) ? ggml_metal_q8_load_bytes(hw, op->src[0]) : 1;
+    const int q8_load = (tsrc1 == GGML_TYPE_F32 && !src1_trans) ? ggml_metal_q8_load_bytes(plan->q8_load_pref, op->src[0]) : 1;
     if (q8_load != 1) {
         const size_t used = strlen(name);
         snprintf(name + used, 256 - used, "_q8load=%d", q8_load);
     }
-    const int q8_act = (op->src[0]->type == GGML_TYPE_Q8_0 && !src1_trans) ? ggml_metal_q8_act_load_bytes(hw, op->src[1]) : 4;
+    const int q8_act = (op->src[0]->type == GGML_TYPE_Q8_0 && !src1_trans) ? ggml_metal_q8_act_load_bytes(plan->q8_act_pref, op->src[1]) : 4;
     if (q8_act != 4) {
         const size_t used = strlen(name);
         snprintf(name + used, 256 - used, "_q8act=%d", q8_act);
+    }
+    if (name_out != nullptr) {
+        snprintf(name_out, 256, "%s", name);
     }
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
@@ -286,7 +270,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     if (pw != simd_width) {
         // Only the kinds sized by the width change; a fixed table and the short float kernel (no threadgroup memory) do not.
         const struct mv_format_row * row = ggml_metal_mv_format(tsrc0);
-        const bool float_short = row != nullptr && row->nsg == 0 && ne00 < 32;
+        const bool float_short = ggml_metal_mv_float_short(row, ne00);
         if (row != nullptr && row->reduce_recompile && !use_shmem_reduce && pw < 32) {
             // Below width 32 (Intel iGPU) simd_sum and simd_shuffle_down are unreliable: compile the kernel again
             // with the shared-memory reduce, the barrier-based path the ext kernel uses there.
@@ -307,6 +291,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             if (sr1.pipeline) {
                 res = sr1;
                 use_shmem_reduce = true;
+                if (name_out != nullptr) {
+                    snprintf(name_out, 256, "%s", sr1_name);
+                }
             }
         }
         if (row != nullptr && !float_short && (row->smem == MV_SMEM_LANE_FLOATS || row->smem == MV_SMEM_ROW_SUMS)) {

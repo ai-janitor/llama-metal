@@ -7,28 +7,10 @@
 #include "../ops/ggml-metal-ops-internal.h"
 #include "formats.h"
 #include "batch-route.h"
+#include "matvec-plan.h"
 
 #include <cstdlib>
 #include <cstring>
-
-// The first per-shape matvec row of this card that applies to a K-quant weight of this kind (0 single, 1 group
-// member), type, shape and activation column count; a prep row applies only when prep_ok (prepared headers exist).
-static inline const struct ggml_device_mv_row * ggml_metal_mv_hw_row(
-        const struct ggml_device_profile * profile, int kind, ggml_type type, int64_t ne00, int64_t ne01, int cols, bool prep_ok) {
-    if (cols > 1 && profile->kq_cols != 1) {
-        return nullptr;
-    }
-    for (uint32_t i = 0; i < profile->n_mv_rows; i++) {
-        const struct ggml_device_mv_row * row = &profile->mv_rows[i];
-        if ((row->form & 4) != 0 && profile->simd_width != 64) {
-            continue; // paired halves are the two halves of a 64-thread wave
-        }
-        if (row->kind == kind && row->type == (int32_t) type && row->ne00 == ne00 && row->ne01 == ne01 && row->cols == cols && (row->prep != 1 || prep_ok)) {
-            return row;
-        }
-    }
-    return nullptr;
-}
 
 // GGML_METAL_KQ_PREP_TEST=1: every Q4_K weight gets prepared headers and its single matvec reads them (test only).
 static inline bool ggml_metal_kq_prep_test_requested() {
@@ -101,7 +83,8 @@ static inline enum mv_batch_route ggml_metal_batch_route(ggml_metal_op_t ctx, in
     in.k               = op->src[0]->ne[0];
     in.m               = op->src[0]->ne[1];
     in.n               = op->src[1]->ne[1];
-    in.cols_takes      = in.n <= 4 && (ggml_metal_mv_hw_row(profile, 0, type, in.k, in.m, (int) in.n, true) != nullptr || ggml_metal_kq_cols_test(nullptr, nullptr));
+    in.cols_takes      = in.n <= 4 && (ggml_metal_matvec_shape_row(ggml_metal_device_get_card(ctx->dev), 0, (int32_t) type, in.k, in.m, (int32_t) in.n, 1) >= 0 || ggml_metal_kq_cols_test(nullptr, nullptr) ||
+                                           ggml_metal_matvec_forced_is_for(ggml_metal_matvec_forced_env(), 0, (int32_t) type, in.k, in.m, (int32_t) in.n));
     return ggml_metal_batch_route_decide(&in);
 }
 
@@ -120,10 +103,21 @@ void ggml_metal_tiled_test_route(ggml_metal_op_t ctx, int idx, int n, const char
 // Scalar mul_mv — workhorse for single-token generation (batch=1).
 int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx);
 
-// Load width in bytes for this Q8_0 weight tensor: the hw row's value when 4-byte reads stay aligned and inside
-// the tensor's Metal buffer, else 1.
-int ggml_metal_q8_load_bytes(const struct ggml_device_profile * hw, const ggml_tensor * src0);
-int ggml_metal_q8_act_load_bytes(const struct ggml_device_profile * hw, const ggml_tensor * src1);
+// Load width in bytes for this Q8_0 weight tensor: the card's preference (the plan's q8_load_pref) when 4-byte reads
+// stay aligned and inside the tensor's Metal buffer, else 1. The same for the activation (q8_act_pref: 16 or 4).
+int ggml_metal_q8_load_bytes(int pref, const ggml_tensor * src0);
+int ggml_metal_q8_act_load_bytes(int pref, const ggml_tensor * src1);
+
+// GGML_METAL_TEST_MV_RECEIPT=1, inert unless set: every matvec launch of the one-column and grouped routes prints one
+// line to stderr: MV_RECEIPT attempt=<the column plan selected, cols:nr0:form:prep, or none> fallback=<none | tail: ... |
+// width: ...> final=<kind:cols:nr0:form:prep:pipeline name> (test only).
+static inline bool ggml_metal_mv_receipt_requested() {
+    static const bool on = [] {
+        const char * value = std::getenv("GGML_METAL_TEST_MV_RECEIPT");
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    }();
+    return on;
+}
 
 // GCN fallback — f32/f16/bf16 on AMD GCN (64-wide wavefronts).
 // Used when scalar mul_mv can't handle these types at NW=64.

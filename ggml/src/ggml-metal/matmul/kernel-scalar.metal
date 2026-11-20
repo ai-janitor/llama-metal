@@ -491,7 +491,7 @@ void kernel_mul_mv_t_t_disp(
         ushort tidx) {
     switch (args.nr0) {
       //case 1: kernel_mul_mv_t_t_impl<T0, T1, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
-        case 2: kernel_mul_mv_t_t_impl<T0, T1, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
+        case N_R0_F: kernel_mul_mv_t_t_impl<T0, T1, N_R0_F, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
       //case 3: kernel_mul_mv_t_t_impl<T0, T1, 3, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
       //case 4: kernel_mul_mv_t_t_impl<T0, T1, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
     }
@@ -640,7 +640,7 @@ void kernel_mul_mv_t_t_4_disp(
         ushort tidx) {
     switch (args.nr0) {
       //case 1: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 1, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
-        case 2: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
+        case N_R0_F: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, N_R0_F, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
       //case 3: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 3, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
       //case 4: kernel_mul_mv_t_t_4_impl<T0, T04, T1, T14, 4, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx); break;
     };
@@ -679,7 +679,7 @@ void kernel_mul_mv_t_t_short_impl(
         device       char * dst,
         uint3  tgpig,
         ushort tidx) {
-    const int r0 = (tgpig.x + args.tg_x_offset)*32 + tidx;
+    const int r0 = (tgpig.x + args.tg_x_offset)*N_F_SHORT_ROWS + tidx;
     const int r1 = tgpig.y + args.tg_y_offset;
     const int im = tgpig.z;
 
