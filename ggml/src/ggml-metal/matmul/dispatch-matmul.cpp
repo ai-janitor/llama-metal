@@ -111,9 +111,8 @@ static const struct tiled_test_hook & tiled_test(void) {
 // GGML_METAL_TEST_TILED_LIMIT=<threads>, inert unless set: the tiled route treats every pipeline as allowing at most
 // that many threads per group (never more than it really allows), so the low-limit paths can be run on a card whose
 // pipelines allow every compiled plan.
-static int tiled_test_limit(void) {
-    static const int limit = [] {
-        const char * env = getenv("GGML_METAL_TEST_TILED_LIMIT");
+static int tiled_test_limit_of(const char * name) {
+        const char * env = getenv(name);
         if (env == nullptr) {
             return 0;
         }
@@ -124,10 +123,20 @@ static int tiled_test_limit(void) {
         }
         const long value = digits ? strtol(env, nullptr, 10) : 0;
         if (!digits || value < 1 || value > 1024) {
-            GGML_ABORT("GGML_METAL_TEST_TILED_LIMIT must be a whole number of threads from 1 to 1024, got '%s'", env);
+            GGML_ABORT("%s must be a whole number of threads from 1 to 1024, got '%s'", name, env);
         }
         return (int) value;
-    }();
+}
+
+static int tiled_test_limit(void) {
+    static const int limit = tiled_test_limit_of("GGML_METAL_TEST_TILED_LIMIT");
+    return limit;
+}
+
+// GGML_METAL_TEST_TILED_LIMIT_W4=<threads>, inert unless set: the same limit for the q4_K word entry only, so the
+// step from the word entry to the same plan's byte entry can be run on a card whose pipelines allow the plan.
+static int tiled_test_limit_w4(void) {
+    static const int limit = tiled_test_limit_of("GGML_METAL_TEST_TILED_LIMIT_W4");
     return limit;
 }
 
@@ -358,6 +367,31 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
                 pipeline = tiled_compile(lib, act_name, &lay, entry, sizeof(entry));
                 if (!pipeline.pipeline) {
                     act.applies = 0;
+                }
+            }
+            // q4_K has a second entry whose fill reads the quants as 4-byte words. It is taken only when every weight
+            // row starts on a 4-byte address: the tensor's offset in its buffer and its row and batch strides.
+            if (!pipeline.pipeline && wtype == GGML_TYPE_Q4_K &&
+                    ggml_metal_get_buffer_id(op->src[0]).offs % 4 == 0 && nb01 % 4 == 0 && nb02 % 4 == 0 && nb03 % 4 == 0) {
+                char words_name[64];
+                snprintf(words_name, sizeof(words_name), "%s_w4", kernel_name);
+                pipeline = tiled_compile(lib, words_name, &lay, entry, sizeof(entry));
+                if (pipeline.pipeline) {
+                    // A word entry that allows fewer threads per group than the plan needs gives way to the same plan's
+                    // byte entry, before any other plan or route is tried.
+                    int words_limit = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
+                    if (tiled_test_limit() > 0 && tiled_test_limit() < words_limit) {
+                        words_limit = tiled_test_limit();
+                    }
+                    if (tiled_test_limit_w4() > 0 && tiled_test_limit_w4() < words_limit) {
+                        words_limit = tiled_test_limit_w4();
+                    }
+                    if (lay.threads > words_limit) {
+                        if (why[0] == '\0') {
+                            snprintf(why, sizeof(why), "entry %s allows %d threads per group, plan %s needs %d", entry, words_limit, ggml_metal_tiled_compiled_id(lay.row), lay.threads);
+                        }
+                        pipeline = {};
+                    }
                 }
             }
             if (!pipeline.pipeline) {

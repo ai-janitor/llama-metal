@@ -97,6 +97,69 @@ struct tiled_loader_q4_K {
     }
 };
 
+// q4_K with the quants read as 4-byte words. Picked by the dispatch only when every weight row starts on a 4-byte
+// address (matmul/dispatch-matmul.cpp); tiled_loader_q4_K above is the form for any address.
+struct tiled_loader_q4_K_w4 {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant ggml_metal_kargs_mul_mm & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / QK_K;
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    // Half a row of the K step (side 0 or 1): 16 weights as four aligned 4-byte words of the row's quants (a block is 144 bytes
+    // and its quants start at byte 16), the block header decoded once. Same unpack per weight as load_a_q4_K_to_shmem.
+    void load_half(threadgroup float2 * buf_a, uint row, uint side, uint idx_m, uint ne01) {
+        const uint base = row * SHMEM_STRIDE + 8 * side;
+        if (idx_m < ne01 && block_idx < num_blocks) {
+            device const block_q4_K * block_ptr = (device const block_q4_K *)(src0_row + row * nb01) + block_idx;
+
+            const bool use_high = (sub_block % 2) == 1;
+            const uint is = (sub_block / 2) * 2;
+            const uchar2 sc = get_scale_min_k4_just2(is, use_high ? 1 : 0, block_ptr->scales);
+            const float d = use_high ? (float)block_ptr->d / 16.0f : (float)block_ptr->d;
+            const float min_val = (float)block_ptr->dmin;
+            const float dl = d * sc[0];
+            const float ml = min_val * sc[1];
+
+            device const uint * words = (device const uint *)(block_ptr->qs + (sub_block / 2) * 32 + 16 * side);
+            const uint mask = use_high ? 0xF0u : 0x0Fu;
+            for (uint j = 0; j < 4; j++) {
+                const uint q = words[j];
+                buf_a[base + 2*j    ] = float2(dl * float( q        & mask) - ml, dl * float((q >>  8) & mask) - ml);
+                buf_a[base + 2*j + 1] = float2(dl * float((q >> 16) & mask) - ml, dl * float((q >> 24) & mask) - ml);
+            }
+        } else {
+            for (uint j = 0; j < 8; j++) {
+                buf_a[base + j] = float2(0.0f);
+            }
+        }
+    }
+
+    void advance() {
+        sub_block++;
+        if (sub_block == 8) {
+            sub_block = 0;
+            block_idx++;
+        }
+    }
+};
+
+// Fill by half rows: thread t takes half rows t, t + threads, ... of the 2 * BM half rows of the tile.
+inline void tiled_fill_a(thread tiled_loader_q4_K_w4 & loader, threadgroup float2 * buf_a, uint tid, uint ir, uint ne01, uint, uint) {
+    for (uint h = tid; h < 2 * BM; h += BLOCK_SIZE) {
+        loader.load_half(buf_a, h / 2, h & 1u, ir * BM + h / 2, ne01);
+    }
+}
+
 // ============================================================================
 // q5_K loader
 // ============================================================================

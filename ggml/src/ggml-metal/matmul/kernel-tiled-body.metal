@@ -26,6 +26,19 @@ constant constexpr int LOAD_VEC_B = 2;
 
 // Threadgroup memory: float2 buf_a[BM * SHMEM_STRIDE], then float2 buf_b[BN * SHMEM_STRIDE].
 
+// Fills this thread's share of the weight tile. The form for every loader: BM / load stride calls, each one float2
+// of another row. A loader with its own fill form defines an overload for its type (tiled_loader_q4_K_w4 in
+// kernel-tiled-loaders-kquant.metal).
+template <typename LoadA>
+inline void tiled_fill_a(thread LoadA & loader, threadgroup float2 * buf_a, uint tid, uint ir, uint ne01, uint block, uint end_k) {
+    const uint loadr_a = tid % (BK / LOAD_VEC_A);
+    const uint loadc_a = tid / (BK / LOAD_VEC_A);
+    const uint loadstride_a = BLOCK_SIZE * LOAD_VEC_A / BK;
+    for (uint l = 0; l < BM; l += loadstride_a) {
+        loader.load(buf_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, ne01, block, end_k);
+    }
+}
+
 #include "kernel-tiled-loaders-qk32.metal"
 #include "kernel-tiled-loaders-kquant.metal"
 #include "kernel-tiled-loaders-iq.metal"
@@ -248,12 +261,9 @@ kernel void kernel_mul_mat_tiled_impl(
     const uint tiwc = tiw / (WSUBM / TM);
 
     // Cooperative load indices (from Vulkan mul_mm.comp lines 194-200)
-    const uint loadr_a = tid % (BK / LOAD_VEC_A);
-    const uint loadc_a = tid / (BK / LOAD_VEC_A);
     const uint loadr_b = tid % (BK / LOAD_VEC_B);
     const uint loadc_b = tid / (BK / LOAD_VEC_B);
 
-    const uint loadstride_a = BLOCK_SIZE * LOAD_VEC_A / BK;
     const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
 
     // Type-specific A-matrix loader
@@ -279,10 +289,8 @@ kernel void kernel_mul_mat_tiled_impl(
     }
 
     for (uint block = 0; block < end_k; block += BK) {
-        // Load A tile — dispatched to type-specific loader
-        for (uint l = 0; l < BM; l += loadstride_a) {
-            loader.load(buf_a, loadr_a, loadc_a + l, ir * BM + loadc_a + l, ne01, block, end_k);
-        }
+        // Load A tile — the loader's fill form
+        tiled_fill_a(loader, buf_a, uint(tid), ir, ne01, block, end_k);
 
         // Load B tile — branch once on ks1 to avoid per-element overhead on contiguous path
         if (ks1 > 1) {
@@ -434,6 +442,11 @@ kernel void kernel_mul_mat_tiled_impl<tiled_loader_iq4_nl>(
 
 template [[host_name("kernel_mul_mat_tiled_q4_K" TILED_PLAN_NAME)]]
 kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_K>(
+    constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
+    device char *, threadgroup char *, uint3, ushort);
+
+template [[host_name("kernel_mul_mat_tiled_q4_K_w4" TILED_PLAN_NAME)]]
+kernel void kernel_mul_mat_tiled_impl<tiled_loader_q4_K_w4>(
     constant ggml_metal_kargs_mul_mm &, device const char *, device const char *,
     device char *, threadgroup char *, uint3, ushort);
 
