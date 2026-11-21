@@ -62,31 +62,51 @@ static bool tiled_tell_once(const char * what) {
     return true;
 }
 
-// The test hook GGML_METAL_TEST_TILED_PLAN=<weight type or any>:<plan id>, inert unless set: this process runs that
-// compiled plan for that weight type instead of the card's selection (a sweep from one binary). row is the plan's row
-// (-1 when unset), weight its ggml_type value (-1 = every type). A value that does not parse aborts. An op the hook
+// The test hook GGML_METAL_TEST_TILED_PLAN=<weight type or any>:<plan id>[:<columns>], inert unless set: this process
+// runs that compiled plan for that weight type instead of the card's selection (a sweep from one binary); with
+// <columns> only for multiplies of exactly that many activation columns, every other count runs the card's selection.
+// row is the plan's row (-1 when unset), weight its ggml_type value (-1 = every type), cols the column count (0 = every count). A value that does not parse aborts. An op the hook
 // applies to runs on that plan or the process aborts: it never runs another plan, kernel or route. A process that
 // ends without one node dispatched on the plan aborts too, after its receipt: one TILED_TEST_PLAN line (the plan's exact
 // entry suffix, the mul_mat nodes of that weight dispatched on the plan and on any other route, whole process) and one
-// TILED_TEST_SHAPE line per weight shape, token count and route (k = weight columns, m = weight rows, n = tokens).
+// TILED_TEST_SHAPE line per weight shape, token count and route (k = weight columns, m = weight rows, n = tokens;
+// nodes = mul_mat nodes, each counted once; dispatches = the Metal dispatches encoded for them on the tiled route,
+// one node can take several; 0 on every other route, which is not counted here; entry = the kernel entry that ran
+// on the tiled route, so the word and the byte reader of one plan are two lines, - on every other route).
 struct tiled_test_hook {
     int32_t row;
     int32_t weight;
+    int32_t cols;
 };
 
 static struct tiled_test_hook tiled_test_parse(void) {
-    struct tiled_test_hook hook = { -1, -1 };
+    struct tiled_test_hook hook = { -1, -1, 0 };
     const char * env = getenv("GGML_METAL_TEST_TILED_PLAN");
     if (env == nullptr || env[0] == '\0') {
         return hook;
     }
     const char * colon = strchr(env, ':');
     if (colon == nullptr) {
-        GGML_ABORT("GGML_METAL_TEST_TILED_PLAN must be <weight type or any>:<plan id>, got '%s'", env);
+        GGML_ABORT("GGML_METAL_TEST_TILED_PLAN must be <weight type or any>:<plan id>[:<columns>], got '%s'", env);
     }
-    hook.row = ggml_metal_tiled_compiled_find(colon + 1);
+    const char * colon2 = strchr(colon + 1, ':');
+    const std::string plan_id = colon2 == nullptr ? std::string(colon + 1) : std::string(colon + 1, colon2 - colon - 1);
+    hook.row = ggml_metal_tiled_compiled_find(plan_id.c_str());
     if (hook.row < 0) {
-        GGML_ABORT("GGML_METAL_TEST_TILED_PLAN: '%s' is not a plan id of data/matmul.tsv [tiles]", colon + 1);
+        GGML_ABORT("GGML_METAL_TEST_TILED_PLAN: '%s' is not a plan id of data/matmul.tsv [tiles]", plan_id.c_str());
+    }
+    if (colon2 != nullptr) {
+        // a column count as the table writes it: digits only, from 2, at most 9 digits, no leading zero
+        const char * c = colon2 + 1;
+        bool digits = c[0] >= '1' && c[0] <= '9' && strlen(c) <= 9;
+        for (const char * p = c; *p != '\0'; ++p) {
+            digits = digits && *p >= '0' && *p <= '9';
+        }
+        const long value = digits ? strtol(c, nullptr, 10) : 0;
+        if (value < 2) {
+            GGML_ABORT("GGML_METAL_TEST_TILED_PLAN: the columns part must be a column count from 2 with at most 9 digits and no leading zero, got '%s'", c);
+        }
+        hook.cols = (int32_t) value;
     }
     const std::string weight(env, colon - env);
     if (weight != "any") {
@@ -145,35 +165,37 @@ static int tiled_test_limit_w4(void) {
 struct tiled_test_shape {
     int32_t type, k, m, n;
     std::string route;
+    std::string entry;
     long nodes;
+    long dispatches;
 };
 static std::mutex tiled_test_lock;
 static std::vector<struct tiled_test_shape> tiled_test_shapes;
 static std::atomic<long> tiled_test_on_plan{0};
 static std::atomic<long> tiled_test_other{0};
 
-static bool tiled_test_applies(const struct tiled_test_hook & hook, enum ggml_type type) {
-    return hook.row >= 0 && (hook.weight < 0 ? tiled_type_suffix(type) != nullptr : hook.weight == (int32_t) type);
+static bool tiled_test_applies(const struct tiled_test_hook & hook, enum ggml_type type, int64_t cols) {
+    return hook.row >= 0 && (hook.weight < 0 ? tiled_type_suffix(type) != nullptr : hook.weight == (int32_t) type) && (hook.cols == 0 || (int64_t) hook.cols == cols);
 }
 
 // A route took nodes idx .. idx + n - 1 (a fused or grouped call takes several): each mul_mat node among them that the
 // hook applies to is counted, under its own shape. on_plan: the route is the tiled kernel on the hook's plan.
-static void tiled_test_took(ggml_metal_op_t ctx, int idx, int n, const char * route, bool on_plan) {
+static void tiled_test_took(ggml_metal_op_t ctx, int idx, int n, const char * route, const char * entry, bool on_plan) {
     const struct tiled_test_hook & hook = tiled_test();
     if (hook.row < 0) {
         return;
     }
     for (int i = 0; i < n; ++i) {
         const ggml_tensor * op = ctx->node(idx + i);
-        if (op == nullptr || op->op != GGML_OP_MUL_MAT || op->src[0] == nullptr || op->src[1] == nullptr || !tiled_test_applies(hook, op->src[0]->type)) {
+        if (op == nullptr || op->op != GGML_OP_MUL_MAT || op->src[0] == nullptr || op->src[1] == nullptr || !tiled_test_applies(hook, op->src[0]->type, op->src[1]->ne[1])) {
             continue;
         }
         (on_plan ? tiled_test_on_plan : tiled_test_other).fetch_add(1);
-        const struct tiled_test_shape s = { (int32_t) op->src[0]->type, (int32_t) op->src[0]->ne[0], (int32_t) op->src[0]->ne[1], (int32_t) op->src[1]->ne[1], route, 1 };
+        const struct tiled_test_shape s = { (int32_t) op->src[0]->type, (int32_t) op->src[0]->ne[0], (int32_t) op->src[0]->ne[1], (int32_t) op->src[1]->ne[1], route, entry, 1, 0 };
         std::lock_guard<std::mutex> guard(tiled_test_lock);
         bool found = false;
         for (struct tiled_test_shape & have : tiled_test_shapes) {
-            if (have.type == s.type && have.k == s.k && have.m == s.m && have.n == s.n && have.route == s.route) {
+            if (have.type == s.type && have.k == s.k && have.m == s.m && have.n == s.n && have.route == s.route && have.entry == s.entry) {
                 have.nodes++;
                 found = true;
                 break;
@@ -186,7 +208,22 @@ static void tiled_test_took(ggml_metal_op_t ctx, int idx, int n, const char * ro
 }
 
 void ggml_metal_tiled_test_route(ggml_metal_op_t ctx, int idx, int n, const char * route) {
-    tiled_test_took(ctx, idx, n, route, false);
+    tiled_test_took(ctx, idx, n, route, "-", false);
+}
+
+// The tiled route encoded `count` Metal dispatches for the node it took (after tiled_test_took recorded the node).
+static void tiled_test_dispatched(const ggml_tensor * op, const char * route, const char * entry, long count) {
+    const struct tiled_test_hook & hook = tiled_test();
+    if (hook.row < 0 || !tiled_test_applies(hook, op->src[0]->type, op->src[1]->ne[1])) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(tiled_test_lock);
+    for (struct tiled_test_shape & have : tiled_test_shapes) {
+        if (have.type == (int32_t) op->src[0]->type && have.k == (int32_t) op->src[0]->ne[0] && have.m == (int32_t) op->src[0]->ne[1] && have.n == (int32_t) op->src[1]->ne[1] && have.route == route && have.entry == entry) {
+            have.dispatches += count;
+            return;
+        }
+    }
 }
 
 // The receipt of a process run with the hook, printed when it ends.
@@ -204,7 +241,7 @@ static void tiled_test_at_exit(void) {
     {
         std::lock_guard<std::mutex> guard(tiled_test_lock);
         for (const struct tiled_test_shape & s : tiled_test_shapes) {
-            fprintf(stderr, "TILED_TEST_SHAPE weight=%s k=%d m=%d n=%d route=%s nodes=%ld\n", ggml_type_name((enum ggml_type) s.type), s.k, s.m, s.n, s.route.c_str(), s.nodes);
+            fprintf(stderr, "TILED_TEST_SHAPE weight=%s k=%d m=%d n=%d route=%s nodes=%ld dispatches=%ld entry=%s\n", ggml_type_name((enum ggml_type) s.type), s.k, s.m, s.n, s.route.c_str(), s.nodes, s.dispatches, s.entry.c_str());
         }
     }
     if (on_plan == 0) {
@@ -307,7 +344,7 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
         ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + 31)/32), ((ne01 + 63)/64), ne12*ne13, 128, 1, 1);
-        tiled_test_took(ctx, idx, 1, "mm", false);
+        tiled_test_took(ctx, idx, 1, "mm", "-", false);
         return 1;  // dispatched
     }
 
@@ -326,9 +363,9 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
         const struct ggml_metal_card * card = ggml_metal_device_get_card(ctx->dev);
         const enum ggml_type wtype = op->src[0]->type;
         const struct tiled_test_hook & hook = tiled_test();
-        const int32_t forced = tiled_test_applies(hook, wtype) ? hook.row : -1;
+        const int32_t forced = tiled_test_applies(hook, wtype, ne11) ? hook.row : -1;
         // The plan asked for: the hook's, else the card's selection for this weight type.
-        const int32_t wanted = forced >= 0 ? forced : ggml_metal_tiled_plan_for(card, (int32_t) wtype, 0).row;
+        const int32_t wanted = forced >= 0 ? forced : ggml_metal_tiled_plan_for(card, (int32_t) wtype, ne11, 0).row;
 
         // Kernel name built from type suffix — matches template instantiations in kernel-tiled.metal
         char kernel_name[64];
@@ -346,7 +383,7 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
             if (attempt > 0 && forced >= 0) {
                 break;
             }
-            lay = ggml_metal_tiled_plan_to_run(card, (int32_t) wtype, 0, attempt == 0 ? forced : 0);
+            lay = ggml_metal_tiled_plan_to_run(card, (int32_t) wtype, ne11, 0, attempt == 0 ? forced : 0);
             if (lay.from_default || !lay.ok) {
                 if (why[0] == '\0') {
                     snprintf(why, sizeof(why), "plan %s needs a wave width or group memory this card does not have (wave %u, group memory %u B)",
@@ -452,7 +489,7 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
         if (ran) {
         if (hook.row >= 0) {
             const std::string route = std::string("tiled:") + ggml_metal_tiled_compiled_id(lay.row) + (act.applies ? "+act" : "");
-            tiled_test_took(ctx, idx, 1, route.c_str(), forced >= 0);
+            tiled_test_took(ctx, idx, 1, route.c_str(), entry, forced >= 0);
         }
 
         ggml_metal_kargs_mul_mm args = {
@@ -487,6 +524,7 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
         const int32_t tiled_grid_y = ((ne11 + lay.bn - 1)/lay.bn);
         const int32_t tiled_grid_z = ne12*ne13;
         const int32_t tiled_total_tg = tiled_grid_x * tiled_grid_y * tiled_grid_z;
+        long tiled_dispatches = 0; // Metal dispatches encoded for this node (the test hook's receipt)
         // Tiled TGs are heavy (64×64 output tile with full K reduction) — use 1/64 of FA limit
         const int32_t tiled_chunk = (int32_t)profile->max_threadgroups_per_dispatch / 64;
 
@@ -505,6 +543,7 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
                     args.tg_x_offset = x_off;
                     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
                     ggml_metal_encoder_dispatch_threadgroups(enc, x_count, tiled_grid_y, tiled_grid_z, lay.threads, 1, 1);
+                    ++tiled_dispatches;
                 }
             } else {
                 for (int32_t x_off = 0; x_off < tiled_grid_x; x_off++) {
@@ -512,12 +551,17 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
                     args.tg_x_offset = x_off;
                     ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
                     ggml_metal_encoder_dispatch_threadgroups(enc, 1, tiled_grid_y, tiled_grid_z, lay.threads, 1, 1);
+                    ++tiled_dispatches;
                 }
             }
         } else {
 
             ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
             ggml_metal_encoder_dispatch_threadgroups(enc, tiled_grid_x, tiled_grid_y, tiled_grid_z, lay.threads, 1, 1);
+            ++tiled_dispatches;
+        }
+        if (hook.row >= 0) {
+            tiled_test_dispatched(op, (std::string("tiled:") + ggml_metal_tiled_compiled_id(lay.row) + (act.applies ? "+act" : "")).c_str(), entry, tiled_dispatches);
         }
 
             return 1;  // dispatched

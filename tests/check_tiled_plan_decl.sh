@@ -21,11 +21,11 @@ fields=$(sed -n '/plan-fields-begin/,/plan-fields-end/p' "$dir/matmul/tiled-plan
 nf=$(printf "%s" "$fields" | wc -w | tr -d ' ')
 if [ "$nf" -eq 0 ]; then echo "FAIL no plan fields found in $dir/matmul/tiled-plan.h"; exit 1; fi
 data=$(awk '/^#/ || /^$/ { next } /^\[/ { on = ($0 == "[tiles]"); next } on' "$table")
-head=$(printf "%s\n" "$data" | head -1 | cut -f 9-19 | tr '\t' ' ')
-if [ "$head " != "$fields" ]; then echo "FAIL columns 9 to 19 of [tiles] are not the struct's fields: $head"; exit 1; fi
+head=$(printf "%s\n" "$data" | head -1 | cut -f 10-20 | tr '\t' ' ')
+if [ "$head " != "$fields" ]; then echo "FAIL columns 10 to 20 of [tiles] are not the struct's fields: $head"; exit 1; fi
 # name, then the eleven values, of every plan: the default row's first, then first appearance, each set of values once
-rows=$(printf "%s\n" "$data" | tail -n +2 | awk -F '\t' -v OFS='\t' '$3 != "-" { k = $9; for (i = 10; i <= 19; i++) k = k OFS $i; line = $3 OFS k
-    if ($4 == "default") { def = line; defk = k } else if (!(k in seen)) { seen[k] = 1; list[++n] = line; keys[n] = k } }
+rows=$(printf "%s\n" "$data" | tail -n +2 | awk -F '\t' -v OFS='\t' '$3 != "-" { k = $10; for (i = 11; i <= 20; i++) k = k OFS $i; line = $3 OFS k
+    if ($5 == "default") { def = line; defk = k } else if (!(k in seen)) { seen[k] = 1; list[++n] = line; keys[n] = k } }
     END { print def; for (i = 1; i <= n; i++) if (keys[i] != defk) print list[i] }')
 np=$(printf "%s\n" "$rows" | grep -c .)
 want_metal=$(printf "%s\n" "$rows" | awk -F '\t' -v fields="$fields" -v nf="$nf" '

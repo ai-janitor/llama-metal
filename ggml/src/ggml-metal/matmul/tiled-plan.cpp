@@ -51,7 +51,7 @@ void ggml_metal_tiled_tune_load(struct ggml_metal_card * card, const char * devi
         // one chip, and a width that was never probed is not known.
         const bool shape = card->wave_probed != 0 && card->wave == row->wave && card->group_mem == row->group_bytes;
         if (shape && std::strcmp(row->card, device_name) == 0 && card->n_tiled_tune < GGML_METAL_CARD_TILED_MAX) {
-            card->tiled_tune[card->n_tiled_tune++] = { row->weight, row->plan };
+            card->tiled_tune[card->n_tiled_tune++] = { row->weight, row->plan, row->cols };
         }
     }
 }
@@ -110,42 +110,49 @@ struct ggml_metal_tiled_plan ggml_metal_tiled_plan_check(const struct ggml_metal
     return lay;
 }
 
-// The row of the compiled table the card selects for this weight type: its entry for the type, else its entry for
-// every type, else 0 (default). An entry outside the table (it cannot come from the generated rows) counts as none.
-static int32_t tiled_selected_row(const struct ggml_metal_card * card, int32_t weight) {
+// The row of the compiled table the card selects for this weight type and column count. Each entry that fits has a
+// level: 3 = for the type at this count, 2 = for the type at every count, 1 = for every type at this count, 0 = for
+// every type at every count; the highest level wins, else row 0 (default). An entry for one count fits that count
+// only. An entry outside the table (it cannot come from the generated rows) counts as none.
+static int32_t tiled_selected_row(const struct ggml_metal_card * card, int32_t weight, int64_t cols) {
     int32_t row = 0;
-    for (int pass = 0; pass < 2; ++pass) {
-        for (int e = 0; e < card->n_tiled_tune && e < GGML_METAL_CARD_TILED_MAX; ++e) {
-            const struct ggml_metal_card_tiled_entry & t = card->tiled_tune[e];
-            const bool mine = pass == 0 ? t.weight < 0 : (t.weight >= 0 && t.weight == weight);
-            if (mine && t.plan >= 0 && t.plan < ggml_metal_tiled_compiled_count()) {
-                row = t.plan;
-            }
+    int best = -1;
+    for (int e = 0; e < card->n_tiled_tune && e < GGML_METAL_CARD_TILED_MAX; ++e) {
+        const struct ggml_metal_card_tiled_entry & t = card->tiled_tune[e];
+        const bool for_type  = t.weight >= 0;
+        const bool for_count = t.cols > 0;
+        if ((for_type && t.weight != weight) || (for_count && (int64_t) t.cols != cols) || t.plan < 0 || t.plan >= ggml_metal_tiled_compiled_count()) {
+            continue;
+        }
+        const int level = (for_type ? 2 : 0) + (for_count ? 1 : 0);
+        if (level >= best) {
+            best = level;
+            row = t.plan;
         }
     }
     return row;
 }
 
-struct ggml_metal_tiled_plan ggml_metal_tiled_plan_for(const struct ggml_metal_card * card, int32_t weight, uint32_t thread_limit) {
+struct ggml_metal_tiled_plan ggml_metal_tiled_plan_for(const struct ggml_metal_card * card, int32_t weight, int64_t cols, uint32_t thread_limit) {
     if (card == nullptr) {
         struct ggml_metal_tiled_plan none = {};
         none.row = -1;
         return none;
     }
-    const int32_t row = tiled_selected_row(card, weight);
+    const int32_t row = tiled_selected_row(card, weight, cols);
     struct ggml_metal_tiled_plan lay = ggml_metal_tiled_plan_check(card, tiled_compiled[row], thread_limit);
     lay.row = row;
     return lay;
 }
 
-struct ggml_metal_tiled_plan ggml_metal_tiled_plan_to_run(const struct ggml_metal_card * card, int32_t weight, uint32_t thread_limit, int32_t forced_row) {
+struct ggml_metal_tiled_plan ggml_metal_tiled_plan_to_run(const struct ggml_metal_card * card, int32_t weight, int64_t cols, uint32_t thread_limit, int32_t forced_row) {
     struct ggml_metal_tiled_plan lay = {};
     lay.row = -1;
     if (card == nullptr) {
         return lay;
     }
     // The plan is chosen without the limit; the limit is then checked on the plan chosen.
-    const int32_t row = forced_row >= 0 && forced_row < ggml_metal_tiled_compiled_count() ? forced_row : tiled_selected_row(card, weight);
+    const int32_t row = forced_row >= 0 && forced_row < ggml_metal_tiled_compiled_count() ? forced_row : tiled_selected_row(card, weight, cols);
     lay = ggml_metal_tiled_plan_check(card, tiled_compiled[row], 0);
     lay.row = row;
     if (!lay.ok && row != 0) {

@@ -1,21 +1,36 @@
 // llama-metal-tiled-sweep: measures every compiled work plan of the tiled matmul kernel on this machine's Metal card
 // and prints the rows to add to section [tiles] of ggml/src/ggml-metal/data/matmul.tsv. No model is needed.
 //
-// Per weight type: one random weight (fixed seed, ROWS x COLS, quantized once by ggml) and random activations. Each
-// plan runs in a child process of this program with GGML_METAL_TEST_TILED_PLAN=<weight>:<plan id> (a process runs one
-// plan), which multiplies at each token count and prints the median time and a digest of the output bytes. Each round
-// runs the default plan right before every other plan, so drift shows. A plan is compared only when both runs report
-// the same device (index and name) and card shape, and the receipt of each shows exactly one route at every token
-// count: the tiled kernel in both, or the same other route in both. A row is proposed when the digest of
-// the output bytes (FNV-1a, 64 bits) equals the default's at every token count, the plan is at least GAIN faster at
-// the largest count and not more than LOSS slower at any other. A child whose receipt does not show the multiply on
-// its plan is refused.
+// Per weight type: one random weight (fixed seed, ROWS x COLS, quantized once by ggml) and random activations. A run
+// is a child process of this program that multiplies at each column count (--tokens) and prints, per count, the median
+// time, a digest of the output bytes (FNV-1a, 64 bits) and the pipeline the dispatch receipt shows. A round is the
+// card's own run (nothing forced: the plan its rows give it) and then one run per compiled plan, the default plan
+// included, forced with GGML_METAL_TEST_TILED_PLAN=<weight>:<plan id>.
+//
+// Each column count is judged on its own (tiled-rows.h, tiled_judge_count): the bar is the plan the card dispatched
+// there with nothing forced; a plan with an equal digest that is at least GAIN faster than that bar gets a row for
+// that count (plan_cols = the count). Otherwise the count gets a KEEP line (the card's plan stays, with both times) or
+// a NOROW line with its reason (not on the tiled kernel, a failure, digests differ). A failure ends one plan at one
+// count. A row is never for a range and counts are never merged; a count that was not measured keeps the card's plan.
+// The rows are candidates: one goes into the table once prompt speed on a model shows its gain.
+//
+// A run whose child failed as a whole (a forced plan the card cannot run ends the process) is run again one column
+// count per child, so the failure costs that count only.
+//
+// Limits: one synthetic weight (ROWS x COLS) per type, one multiply at a time. The time is the host's stopwatch around
+// the multiply and the wait for it: it holds the encoding, the synchronization and the dispatch receipt's recording in
+// every run, and the hook's counters in the forced runs. Near the GAIN line that matters; prompt speed on a model decides.
 //
 // Mode --matvec does the same for the matvec work plan (rows per simdgroup, columns, loop form, prepared headers) and
 // prints rows for section [matvec_shapes]: see the comment above mv_main below.
 //
-// Exit code: 0 = every plan was compared (with or without rows), 3 = some plan or weight could not be compared (rows
-// are for the rest), 2 = bad arguments, 1 = no Metal device, one compiled plan only, or nothing could be compared.
+// Exit code: 0 = every count has a row or a KEEP and every plan was judged at every count, 3 = the sweep finished and
+// some count has a NOROW or some plan was not judged at a count (rows are for the rest; every count a NOROW is still
+// 3), 2 = bad arguments, 1 = no run sent a time and a digest at any count (no Metal device, every allocation failed),
+// or one compiled plan only.
+//
+// For the check of this tool only: LLAMA_METAL_TILED_SWEEP_TEST_ABORT=<plan id>:<columns> ends the child that is forced
+// to that plan when it reaches that column count, the way a plan the card cannot run does.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -24,6 +39,7 @@
 #include "gguf.h"
 
 #include "mv-row.h"
+#include "tiled-rows.h"
 
 #include <mach-o/dyld.h>
 #include <unistd.h>
@@ -42,9 +58,8 @@
 
 static const int64_t ROWS = 4096;   // weight rows
 static const int64_t COLS = 2560;   // weight columns
-static const int     REPS = 9;      // timed multiplies per token count in a child, after one untimed
-static const double  GAIN = 0.03;   // a row needs this much less time at the largest token count
-static const double  LOSS = 0.03;   // and may not cost more than this at any other count
+static const int     REPS = 9;      // timed multiplies per column count in a child, after one untimed
+static const double  GAIN = 0.03;   // a row needs this much less time than the plan the card runs at that column count
 
 static void fill(std::vector<float> & v, uint64_t seed) {
     uint64_t s = seed;
@@ -98,7 +113,26 @@ static double median(std::vector<double> v) {
     return v.empty() ? 0.0 : (v.size() % 2 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]));
 }
 
-// ---- child: one plan (from the environment), one weight file, every token count ----
+// ---- child: one plan (from the environment, or the card's own when it is unset), one weight file, every column count ----
+
+// The pipelines of the dispatch receipt's window as lines "SWEEP_ENTRY n=<n> pipeline=<name> count=<encoded dispatches>".
+static bool print_entries(int64_t n) {
+    const int need = ggml_backend_metal_test_dispatch_receipt(nullptr, 0, 0);
+    std::string js(need > 0 ? (size_t) need : 1, '\0');
+    if (need <= 0 || ggml_backend_metal_test_dispatch_receipt(&js[0], js.size(), 0) != need) return false;
+    // one JSON object per pipeline; its keys in any order
+    for (size_t p = js.find('{'); p != std::string::npos; p = js.find('{', p + 1)) {
+        const size_t end = js.find('}', p);
+        if (end == std::string::npos) return false;
+        const std::string obj = js.substr(p, end - p + 1);
+        const size_t np = obj.find("\"pipeline\":\""), cp = obj.find("\"count\":");
+        if (np == std::string::npos || cp == std::string::npos) return false;
+        const size_t s = np + 12, e = obj.find('"', s);
+        if (e == std::string::npos) return false;
+        printf("SWEEP_ENTRY n=%lld pipeline=%s count=%lld\n", (long long) n, obj.substr(s, e - s).c_str(), atoll(obj.c_str() + cp + 8));
+    }
+    return true;
+}
 
 static int child_main(const char * type_name, const char * weight_path, const char * tokens_csv) {
     const ggml_type type = type_by_name(type_name);
@@ -120,6 +154,9 @@ static int child_main(const char * type_name, const char * weight_path, const ch
         printf("SWEEP_SHAPE wave=%u group_bytes=%u\n", wave, group_bytes);
     }
 
+    const char * test_abort = getenv("LLAMA_METAL_TILED_SWEEP_TEST_ABORT");
+    const char * hook       = getenv("GGML_METAL_TEST_TILED_PLAN");
+    // a failure at one count is said for that count and the next count still runs
     for (const std::string & tok : split(tokens_csv, ',')) {
         const int64_t n = atoll(tok.c_str());
         ggml_init_params ip = { ggml_tensor_overhead() * 16 + ggml_graph_overhead(), nullptr, true };
@@ -130,29 +167,43 @@ static int child_main(const char * type_name, const char * weight_path, const ch
         ggml_cgraph * gf  = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, out);
         ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(ga, gf)) { printf("SWEEP_FAIL graph allocation\n"); return 1; }
-        std::vector<float> xf((size_t) (n * COLS));
-        fill(xf, 2);
-        ggml_backend_tensor_set(a, wq.data(), 0, wb);
-        ggml_backend_tensor_set(b, xf.data(), 0, xf.size() * sizeof(float));
-
+        const char * bad = nullptr;
+        if (test_abort != nullptr && hook != nullptr && std::string(hook) + ":" + std::to_string(n) == std::string(type_name) + ":" + test_abort) {
+            printf("SWEEP_FAIL the check's abort at %lld columns\n", (long long) n);
+            fflush(stdout);
+            abort();
+        }
+        if (!ggml_gallocr_alloc_graph(ga, gf)) bad = "graph allocation";
         std::vector<double> ms;
-        for (int r = 0; r <= REPS; ++r) { // r = 0 compiles the kernel and is not timed
+        if (bad == nullptr) {
+            std::vector<float> xf((size_t) (n * COLS));
+            fill(xf, 2);
+            ggml_backend_tensor_set(a, wq.data(), 0, wb);
+            ggml_backend_tensor_set(b, xf.data(), 0, xf.size() * sizeof(float));
+            // the receipt's window is this count's multiplies: which pipeline ran them
+            if (ggml_backend_metal_test_dispatch_receipt(nullptr, 0, 1) < 0) bad = "dispatch receipt reset";
+        }
+        for (int r = 0; bad == nullptr && r <= REPS; ++r) { // r = 0 compiles the kernel and is not timed
             const int64_t t0 = ggml_time_us();
-            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { printf("SWEEP_FAIL compute\n"); return 1; }
+            if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) { bad = "compute"; break; }
             ggml_backend_synchronize(backend);
             if (r > 0) ms.push_back((double) (ggml_time_us() - t0) / 1000.0);
         }
-        const size_t nb = ggml_nbytes(out);
-        std::vector<uint8_t> res(nb);
-        ggml_backend_tensor_get(out, res.data(), 0, nb);
-        printf("SWEEP_RESULT n=%lld ms=%.4f bytes=%zu fnv=%016llx\n", (long long) n, median(ms), nb, (unsigned long long) fnv(res.data(), nb));
+        if (bad == nullptr && !print_entries(n)) bad = "dispatch receipt read";
+        if (bad != nullptr) {
+            printf("SWEEP_FAIL_AT n=%lld %s\n", (long long) n, bad);
+        } else {
+            const size_t nb = ggml_nbytes(out);
+            std::vector<uint8_t> res(nb);
+            ggml_backend_tensor_get(out, res.data(), 0, nb);
+            printf("SWEEP_RESULT n=%lld ms=%.4f bytes=%zu fnv=%016llx\n", (long long) n, median(ms), nb, (unsigned long long) fnv(res.data(), nb));
+        }
         ggml_gallocr_free(ga);
         ggml_free(ctx);
     }
     fflush(stdout);
     ggml_backend_free(backend);
-    return 0; // the library prints the receipt lines at exit
+    return 0; // the library prints the hook's receipt lines at exit
 }
 
 // ---- parent ----
@@ -168,11 +219,10 @@ struct run {
     std::string why;                      // when !ok
     std::string device;                   // "MTL<index>:<name>"
     std::string wave, group_bytes;        // the card's shape, "" when the child did not report it
-    std::map<int64_t, double> ms;         // per token count
+    std::map<int64_t, double> ms;         // per column count
     std::map<int64_t, std::string> hash;
-    std::map<int64_t, std::string> route; // the receipt's route of the multiply at this count; absent = no receipt for it
-    std::map<int64_t, bool> mixed;        // the receipt shows more than one route at this count (route lists them)
-    std::map<int64_t, bool> tiled;        // the multiply at this count ran on the plan's tiled kernel and on nothing else
+    std::map<int64_t, std::set<std::string>> entries; // the pipelines the dispatch receipt holds for the multiply at this count
+    std::map<int64_t, std::string> fail;  // a failure at this count only
 };
 
 static std::string shell_quote(const std::string & s) {
@@ -181,16 +231,17 @@ static std::string shell_quote(const std::string & s) {
     return q + "'";
 }
 
+// plan "" = nothing forced: the card's own run.
 static run run_child(const std::string & self, const std::string & type, const std::string & weight_path, const std::string & plan,
                      const std::string & tokens_csv) {
     run r;
-    setenv("GGML_METAL_TEST_TILED_PLAN", (type + ":" + plan).c_str(), 1);
+    if (plan.empty()) unsetenv("GGML_METAL_TEST_TILED_PLAN");
+    else              setenv("GGML_METAL_TEST_TILED_PLAN", (type + ":" + plan).c_str(), 1);
     const std::string cmd = shell_quote(self) + " --child " + shell_quote(type) + " " + shell_quote(weight_path) + " " + shell_quote(tokens_csv) + " 2>&1";
     FILE * p = popen(cmd.c_str(), "r");
-    if (p == nullptr) { r.why = "could not start the child process"; return r; }
+    if (p == nullptr) { unsetenv("GGML_METAL_TEST_TILED_PLAN"); r.why = "could not start the child process"; return r; }
     char buf[4096];
     std::string receipt, last;
-    std::map<int64_t, std::set<std::string>> routes;
     while (fgets(buf, sizeof(buf), p) != nullptr) {
         std::string line = buf;
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
@@ -203,12 +254,12 @@ static run run_child(const std::string & self, const std::string & type, const s
             const int64_t n = atoll(cell(line, "n").c_str());
             r.ms[n]   = atof(cell(line, "ms").c_str());
             r.hash[n] = cell(line, "fnv") + "/" + cell(line, "bytes");
+        } else if (line.rfind("SWEEP_ENTRY ", 0) == 0) {
+            if (!cell(line, "pipeline").empty()) r.entries[atoll(cell(line, "n").c_str())].insert(cell(line, "pipeline"));
+        } else if (line.rfind("SWEEP_FAIL_AT ", 0) == 0) {
+            r.fail[atoll(cell(line, "n").c_str())] = line.substr(line.find(' ', 14) == std::string::npos ? 14 : line.find(' ', 14) + 1);
         } else if (line.rfind("TILED_TEST_PLAN ", 0) == 0) {
             receipt = line;
-        } else if (line.rfind("TILED_TEST_SHAPE ", 0) == 0) {
-            if (cell(line, "weight") == type && atoll(cell(line, "k").c_str()) == COLS && atoll(cell(line, "m").c_str()) == ROWS && !cell(line, "route").empty()) {
-                routes[atoll(cell(line, "n").c_str())].insert(cell(line, "route"));
-            }
         } else if (line.find("GGML_METAL_TEST_TILED_PLAN") != std::string::npos || line.rfind("SWEEP_FAIL ", 0) == 0) {
             if (r.why.empty()) r.why = line;
         }
@@ -216,19 +267,13 @@ static run run_child(const std::string & self, const std::string & type, const s
     }
     const int status = pclose(p);
     unsetenv("GGML_METAL_TEST_TILED_PLAN");
-    for (const auto & at : routes) {
-        std::string all;
-        for (const std::string & one : at.second) all += (all.empty() ? "" : "+") + one;
-        r.route[at.first] = all;
-        if (at.second.size() != 1) r.mixed[at.first] = true;
-        else if (all == "tiled:" + plan) r.tiled[at.first] = true;
-    }
     if (status != 0) {
         if (r.why.empty()) r.why = "the child ended with status " + std::to_string(status) + (last.empty() ? "" : ": " + last);
         return r;
     }
-    if (receipt.empty() || cell(receipt, "plan") != plan || atol(cell(receipt, "on_plan").c_str()) < 1) {
-        r.why = "the receipt does not show the multiply on plan " + plan + (receipt.empty() ? " (no TILED_TEST_PLAN line)" : ": " + receipt);
+    if (r.device.empty()) { r.why = "the child reported no device"; return r; }
+    if (!plan.empty() && (receipt.empty() || cell(receipt, "plan") != plan || atol(cell(receipt, "on_plan").c_str()) < 1)) {
+        r.why = "the receipt does not show a multiply on plan " + plan + (receipt.empty() ? " (no TILED_TEST_PLAN line)" : ": " + receipt);
         return r;
     }
     r.ok = true;
@@ -918,10 +963,10 @@ static int mv_main(int argc, char ** argv) {
 }
 
 static void usage(void) {
-    printf("usage: llama-metal-tiled-sweep [--weights q4_K,q8_0,...] [--tokens 64,512] [--rounds 3]\n"
+    printf("usage: llama-metal-tiled-sweep [--weights q4_K,q8_0,...] [--tokens 64,128,512] [--rounds 3]\n"
            "  --weights  weight types to measure (default: every type that has a tiled kernel)\n"
-           "  --tokens   token counts, ascending; a row is judged at the largest (default 64,512)\n"
-           "  --rounds   rounds, each runs the default plan before every other plan (default 3)\n"
+           "  --tokens   column counts of the multiply (prompt tokens in one batch), from 2, ascending; each is judged on its own (default 64,128,512)\n"
+           "  --rounds   rounds, each runs the card's own plan and then every compiled plan forced (default 3)\n"
            "       llama-metal-tiled-sweep --matvec ...   the matvec work plan: run --matvec --help\n");
 }
 
@@ -936,7 +981,7 @@ int main(int argc, char ** argv) {
     if (argc >= 2 && strcmp(argv[1], "--matvec") == 0) {
         return mv_main(argc, argv);
     }
-    std::string weights_csv, tokens_csv = "64,512";
+    std::string weights_csv, tokens_csv = "64,128,512";
     int rounds = 3;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -949,7 +994,8 @@ int main(int argc, char ** argv) {
     for (const std::string & t : split(tokens_csv, ',')) {
         char * end = nullptr;
         const long long n = strtoll(t.c_str(), &end, 10);
-        if (*end != '\0' || n < 1 || n > 8192 || (!tokens.empty() && n <= tokens.back())) { usage(); return 2; }
+        // a row is for one column count from 2 (the table's plan_cols)
+        if (*end != '\0' || n < 2 || n > 8192 || (!tokens.empty() && n <= tokens.back())) { usage(); return 2; }
         tokens.push_back(n);
     }
     if (tokens.empty() || rounds < 1 || rounds > 99) { usage(); return 2; }
@@ -958,7 +1004,17 @@ int main(int argc, char ** argv) {
     if (n_plans < 1) { printf("this build has no compiled tiled plans\n"); return 1; }
     if (n_plans < 2) { printf("this build compiles only the default plan: there is no plan to compare it with\n"); return 1; }
     std::vector<std::string> plans;
-    for (int i = 0; i < n_plans; ++i) plans.push_back(ggml_backend_metal_tiled_plan_id(i));
+    std::vector<std::vector<int32_t>> plan_values;
+    std::vector<std::string> plan_suffix; // the end of a plan's entry name
+    for (int i = 0; i < n_plans; ++i) {
+        plans.push_back(ggml_backend_metal_tiled_plan_id(i));
+        std::vector<int32_t> v(11);
+        if (ggml_backend_metal_tiled_plan_values(i, v.data(), 11) != 11) { printf("plan %s has no values\n", plans.back().c_str()); return 1; }
+        std::string suffix = "_lay";
+        for (const int32_t x : v) suffix += "_" + std::to_string(x);
+        plan_values.push_back(v);
+        plan_suffix.push_back(suffix);
+    }
 
     std::vector<std::string> weights;
     if (weights_csv.empty()) {
@@ -986,13 +1042,12 @@ int main(int argc, char ** argv) {
     const time_t now = time(nullptr);
     strftime(date, sizeof(date), "%Y-%m-%d", gmtime(&now));
 
-    printf("plans: %d (default %s) · weights: %zu · tokens: %s · rounds: %d · weight %lld x %lld\n", n_plans, plans[0].c_str(), weights.size(),
+    printf("plans: %d (default %s) · weights: %zu · column counts: %s · rounds: %d · weight %lld x %lld\n", n_plans, plans[0].c_str(), weights.size(),
            tokens_csv.c_str(), rounds, (long long) ROWS, (long long) COLS);
-    const int64_t top = tokens.back();
-    std::vector<std::string> rows;
+    std::vector<std::string> rows, keeps, norows;
     std::string device, wave, group_bytes; // device: "MTL<index>:<name>"
     bool have_card = false;
-    int weights_compared = 0, pairs_compared = 0, pairs_failed = 0;
+    int counts_judged = 0, plans_not_judged = 0, measured_arms = 0;
 
     for (const std::string & w : weights) {
         const ggml_type type = type_by_name(w);
@@ -1005,142 +1060,130 @@ int main(int argc, char ** argv) {
             std::vector<float> importance;
             if (ggml_quantize_requires_imatrix(type)) importance.assign((size_t) COLS, 1.0f);
             if (ggml_quantize_chunk(type, wf.data(), wq.data(), 0, ROWS, COLS, importance.empty() ? nullptr : importance.data()) != wb) {
-                printf("%s: ggml could not build the weight, not compared\n", w.c_str());
-                pairs_failed += n_plans - 1;
+                for (const int64_t n : tokens) norows.push_back("NOROW\t" + w + "\t" + std::to_string(n) + " columns\tggml could not build the weight");
                 continue;
             }
             FILE * f = fopen(weight_path.c_str(), "wb");
             if (f == nullptr || fwrite(wq.data(), 1, wb, f) != wb || fclose(f) != 0) { printf("cannot write %s\n", weight_path.c_str()); return 1; }
         }
-        // per plan and token count: the plan's times, and the default's times measured right before each
-        std::map<std::string, std::map<int64_t, std::vector<double>>> t_plan, t_base;
-        std::map<std::string, bool> same, dead;
-        std::map<std::string, std::string> why;
+        // one run at one count, as the judging step reads it
+        const auto arm_at = [&](const run & r, int64_t n) {
+            tiled_arm a;
+            if (!r.ok)                 { a.why = r.why.empty() ? "the run failed" : r.why; return a; }
+            if (r.fail.count(n))       { a.why = r.fail.at(n); return a; }
+            if (!r.ms.count(n) || !r.hash.count(n)) { a.why = "no result at this count"; return a; }
+            if (r.device != device || r.wave != wave || r.group_bytes != group_bytes) { a.why = "the run was on another device or card shape (" + r.device + ")"; return a; }
+            a.ok     = true;
+            a.ms     = r.ms.at(n);
+            a.digest = r.hash.at(n);
+            const auto e = r.entries.find(n);
+            if (e == r.entries.end() || e->second.empty()) { a.why = "no pipeline in the dispatch receipt"; return a; }
+            if (e->second.size() != 1) {
+                a.why = "more than one pipeline:";
+                for (const std::string & one : e->second) a.why += " " + one;
+                return a;
+            }
+            const std::string & name = *e->second.begin();
+            for (size_t p = 0; p < plans.size(); ++p) {
+                const std::string & s = plan_suffix[p];
+                if (name.rfind("kernel_mul_mat_tiled_", 0) == 0 && name.size() > s.size() && name.compare(name.size() - s.size(), s.size(), s) == 0) a.plan = plans[p];
+            }
+            if (a.plan.empty()) a.why = "dispatched " + name;
+            return a;
+        };
+        std::map<int64_t, std::vector<tiled_round>> measured;
         for (int round = 0; round < rounds; ++round) {
-            for (int pi = 1; pi < n_plans; ++pi) {
-                const std::string & plan = plans[pi];
-                if (dead[plan]) continue;
-                // a failure here ends this plan only: a plan that already ran all its rounds keeps its result
-                const run base = run_child(self, w, weight_path, plans[0], tokens_csv);
-                if (!base.ok || !base.tiled.count(top)) {
-                    dead[plan] = true;
-                    why[plan] = "the default plan, run before it, did not run the " + std::to_string(top) + "-token multiply on the tiled kernel" + (base.why.empty() ? "" : ": " + base.why);
-                    continue;
+            // the card's own run first, then every compiled plan forced; each run is a process of its own. by_count[i][n]
+            // is the run that holds count n of run i: the batch child, or a child of that count alone when the batch failed.
+            std::vector<run> runs;
+            std::vector<std::map<int64_t, run>> by_count;
+            for (int i = 0; i <= n_plans; ++i) {
+                const std::string plan = i == 0 ? "" : plans[(size_t) (i - 1)];
+                const run batch = run_child(self, w, weight_path, plan, tokens_csv);
+                runs.push_back(batch);
+                by_count.push_back({});
+                if (!batch.ok && tokens.size() > 1) {
+                    printf("%-6s round %d: %s: the run of all counts failed (%s); each count is run alone\n", w.c_str(), round + 1,
+                           plan.empty() ? "the card's own run" : plan.c_str(), batch.why.c_str());
+                    for (const int64_t n : tokens) {
+                        by_count.back()[n] = run_child(self, w, weight_path, plan, std::to_string(n));
+                        runs.push_back(by_count.back()[n]);
+                    }
+                } else {
+                    for (const int64_t n : tokens) by_count.back()[n] = batch;
                 }
+            }
+            for (const run & r : runs) {
+                if (r.device.empty()) continue;
                 if (!have_card) {
                     have_card   = true;
-                    device      = base.device;
-                    wave        = base.wave;
-                    group_bytes = base.group_bytes;
-                } else if (base.device != device || base.wave != wave || base.group_bytes != group_bytes) {
+                    device      = r.device;
+                    wave        = r.wave;
+                    group_bytes = r.group_bytes;
+                } else if (r.device != device || r.wave != wave || r.group_bytes != group_bytes) {
                     printf("the card changed during the sweep (%s wave %s group memory %s, then %s wave %s group memory %s): a sweep is one card\n", device.c_str(),
-                           wave.c_str(), group_bytes.c_str(), base.device.c_str(), base.wave.c_str(), base.group_bytes.c_str());
+                           wave.c_str(), group_bytes.c_str(), r.device.c_str(), r.wave.c_str(), r.group_bytes.c_str());
                     unlink(weight_path.c_str());
                     return 1;
                 }
-                const run got = run_child(self, w, weight_path, plan, tokens_csv);
-                std::string bad;
-                if (!got.ok || !got.tiled.count(top)) {
-                    bad = got.why.empty() ? "the multiply did not run on this plan" : got.why;
-                } else if (got.device != base.device || got.wave != base.wave || got.group_bytes != base.group_bytes) {
-                    bad = "the plan ran on another device or card shape than the default plan (" + got.device + ")";
-                }
-                for (const int64_t n : tokens) {
-                    if (!bad.empty()) break;
-                    if (!base.hash.count(n) || !got.hash.count(n)) {
-                        bad = "no result at " + std::to_string(n) + " tokens";
-                    } else if (!base.route.count(n) || !got.route.count(n)) {
-                        bad = "no route receipt at " + std::to_string(n) + " tokens";
-                    } else if (base.mixed.count(n) || got.mixed.count(n)) {
-                        // two runs that each mix routes can dispatch them in different numbers: one route per run and count, or no comparison
-                        bad = "more than one route at " + std::to_string(n) + " tokens (" + base.route.at(n) + ", " + got.route.at(n) + ")";
-                    } else if (base.tiled.count(n) != got.tiled.count(n)) {
-                        bad = "at " + std::to_string(n) + " tokens only one of the two runs used the tiled kernel alone (" + base.route.at(n) + ", " + got.route.at(n) + ")";
-                    } else if (!got.tiled.count(n) && base.route.at(n) != got.route.at(n)) {
-                        bad = "at " + std::to_string(n) + " tokens the two runs took different routes (" + base.route.at(n) + ", " + got.route.at(n) + ")";
-                    }
-                }
-                if (!bad.empty()) {
-                    dead[plan] = true;
-                    why[plan] = bad;
-                    continue;
-                }
-                if (!same.count(plan)) same[plan] = true;
-                for (const int64_t n : tokens) {
-                    if (base.hash.at(n) != got.hash.at(n)) same[plan] = false;
-                    // a count the card does not send to the tiled kernel runs one kernel in both runs: its time says nothing about the plan
-                    if (!got.tiled.count(n)) continue;
-                    t_base[plan][n].push_back(base.ms.at(n));
-                    t_plan[plan][n].push_back(got.ms.at(n));
-                }
+            }
+            for (const int64_t n : tokens) {
+                tiled_round one;
+                one.own = arm_at(by_count[0].at(n), n);
+                for (size_t p = 0; p < plans.size(); ++p) one.forced.push_back(arm_at(by_count[p + 1].at(n), n));
+                measured[n].push_back(one);
             }
         }
 
-        std::string best;
-        double best_ratio = 1.0;
-        std::string best_note;
-        int compared = 0;
-        for (int pi = 1; pi < n_plans; ++pi) {
-            const std::string & plan = plans[pi];
-            if (dead[plan]) { printf("%-6s %-18s not compared: %s\n", w.c_str(), plan.c_str(), why[plan].c_str()); ++pairs_failed; continue; }
-            ++compared;
-            bool wins = same[plan];
-            std::string note;
-            double ratio_top = 1.0;
-            for (const int64_t n : tokens) {
-                if (!t_plan[plan].count(n)) { printf("%-6s %-18s %5lld tokens: not on the tiled kernel at this count · digest %s\n", w.c_str(), plan.c_str(), (long long) n, same[plan] ? "equal" : "DIFFER"); continue; }
-                const double b = median(t_base[plan][n]), p = median(t_plan[plan][n]);
-                std::vector<double> ratios;
-                for (size_t i = 0; i < t_plan[plan][n].size(); ++i) ratios.push_back(t_plan[plan][n][i] / t_base[plan][n][i]);
-                const double ratio = median(ratios);
-                printf("%-6s %-18s %5lld tokens: default %9.3f ms · plan %9.3f ms · %+6.1f %% time · digest %s\n", w.c_str(), plan.c_str(), (long long) n, b, p,
-                       (ratio - 1.0) * 100.0, same[plan] ? "equal" : "DIFFER");
-                char one[160];
-                snprintf(one, sizeof(one), "%s%lld tokens default %.3f ms -> %.3f ms (%+.1f %%)", note.empty() ? "" : ", ", (long long) n, b, p, (ratio - 1.0) * 100.0);
-                note += one;
-                if (n == top) { ratio_top = ratio; if (ratio > 1.0 - GAIN) wins = false; }
-                else if (ratio > 1.0 + LOSS) wins = false;
+        for (const int64_t n : tokens) {
+            const tiled_verdict v = tiled_judge_count(plans, measured[n], GAIN);
+            measured_arms += tiled_measured(measured[n]);
+            const std::string at = w + "\t" + std::to_string(n) + " columns\t";
+            char text[512];
+            if (v.kind != tiled_verdict::NOROW) {
+                printf("%-6s %5lld columns: the card's own run: plan %s · %.3f ms\n", w.c_str(), (long long) n, v.own_plan.c_str(), v.own_ms);
+                ++counts_judged;
             }
-            if (wins && ratio_top < best_ratio) { best = plan; best_ratio = ratio_top; best_note = note; }
-        }
-        pairs_compared += compared;
-        if (compared == 0) {
-            printf("%-6s no plan could be compared with the default plan\n", w.c_str());
+            for (const std::string & line : v.lines) printf("%-6s %5lld columns: %s\n", w.c_str(), (long long) n, line.c_str());
+            plans_not_judged += v.not_judged;
+            if (v.kind == tiled_verdict::NOROW) {
+                norows.push_back("NOROW\t" + at + v.reason);
+            } else if (v.kind == tiled_verdict::KEEP) {
+                snprintf(text, sizeof(text), "the card's plan %s stays: %.3f ms; the fastest other plan: %s %.3f ms (%+.1f %% time, a row needs %.0f %% less)", v.own_plan.c_str(), v.own_ms,
+                         v.plan.c_str(), v.plan_ms, (v.ratio - 1.0) * 100.0, GAIN * 100.0);
+                keeps.push_back("KEEP\t" + at + text);
+            } else if (wave.empty() || group_bytes.empty()) {
+                norows.push_back("NOROW\t" + at + "plan " + v.plan + " wins, but the card's wave width and group memory could not be read");
+            } else {
+                snprintf(text, sizeof(text), "%lld columns: the card's own plan %s %.3f ms -> %.3f ms (%+.1f %%)", (long long) n, v.own_plan.c_str(), v.own_ms, v.plan_ms, (v.ratio - 1.0) * 100.0);
+                const size_t pi = (size_t) (std::find(plans.begin(), plans.end(), v.plan) - plans.begin());
+                rows.push_back(tiled_row_text(card_name(device), w, v.plan, n, wave, group_bytes, plan_values[pi].data(),
+                                              std::string("measured ") + date + " by llama-metal-tiled-sweep, one random " + w + " weight " + std::to_string(ROWS) + " x " + std::to_string(COLS) +
+                                              ", " + std::to_string(rounds) + " rounds, each the card's own run then every compiled plan forced, median multiply time at " + text +
+                                              "; digest of the output bytes equal to the card's own run",
+                                              "llama-metal-tiled-sweep --weights " + w + " --tokens " + tokens_csv + " --rounds " + std::to_string(rounds)));
+            }
             fflush(stdout);
-            continue;
         }
-        ++weights_compared;
-        if (!best.empty() && (wave.empty() || group_bytes.empty())) {
-            printf("%-6s plan %s wins, but the card's wave width and group memory could not be read: no row\n", w.c_str(), best.c_str());
-            fflush(stdout);
-            continue;
-        }
-        if (best.empty()) {
-            printf("%-6s no row: none of the %d plans compared is %.0f %% faster than the default plan (%s) at %lld tokens with an equal digest and no more than %.0f %% slower elsewhere\n",
-                   w.c_str(), compared, GAIN * 100.0, plans[0].c_str(), (long long) top, LOSS * 100.0);
-        } else {
-            std::string values;
-            int32_t v[16] = {};
-            const int nv = ggml_backend_metal_tiled_plan_values((int) (std::find(plans.begin(), plans.end(), best) - plans.begin()), v, 16);
-            for (int i = 0; i < nv; ++i) values += "\t" + std::to_string(v[i]);
-            // card, weight, plan, role, no thresholds, the card's shape, the plan's values, no threshold evidence, the measurement, the command
-            rows.push_back(card_name(device) + "\t" + w + "\t" + best + "\ttuned\t-\t-\t" + wave + "\t" + group_bytes + values + "\t-\t-\tmeasured " + date + " by llama-metal-tiled-sweep, one random " + w + " weight " + std::to_string(ROWS) + " x " +
-                           std::to_string(COLS) + ", " + std::to_string(rounds) + " rounds alternating with the default plan, median multiply time: " + best_note +
-                           "; digest of the output bytes equal to the default plan's at every token count\tllama-metal-tiled-sweep --weights " + w + " --tokens " + tokens_csv + " --rounds " + std::to_string(rounds));
-        }
-        fflush(stdout);
     }
     unlink(weight_path.c_str());
 
-    printf("\ncompared with the default plan (%s): %d plan and weight pairs over %d weights · not compared: %d\n", plans[0].c_str(), pairs_compared, weights_compared, pairs_failed);
-    if (pairs_compared == 0) { printf("nothing could be measured\n"); return 1; }
-    printf("card: %s (%s)\n", card_name(device).c_str(), device.c_str());
-    if (rows.empty()) {
-        printf("no rows: no plan that was compared passes the rule\n");
+    printf("\njudged: %d weight and column-count pairs · without a verdict: %zu · plans not judged at a count: %d\n", counts_judged, norows.size(), plans_not_judged);
+    if (have_card) printf("card: %s (%s)\n", card_name(device).c_str(), device.c_str());
+    for (const std::string & k : keeps)  printf("%s\n", k.c_str());
+    for (const std::string & k : norows) printf("%s\n", k.c_str());
+    if (measured_arms == 0) {
+        printf("nothing was measured: no run sent a time and a digest at any column count%s\n", have_card ? "" : " (no run reported a Metal device)");
+        return tiled_sweep_exit(0, (int) norows.size(), plans_not_judged);
+    }
+    if (counts_judged == 0) {
+        printf("no rows: the sweep finished and no column count could be judged (the reasons are above)\n");
+    } else if (rows.empty()) {
+        printf("no rows: at no column count is a plan %.0f %% faster than the plan the card runs there\n", GAIN * 100.0);
     } else {
-        printf("rows for section [tiles] of ggml/src/ggml-metal/data/matmul.tsv (cells are separated by one tab; if the card and weight\n"
-               "already have a row there with thresholds, put the plan, the shape, the eleven values and the last two cells into that row):\n");
+        printf("rows for section [tiles] of ggml/src/ggml-metal/data/matmul.tsv (cells are separated by one tab; each row is for ONE column\n"
+               "count and stands beside the card's other rows; a row is a candidate until prompt speed on a model shows its gain):\n");
         for (const std::string & r : rows) printf("%s\n", r.c_str());
     }
-    return pairs_failed > 0 ? 3 : 0;
+    return tiled_sweep_exit(measured_arms, (int) norows.size(), plans_not_judged);
 }

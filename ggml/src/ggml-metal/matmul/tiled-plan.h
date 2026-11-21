@@ -43,11 +43,13 @@ struct ggml_metal_tiled_plan {
 };
 
 // One row of data/matmul.tsv [tiles]: the card with this Metal device name runs compiled plan `plan` (a row of
-// data/matmul.tsv [tiles]) for weight type `weight` (a ggml_type value, -1 = every type).
+// data/matmul.tsv [tiles]) for weight type `weight` (a ggml_type value, -1 = every type), for multiplies of `cols`
+// activation columns (0 = every column count).
 struct ggml_metal_tiled_tune_row {
     const char * card;
     int32_t      weight;
     int32_t      plan;
+    int32_t      cols;
     uint32_t     wave;        // the wave width and group memory the card reported when the row was measured
     uint32_t     group_bytes;
 };
@@ -61,14 +63,16 @@ void ggml_metal_tiled_tune_load(struct ggml_metal_card * card, const char * devi
 // thread_limit (a built pipeline's maxTotalThreadsPerThreadgroup, or 0 = not known yet).
 struct ggml_metal_tiled_plan ggml_metal_tiled_plan_check(const struct ggml_metal_card * card, const int32_t values[GGML_METAL_TILED_PLAN_N], uint32_t thread_limit);
 
-// The rule: the compiled plan of the card's entry for this weight type when it has one, else of its entry for every
-// type, else the default plan; then the checks. weight is the ggml_type value of the op's weights.
-struct ggml_metal_tiled_plan ggml_metal_tiled_plan_for(const struct ggml_metal_card * card, int32_t weight, uint32_t thread_limit);
+// The rule: the compiled plan of the first entry of the card that exists, in this order: for this weight type at this
+// column count; for the type at every count; for every type at this count; for every type at every count; else the
+// default plan. Then the checks. weight is the ggml_type value of the op's weights, cols its activation column count
+// (an entry for one count is that count only: 63 and 65 columns do not read the entry of 64).
+struct ggml_metal_tiled_plan ggml_metal_tiled_plan_for(const struct ggml_metal_card * card, int32_t weight, int64_t cols, uint32_t thread_limit);
 
 // The plan the tiled route runs: the rule's plan (or, with forced_row >= 0, that row of the compiled table instead of
-// the card's selection) when the card's facts admit it, else the default plan with from_default = 1, so a selection
+// the card's selection, whatever the column count) when the card's facts admit it, else the default plan with from_default = 1, so a selection
 // never drops the op off the tiled route. The thread limit is checked on the plan chosen. ok = 0 when neither can run.
-struct ggml_metal_tiled_plan ggml_metal_tiled_plan_to_run(const struct ggml_metal_card * card, int32_t weight, uint32_t thread_limit, int32_t forced_row);
+struct ggml_metal_tiled_plan ggml_metal_tiled_plan_to_run(const struct ggml_metal_card * card, int32_t weight, int64_t cols, uint32_t thread_limit, int32_t forced_row);
 
 // The compiled plans (rows of data/matmul.tsv [tiles]): how many; row i as its values in field order and its id
 // (NULL outside); the row of an id, or -1.

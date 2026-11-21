@@ -8,7 +8,7 @@
 //   |     +-- level-1 cache per compute unit (the card's row of data/device.tsv; not known without one)
 //   |
 //   +-- Tuning (measured on this card, beats the default)
-//         +-- tile shape of the tiled matmul, per weight type (when measured)
+//         +-- tile shape of the tiled matmul, per weight type and column count (when measured)
 //         +-- matvec settings (data/matmul.tsv [matvec_defaults]: the default rows, then the card's own row)
 //         +-- matvec rows per weight type and shape (data/matmul.tsv [matvec_shapes], the card's rows)
 //                   |
@@ -50,10 +50,12 @@ extern "C" {
 #define GGML_METAL_CARD_TILED_MAX 32 // tuning entries one card may carry for it
 
 // One measured tuning entry: for weight type `weight` (a ggml_type value, or -1 = every type) this card runs the
-// compiled plan of row `plan` of the compiled plans (a whole plan, never one field of it).
+// compiled plan of row `plan` of the compiled plans (a whole plan, never one field of it), for multiplies of `cols`
+// activation columns (0 = every column count).
 struct ggml_metal_card_tiled_entry {
     int32_t weight;
     int32_t plan;
+    int32_t cols;
 };
 
 struct ggml_metal_card {
@@ -64,7 +66,8 @@ struct ggml_metal_card {
     // Bytes of threadgroup memory one group may declare. Source: MTLDevice maxThreadgroupMemoryLength.
     uint32_t group_mem;
     // Measured tuning of this card for the tiled matmul work plan: an entry names the compiled plan to run for one
-    // weight type or for every type; an entry for the type wins over one for every type.
+    // weight type or for every type, at one column count or at every count; an entry for the type wins over one for
+    // every type, and inside each an entry for the op's column count wins over one for every count.
     // Source of every entry: its tuned row of data/matmul.tsv [tiles], which cites the measurement.
     // Loaded by ggml_metal_tiled_tune_load (matmul/tiled-plan.cpp).
     struct ggml_metal_card_tiled_entry tiled_tune[GGML_METAL_CARD_TILED_MAX];
