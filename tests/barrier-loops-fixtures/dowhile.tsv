@@ -1,0 +1,2 @@
+# file	rule	first line of the block	sha256[:12] of the block	reviewed|open	reason
+k.metal	L	do {	32c5b91bee06	reviewed	self-test: the trailing predicate is the same for every thread; the continue follows the barrier

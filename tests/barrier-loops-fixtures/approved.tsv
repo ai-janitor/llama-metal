@@ -1,0 +1,3 @@
+# file	rule	first line of the block	sha256[:12] of the block	reviewed|open	reason
+k.metal	L	for (int i = 0; i < 4; ++i) {	63591d6f76e3	reviewed	self-test: each continue follows the pass barriers
+k.metal	C	if (x[i] < 0.0f) {	0ad022bcdea1	reviewed	self-test: each continue follows the pass barriers

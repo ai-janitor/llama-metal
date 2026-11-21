@@ -152,14 +152,20 @@ kernel void kernel_flash_attn_ext_vec(
 
         // loop over the KV cache
         // each simdgroup handles blocks of Q rows and C columns
-        for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
-            int ic = ic0*C;
-            if (ic >= args.ne11) {
-                break;
+        // every simdgroup of the threadgroup makes the same passes and meets both barriers in each:
+        // a pass with no chunk left, or with a chunk the mask rules out, only meets the barriers
+        const int n_pass = (int) (((int64_t) args.ne11 - iwg*NSG*C + NWG*NSG*C - 1)/(NWG*NSG*C));
+        for (int pass = 0; pass < n_pass; ++pass) {
+            const int64_t ic64 = (int64_t) (iwg*NSG + sgitg + pass*NWG*NSG)*C;
+            if (ic64 >= args.ne11) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                continue;
             }
+            int ic = (int) ic64;
 
             // the last partial chunk uses the pad buffer as source
-            if (FC_flash_attn_ext_vec_has_kvpad && ic + C > args.ne11) {
+            if (FC_flash_attn_ext_vec_has_kvpad && ic64 + C > args.ne11) {
                 k    = pad;
                 v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
                 mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
@@ -191,6 +197,8 @@ kernel void kernel_flash_attn_ext_vec(
             // skip -INF blocks
             // NOTE: use float cast to avoid simd_max(half) bug on AMD RDNA
             if (simd_max(float(sm[tiisg])) <= -65504.0f) {
+                simdgroup_barrier(mem_flags::mem_threadgroup);
+                simdgroup_barrier(mem_flags::mem_threadgroup);
                 continue;
             }
 

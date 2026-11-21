@@ -1,0 +1,2 @@
+# file	rule	first line of the block	sha256[:12] of the block	reviewed|open	reason
+k.metal	C	if (n > 4) {	9c327fa3fc8f	reviewed	self-test: n is a kernel argument, the same for every thread
