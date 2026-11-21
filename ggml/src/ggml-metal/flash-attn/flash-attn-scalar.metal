@@ -194,8 +194,14 @@ inline void flash_attn_ext_scalar_impl(
     float max_score = -__FLT_MAX__ / 2.0f;
     float sum_exp   = 0;
 
+    // a row masked with -inf adds exp(-inf) = 0 to every sum when the slope is positive
+    const bool skip_masked = has_mask && slope > 0.0f;
+
     // Main KV loop: each simdgroup steps through KV by BN
     for (int i = simd_gid; i < KV; i += BN) {
+        if (skip_masked && float(mask_row[i]) == -INFINITY) {
+            continue;
+        }
         const uint64_t k_row_offset = (uint64_t)i * args.nb11;
 
         // QK dot product: partial per thread, then simd_sum

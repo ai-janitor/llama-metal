@@ -896,8 +896,10 @@ kernel void kernel_mul_mv_id(
     if (i02 == -1) {
         device float * out = (device float *) dst + (idx + iid1*args.ne1)*args.ne0;
         const ushort nth = ntg.x*ntg.y*ntg.z;
-        for (int i = tiitg; i < args.ne0; i += nth) {
-            out[i] = 0.0f;
+        if (tgpig.x == 0 && tgpig.y == 0) { // one threadgroup writes the zeros
+            for (int i = tiitg; i < args.ne0; i += nth) {
+                out[i] = 0.0f;
+            }
         }
         return;
     }

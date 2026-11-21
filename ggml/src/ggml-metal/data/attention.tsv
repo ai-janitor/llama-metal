@@ -56,6 +56,8 @@ order	route	file	needs_matrix	vendor	width	batch	kv	fp8	head	note
 [launch]
 launch_route	card	wave	simdgroups	wide_simdgroups	wide_head	workgroups	small_queries	threads	evidence
 scalar	any	any	4	-	-	-	-	-	The number the route held in code before it was a row; not tuned on any card.
+scalar	AMD Radeon Pro Vega 64	64	8	-	-	-	-	-	Measured with the masked-row skip, 3 alternating rounds of llama-bench: decode of 128 tokens 4B 52.12 to 56.23 t/s, 0.8B 140.69 to 165.0. 2 simdgroups was slower.
+scalar	AMD Radeon HD - FirePro D700	64	8	-	-	-	-	-	Measured with the masked-row skip, 3 alternating rounds of llama-bench: decode of 128 tokens 4B 19.49 to 20.28 t/s, 0.8B 61.29 to 68.05. 2 simdgroups was slower.
 vec	any	any	4	-	-	32	20	-	The numbers the route and the size functions held in code before they were rows (upstream's values); not tuned on any card.
 matrix	any	any	4	8	512	-	-	-	The numbers the route held in code before they were rows (upstream's values); not tuned on any card.
 prepass	any	any	-	-	-	-	-	32	The number both pre-pass launches held in code before it was a row; not tuned on any card.

@@ -273,6 +273,16 @@ static std::vector<op_case> case_table() {
         cs.push_back({ "C.pool_1d." + on, "kernel_pool_1d_" + on + "_f32", "kernel_pool_",
             [=](graph_builder & g) { g.out(ggml_pool_1d(g.ctx, g.in(F32, 11, 4), op, 3, 2, 1)); } });
     }
+    // P: transposed 1-D convolution, kernel [K, OC, IC] f32 and f16, data [IL, IC]
+    struct convt_shape { int64_t il, k, s0, ic, oc; };
+    for (ggml_type t : { F32, F16 }) {
+        for (convt_shape s : { convt_shape{ 64, 4, 2, 3, 2 }, convt_shape{ 300, 16, 8, 2, 2 } }) {
+            const std::string tn = ggml_type_name(t);
+            cs.push_back({ "P.conv_transpose_1d." + tn + ".il" + std::to_string(s.il) + "k" + std::to_string(s.k) + "s" + std::to_string(s.s0),
+                "kernel_conv_transpose_1d_" + tn + "_f32", "kernel_conv_transpose_1d_",
+                [=](graph_builder & g) { g.out(ggml_conv_transpose_1d(g.ctx, g.in(t, s.k, s.oc, s.ic), g.in(F32, s.il, s.ic), (int) s.s0, 0, 1)); } });
+        }
+    }
     // D: rotary position transform; 64-wide heads, 4 heads, 5 tokens
     for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_VISION }) {
         for (ggml_type t : { F32, F16 }) {

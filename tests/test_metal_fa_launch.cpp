@@ -32,6 +32,11 @@ int main() {
         want("matrix",  fa_launch_pick(FA_LAUNCH_MATRIX,  c.card, c.wave), 4, 8, 512, 0, 0, 0);
         want("prepass", fa_launch_pick(FA_LAUNCH_PREPASS, c.card, c.wave), 0, 0, 0, 0, 0, 32);
     }
+    static const char * measured[] = { "AMD Radeon Pro Vega 64", "AMD Radeon HD - FirePro D700" }; // the cards with a scalar row
+    for (const char * card : measured) {
+        want("scalar, measured card", fa_launch_pick(FA_LAUNCH_SCALAR, card, 64), 8, 0, 0, 0, 0, 0);
+        want("vec, measured card",    fa_launch_pick(FA_LAUNCH_VEC,    card, 64), 4, 0, 0, 32, 20, 0);
+    }
     want("a route outside the table", fa_launch_pick(FA_LAUNCH_COUNT, nullptr, 0), 0, 0, 0, 0, 0, 0);
     printf("attention launch rows (shipped): 4 routes, %d failures\n", failures);
 #endif

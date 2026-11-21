@@ -39,7 +39,9 @@ kernel void kernel_solve_tri_f32(
 
             for (short t = 0; t*NW < N; ++t) {
                 const short idx = t*NW + tiisg;
-                sh0_cur[idx] = src0_ptr[idx];
+                if (idx < N && rr + sgitg < N) {
+                    sh0_cur[idx] = src0_ptr[idx];
+                }
             }
 
             src0_ptr += NSG*N;
@@ -92,7 +94,7 @@ kernel void kernel_argmax_f32(
     device const float * x_row = (device const float *) ((device const char *) src0 + tgpig * args.nb01);
 
     float   lmax = -INFINITY;
-    int32_t larg = -1;
+    int32_t larg = 0x7fffffff;
 
     for (int i00 = tpitg; i00 < args.ne00; i00 += ntg) {
         if (x_row[i00] > lmax) {
@@ -103,7 +105,7 @@ kernel void kernel_argmax_f32(
 
     // find the argmax value in the block
     float max_val = simd_max(lmax);
-    int32_t arg_val = simd_max(select(-1, larg, lmax == max_val));
+    int32_t arg_val = simd_min(select(0x7fffffff, larg, lmax == max_val));
 
     device int32_t * dst_i32 = (device int32_t *) dst;
 
@@ -122,25 +124,30 @@ kernel void kernel_argmax_f32(
             const ushort nsg = (ntg + simd_width - 1) / simd_width;
 
             float best = -INFINITY;
-            int32_t arg = -1;
+            int32_t arg = 0x7fffffff;
 
             for (ushort i = tiisg; i < nsg; i += simd_width) {
-                if (shared_maxval[i] > best) {
+                if (shared_maxval[i] > best || (shared_maxval[i] == best && shared_argmax[i] < arg)) {
                     best = shared_maxval[i];
                     arg = shared_argmax[i];
                 }
             }
 
             float max_val_reduced   = simd_max(best);
-            int32_t arg_val_reduced = simd_max(select(-1, arg, best == max_val_reduced));
+            int32_t arg_val_reduced = simd_min(select(0x7fffffff, arg, best == max_val_reduced));
 
-            dst_i32[tgpig] = arg_val_reduced;
+            // ties keep the lowest index; a row of -inf gives the last index, as the CPU
+            if (tiisg == 0) {
+                dst_i32[tgpig] = arg_val_reduced == 0x7fffffff ? args.ne00 - 1 : arg_val_reduced;
+            }
         }
 
         return;
     }
 
-    dst_i32[tgpig] = arg_val;
+    if (tpitg == 0) {
+        dst_i32[tgpig] = arg_val == 0x7fffffff ? args.ne00 - 1 : arg_val;
+    }
 }
 
 // One threadgroup over a single row: each simdgroup reads whole 16-byte values side by side; ties keep the lowest index.
@@ -208,6 +215,6 @@ kernel void kernel_argmax_f32_w4(
     }
 
     if (tiisg == 0 && sgitg == 0) {
-        dst_i32[tgpig] = arg_val;
+        dst_i32[tgpig] = arg_val == 0x7fffffff ? args.ne00 - 1 : arg_val; // a row of -inf gives the last index
     }
 }

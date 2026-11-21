@@ -197,11 +197,17 @@ kernel void kernel_conv_transpose_1d(
 
     float v = 0.0f;
 
+    // for a positive stride only i in [ceil((j - K + 1) / s0), j / s0] can pass the test below
+    const int64_t j  = tgpig[0];
+    const int64_t s0 = args.s0;
+    const int64_t i_min = (s0 > 0 && j - args.K + 1 > 0) ? (j - args.K + s0) / s0 : 0;
+    const int64_t i_max = s0 > 0 ? min(j / s0, (int64_t) args.IL - 1) : (int64_t) args.IL - 1;
+
     for (int64_t c = 0; c < args.IC; c++) {
         const int32_t kernel_offset = c * tgpg[1] * args.K + args.K * tgpig[1];
         const int32_t input_offset = c * args.IL;
 
-        for (int64_t i = 0; i < args.IL; i++) {
+        for (int64_t i = i_min; i <= i_max; i++) {
             if (tgpig[0] >= i * args.s0 && tgpig[0] < i * args.s0 + args.K) {
                 v += src0[kernel_offset + tgpig[0] - i * args.s0] * src1[input_offset + i];
             }

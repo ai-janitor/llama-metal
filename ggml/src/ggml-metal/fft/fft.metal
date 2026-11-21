@@ -79,47 +79,50 @@ kernel void kernel_fold_f32(
     device       float * output = (device       float *) dst;
 
     // Each thread computes one output sample
-    for (int64_t i = tpitg.x; i < n_out; i += ntg.x) {
-        float audio_sum = 0.0f;
-        float env_sum   = 0.0f;
+    // one output sample per thread: group g holds samples g * ntg.x to g * ntg.x + ntg.x - 1
+    const int64_t i = (int64_t) tgpig.x * ntg.x + tpitg.x;
+    if (i >= n_out) {
+        return;
+    }
+    float audio_sum = 0.0f;
+    float env_sum   = 0.0f;
 
-        // Output position i corresponds to position (i + n_pad) in the padded domain
-        int64_t p = i + n_pad;
+    // Output position i corresponds to position (i + n_pad) in the padded domain
+    int64_t p = i + n_pad;
 
-        // Find all frames that overlap this output position
-        // Frame l contributes to positions [l*n_hop, l*n_hop + n_fft)
-        // So frame l overlaps position p if: l*n_hop <= p < l*n_hop + n_fft
-        // Equivalently: (p - n_fft + 1) <= l*n_hop <= p
-        //               (p - n_fft + 1)/n_hop <= l <= p/n_hop
+    // Find all frames that overlap this output position
+    // Frame l contributes to positions [l*n_hop, l*n_hop + n_fft)
+    // So frame l overlaps position p if: l*n_hop <= p < l*n_hop + n_fft
+    // Equivalently: (p - n_fft + 1) <= l*n_hop <= p
+    //               (p - n_fft + 1)/n_hop <= l <= p/n_hop
 
-        int64_t l_start = (p >= n_fft - 1) ? (p - n_fft + 1) / n_hop : 0;
-        int64_t l_end   = p / n_hop;
+    int64_t l_start = (p >= n_fft - 1) ? (p - n_fft + n_hop) / n_hop : 0;
+    int64_t l_end   = p / n_hop;
 
-        // Clamp to valid frame range
-        if (l_start < 0) l_start = 0;
-        if (l_end >= n_codes) l_end = n_codes - 1;
+    // Clamp to valid frame range
+    if (l_start < 0) l_start = 0;
+    if (l_end >= n_codes) l_end = n_codes - 1;
 
-        for (int64_t l = l_start; l <= l_end; ++l) {
-            // Position within frame l
-            int64_t frame_start = l * n_hop;
-            int64_t j = p - frame_start;
+    for (int64_t l = l_start; l <= l_end; ++l) {
+        // Position within frame l
+        int64_t frame_start = l * n_hop;
+        int64_t j = p - frame_start;
 
-            // Bounds check
-            if (j >= 0 && j < n_fft) {
-                device const float * frame_ptr = frames + l*args.nb01/sizeof(float);
-                float frame_val = frame_ptr[j];
-                float window_val = hann[j];
+        // Bounds check
+        if (j >= 0 && j < n_fft) {
+            device const float * frame_ptr = frames + l*args.nb01/sizeof(float);
+            float frame_val = frame_ptr[j];
+            float window_val = hann[j];
 
-                audio_sum += frame_val;
-                env_sum   += window_val * window_val;
-            }
+            audio_sum += frame_val;
+            env_sum   += window_val * window_val;
         }
+    }
 
-        // Normalize by envelope
-        if (env_sum > 0.0f) {
-            output[i] = audio_sum / env_sum;
-        } else {
-            output[i] = 0.0f;
-        }
+    // Normalize by envelope
+    if (env_sum > 0.0f) {
+        output[i] = audio_sum / env_sum;
+    } else {
+        output[i] = audio_sum;
     }
 }

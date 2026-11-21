@@ -49,6 +49,7 @@ kernel void kernel_norm_fuse_impl(
     sumf = dot(sumft, T(1.0f));
 
     sumf = tgmem_tree_sum<false>(sumf, tid, n_threads, shmem_f32);
+    threadgroup_barrier(mem_flags::mem_threadgroup); // every thread holds the first sum before the scratch is written again
 
     const float mean = sumf/args.ne00;
 
