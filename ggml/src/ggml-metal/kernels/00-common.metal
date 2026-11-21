@@ -42,6 +42,26 @@ inline float tgmem_reduce_sum(float val, uint tidx, uint ntg, threadgroup float 
     return buf[0];
 }
 
+// Sum of one partial per thread by pairwise halving in threadgroup memory, for any thread count: the slots up to the
+// next power of two are zero. SHARED_PAD: every thread zeroes its share of those slots; otherwise thread 0 zeroes all.
+template<bool SHARED_PAD>
+inline float tgmem_tree_sum(float partial, ushort tid, ushort n_threads, threadgroup float * buf) {
+    buf[tid] = partial;
+    ushort np2 = 1;
+    while (np2 < n_threads) np2 <<= 1;
+    if (SHARED_PAD) {
+        for (ushort i = n_threads + tid; i < np2; i += n_threads) buf[i] = 0.0f;
+    } else {
+        if (tid == 0) { for (ushort i = n_threads; i < np2; i++) buf[i] = 0.0f; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (ushort s = np2 / 2; s > 0; s >>= 1) {
+        if (tid < s) { buf[tid] += buf[tid + s]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return buf[0];
+}
+
 // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
 //
 // cmd:

@@ -184,7 +184,9 @@ kernel void kernel_dsv4_hc_comb_f32(
     }
 }
 
-kernel void kernel_dsv4_hc_pre_f32(
+// GATED: each term is weighted by the sigmoid of its own gate element instead of one weight per head and token.
+template<bool GATED>
+kernel void kernel_dsv4_hc_pre_impl(
         constant ggml_metal_kargs_dsv4_hc_pre & args,
         device const char * x,
         device const char * weights,
@@ -201,43 +203,27 @@ kernel void kernel_dsv4_hc_pre_f32(
     }
 
     device const char * xb = x + i0*args.nb_x0 + it*args.nb_x2;
+    device const char * gb = GATED ? weights + i0*args.nb_w0 + it*args.nb_w2 : weights;
     float result = 0.0f;
     FOR_UNROLL (int ih = 0; ih < FC_dsv4_hc_n_hc; ++ih) {
-        const float xv = *(device const float *) (xb + ih*args.nb_x1);
-        const float wv = *(device const float *) (weights + ih*args.nb_w0 + it*args.nb_w1);
-        result = fma(xv, wv, result);
+        if (GATED) {
+            const float g  = 1.0f/(1.0f + exp(-*(device const float *) (gb + ih*args.nb_w1)));
+            const float xv = *(device const float *) (xb + ih*args.nb_x1);
+            result = fma(xv, g, result);
+        } else {
+            const float xv = *(device const float *) (xb + ih*args.nb_x1);
+            const float wv = *(device const float *) (weights + ih*args.nb_w0 + it*args.nb_w1);
+            result = fma(xv, wv, result);
+        }
     }
 
     *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
 }
 
-kernel void kernel_dsv4_hc_pre_gated_f32(
-        constant ggml_metal_kargs_dsv4_hc_pre & args,
-        device const char * x,
-        device const char * gate,
-        device       char * dst,
-        uint3   tgpig[[threadgroup_position_in_grid]],
-        ushort  tiisg[[thread_index_in_simdgroup]],
-        ushort  sgitg[[simdgroup_index_in_threadgroup]],
-        ushort3   ntg[[threads_per_threadgroup]]) {
-    const int it = tgpig.y;
-    const int i0 = ((int) tgpig.x*ntg.y + sgitg)*ntg.x + tiisg;
+typedef decltype(kernel_dsv4_hc_pre_impl<false>) kernel_dsv4_hc_pre_t;
 
-    if (i0 >= args.n_embd) {
-        return;
-    }
-
-    device const char * xb = x    + i0*args.nb_x0 + it*args.nb_x2;
-    device const char * gb = gate + i0*args.nb_w0 + it*args.nb_w2;
-    float result = 0.0f;
-    FOR_UNROLL (int ih = 0; ih < FC_dsv4_hc_n_hc; ++ih) {
-        const float g  = 1.0f/(1.0f + exp(-*(device const float *) (gb + ih*args.nb_w1)));
-        const float xv = *(device const float *) (xb + ih*args.nb_x1);
-        result = fma(xv, g, result);
-    }
-
-    *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
-}
+template [[host_name("kernel_dsv4_hc_pre_f32")]]       kernel kernel_dsv4_hc_pre_t kernel_dsv4_hc_pre_impl<false>;
+template [[host_name("kernel_dsv4_hc_pre_gated_f32")]] kernel kernel_dsv4_hc_pre_t kernel_dsv4_hc_pre_impl<true>;
 
 kernel void kernel_dsv4_hc_post_nocomb_f32(
         constant ggml_metal_kargs_dsv4_hc_post & args,

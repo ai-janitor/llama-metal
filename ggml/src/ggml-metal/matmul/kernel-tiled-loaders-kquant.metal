@@ -341,19 +341,11 @@ struct tiled_loader_q6_K {
 // q2_K loader
 // ============================================================================
 
-inline void load_a_q2_K_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+struct tiled_dec_q2_K {
+    typedef block_q2_K block_t;
+    enum { units = 8 };
 
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_q2_K * block_ptr = (device const block_q2_K *)(src0_row + loadc * nb01) + block_idx;
-
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         // q2_K: 2 bits per element, 64 bytes = 256 elements
         // Each byte holds 4 elements (2 bits each)
         // Map sub_block (0..7) to il parameter (0..15)
@@ -401,61 +393,22 @@ inline void load_a_q2_K_to_shmem(
         const float val0 = dl * float(byte0 & mask) - ml;
         const float val1 = dl * float(byte1 & mask) - ml;
 
-        buf_a[buf_idx] = float2(val0, val1);
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_q2_K {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_q2_K_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01,
-                             block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
-        }
+        return float2(val0, val1);
     }
 };
+
+typedef tiled_loader_block<tiled_dec_q2_K> tiled_loader_q2_K;
 
 // ============================================================================
 // q3_K loader
 // ============================================================================
 
 // q3_K: 3 bits per element with complex bit packing. Follows dequantize_q3_K exactly.
-inline void load_a_q3_K_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+struct tiled_dec_q3_K {
+    typedef block_q3_K block_t;
+    enum { units = 8 };
 
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_q3_K * block_ptr = (device const block_q3_K *)(src0_row + loadc * nb01) + block_idx;
-
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         const float d_all = (float)block_ptr->d;
         device const uint8_t * q_base = (device const uint8_t *)block_ptr->qs;
         device const uint8_t * h_base = (device const uint8_t *)block_ptr->hmask;
@@ -492,39 +445,8 @@ inline void load_a_q3_K_to_shmem(
         float val0 = dl * float(q[i0] & mask) - (h[i0] & m ? 0.f : ml);
         float val1 = dl * float(q[i1] & mask) - (h[i1] & m ? 0.f : ml);
 
-        buf_a[buf_idx] = float2(val0, val1);
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_q3_K {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_q3_K_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01,
-                             block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
-        }
+        return float2(val0, val1);
     }
 };
+
+typedef tiled_loader_block<tiled_dec_q3_K> tiled_loader_q3_K;

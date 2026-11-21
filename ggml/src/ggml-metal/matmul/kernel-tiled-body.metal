@@ -39,17 +39,10 @@ inline void tiled_fill_a(thread LoadA & loader, threadgroup float2 * buf_a, uint
     }
 }
 
-#include "kernel-tiled-loaders-qk32.metal"
-#include "kernel-tiled-loaders-kquant.metal"
-#include "kernel-tiled-loaders-iq.metal"
-
-// Cooperative load: A tile (BM rows × BK cols) into shared memory
-// Matches Vulkan mul_mm_funcs.glsl:1-27 (LOAD_VEC_BATCH_A=2 path)
-// pos_a = K-dimension offset, data_a already points to tile's first row
-// idx_m = global row index, checked against ne01 (M dimension)
-// block + loadr*2 checked against end_k (K dimension)
+// Loader of a weight type read as plain elements (half, float, bfloat): typed pointer, element stride.
+template <typename T>
 inline void load_a_to_shmem(
-    device const half * data_a,
+    device const T * data_a,
     threadgroup float2 * buf_a,
     uint pos_a,
     uint loadr,
@@ -73,26 +66,83 @@ inline void load_a_to_shmem(
     }
 }
 
+template <typename T>
+struct tiled_loader_typed {
+    device const T * data_a;
+    uint stride_a;
+    uint pos_a;
+
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant ggml_metal_kargs_mul_mm & args) {
+        data_a = (device const T *)(src0 + offset0 + args.nb01 * (ir * BM));
+        stride_a = args.nb01 / sizeof(T);
+        pos_a = 0;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        load_a_to_shmem(data_a, buf_a, pos_a, loadr, loadc, idx_m, ne01, block, end_k, stride_a);
+    }
+
+    void advance() { pos_a += BK; }
+};
+
+// Loader of a block format: Dec decodes the two weights at loadr of one 32-weight unit; a block holds Dec::units units.
+template <typename Dec>
+struct tiled_loader_block {
+    device const char * src0_row;
+    uint num_blocks;
+    uint block_idx;
+    uint sub_block;
+    uint nb01;
+
+    void init(device const char * src0, uint64_t offset0, uint ir,
+              constant ggml_metal_kargs_mul_mm & args) {
+        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
+        num_blocks = args.ne00 / (32 * Dec::units);
+        block_idx = 0;
+        sub_block = 0;
+        nb01 = args.nb01;
+    }
+
+    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
+              uint idx_m, uint ne01, uint block, uint end_k) {
+        const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+
+        if (idx_m < ne01 && block_idx < num_blocks) {
+            device const typename Dec::block_t * block_ptr = (device const typename Dec::block_t *)(src0_row + loadc * nb01) + block_idx;
+            buf_a[buf_idx] = Dec::pair(block_ptr, sub_block, loadr);
+        } else {
+            buf_a[buf_idx] = float2(0.0f);
+        }
+    }
+
+    void advance() {
+        if (Dec::units == 1) {
+            block_idx++;
+        } else {
+            sub_block++;
+            if (sub_block == 8) {
+                sub_block = 0;
+                block_idx++;
+            }
+        }
+    }
+};
+
+#include "kernel-tiled-loaders-qk32.metal"
+#include "kernel-tiled-loaders-kquant.metal"
+#include "kernel-tiled-loaders-iq.metal"
+
 // Cooperative load: A tile (BM rows × BK cols) from mxfp4 blocks into shared memory
 // Each K-tile is exactly 1 mxfp4 block per row (BK=32=QK_MXFP4)
 // loadr ranges 0..15 (BK/LOAD_VEC_A = 32/2), identifies which byte in qs[] to read
 // Each thread reads 1 byte from qs[], extracts 2 nibbles, dequantizes via LUT, scales by e8m0
-inline void load_a_mxfp4_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr,
-    uint loadc,
-    uint idx_m,
-    uint ne01,
-    uint block_k,
-    uint num_blocks,
-    uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
+struct tiled_dec_mxfp4 {
+    typedef block_mxfp4 block_t;
+    enum { units = 1 };
 
-    if (idx_m < ne01 && block_k < num_blocks) {
-        device const block_mxfp4 * block_ptr = (device const block_mxfp4 *)(src0_row + loadc * nb01) + block_k;
-
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         const float scale = e8m0_to_fp32(block_ptr->e);
 
         // mxfp4 nibble packing: low nibbles = elements 0-15, high nibbles = elements 16-31
@@ -102,16 +152,16 @@ inline void load_a_mxfp4_to_shmem(
         if (loadr < 8) {
             const uint8_t byte0 = block_ptr->qs[2*loadr];
             const uint8_t byte1 = block_ptr->qs[2*loadr + 1];
-            buf_a[buf_idx] = float2(scale * kvalues_mxfp4_f[byte0 & 0x0F], scale * kvalues_mxfp4_f[byte1 & 0x0F]);
+            return float2(scale * kvalues_mxfp4_f[byte0 & 0x0F], scale * kvalues_mxfp4_f[byte1 & 0x0F]);
         } else {
             const uint8_t byte0 = block_ptr->qs[2*(loadr - 8)];
             const uint8_t byte1 = block_ptr->qs[2*(loadr - 8) + 1];
-            buf_a[buf_idx] = float2(scale * kvalues_mxfp4_f[byte0 >> 4], scale * kvalues_mxfp4_f[byte1 >> 4]);
+            return float2(scale * kvalues_mxfp4_f[byte0 >> 4], scale * kvalues_mxfp4_f[byte1 >> 4]);
         }
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
     }
-}
+};
+
+typedef tiled_loader_block<tiled_dec_mxfp4> tiled_loader_mxfp4;
 
 // Cooperative load: B tile (BN rows × BK cols) into shared memory
 // B is src1: f32, or the copy at the model's precision (ActT). idx_n checked against ne11 (N dimension)
@@ -172,55 +222,11 @@ inline void load_b_to_shmem_strided(
 }
 
 // ---------------------------------------------------------------------------
-// Loader structs — each wraps one of the load_a functions above.
-// The template parameter to kernel_mul_mat_tiled_impl selects which loader
-// to use. The compiler inlines everything — identical machine code to the
-// hand-duplicated kernels.
+// Loader types; the template parameter of kernel_mul_mat_tiled_impl selects one.
 // ---------------------------------------------------------------------------
 
 // f16: typed pointer, element-based stride, pos_a tracks element offset
-struct tiled_loader_f16 {
-    device const half * data_a;
-    uint stride_a;
-    uint pos_a;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        data_a = (device const half *)(src0 + offset0 + args.nb01 * (ir * BM));
-        stride_a = args.nb01 / sizeof(half);
-        pos_a = 0;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_to_shmem(data_a, buf_a, pos_a, loadr, loadc, idx_m, ne01, block, end_k, stride_a);
-    }
-
-    void advance() { pos_a += BK; }
-};
-
-// mxfp4: byte pointer, block-based K tracking, LUT dequant
-struct tiled_loader_mxfp4 {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_k;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_MXFP4;
-        block_k = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_mxfp4_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_k, num_blocks, nb01);
-    }
-
-    void advance() { block_k++; }
-};
+typedef tiled_loader_typed<half> tiled_loader_f16;
 
 // ---------------------------------------------------------------------------
 // Shared kernel body — templated on LoadA strategy.

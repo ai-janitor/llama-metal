@@ -176,47 +176,6 @@ static inline prepared_activation prepare_activation(device const float * activa
     return prepared;
 }
 
-template<short ARITHMETIC_LANE = block_dot_lane_fp32>
-static inline void accumulate(
-        device const block_q4_0 * block,
-        thread const owned_fragment & owned,
-        thread prepared_activation & prepared,
-        thread float & accumulator) {
-    static_assert(ARITHMETIC_LANE == block_dot_lane_fp32, "only the fp32 lane exists");
-    accumulator += block_q_n_dot_y(block, prepared.unscaled_sum[0] + prepared.unscaled_sum[1], prepared.values, owned.half_block_byte_offset);
-}
-
-template<short ARITHMETIC_LANE = block_dot_lane_fp32>
-static inline void accumulate(
-        device const block_q4_1 * block,
-        thread const owned_fragment & owned,
-        thread prepared_activation & prepared,
-        thread float & accumulator) {
-    static_assert(ARITHMETIC_LANE == block_dot_lane_fp32, "only the fp32 lane exists");
-    // Keep the established helper invocation and accumulation order in lane 0.
-    accumulator += block_q_n_dot_y(block, prepared.unscaled_sum[0] + prepared.unscaled_sum[1], prepared.values, owned.half_block_byte_offset);
-}
-
-template<short ARITHMETIC_LANE = block_dot_lane_fp32>
-static inline void accumulate(
-        device const block_q5_0 * block,
-        thread const owned_fragment & owned,
-        thread prepared_activation & prepared,
-        thread float & accumulator) {
-    static_assert(ARITHMETIC_LANE == block_dot_lane_fp32, "only the fp32 lane exists");
-    accumulator += block_q_n_dot_y(block, prepared.unscaled_sum[0] + prepared.unscaled_sum[1], prepared.values, owned.half_block_byte_offset);
-}
-
-template<short ARITHMETIC_LANE = block_dot_lane_fp32>
-static inline void accumulate(
-        device const block_q5_1 * block,
-        thread const owned_fragment & owned,
-        thread prepared_activation & prepared,
-        thread float & accumulator) {
-    static_assert(ARITHMETIC_LANE == block_dot_lane_fp32, "only the fp32 lane exists");
-    accumulator += block_q_n_dot_y(block, prepared.unscaled_sum[0] + prepared.unscaled_sum[1], prepared.values, owned.half_block_byte_offset);
-}
-
 template<short ARITHMETIC_LANE = block_dot_lane_fp32, typename block_q_type>
 static inline void accumulate(
         device const block_q_type * block,

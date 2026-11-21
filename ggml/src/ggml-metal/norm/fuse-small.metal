@@ -136,18 +136,7 @@ kernel void kernel_small_norm_impl(
     float sum = 0.0f;
     sum += dot(xv, xv);
     const ushort threads = ntg.x;
-    shmem[tid.x] = sum;
-    ushort np2 = 1;
-    while (np2 < threads) np2 <<= 1;
-    for (ushort i = threads + tid.x; i < np2; i += threads) shmem[i] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (ushort step = np2 / 2; step > 0; step >>= 1) {
-        if (tid.x < step) {
-            shmem[tid.x] += shmem[tid.x + step];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    sum = shmem[0];
+    sum = tgmem_tree_sum<true>(sum, tid.x, threads, shmem);
     const float mean = sum / a.ne00;
     const float scale = 1.0f / sqrt(mean + a.eps);
     if (GATED) {
@@ -188,18 +177,7 @@ kernel void kernel_small_add_norm_f32_4(
     float sum = 0.0f;
     sum += dot(xv, xv);
     const ushort threads = ntg.x;
-    shmem[tid.x] = sum;
-    ushort np2 = 1;
-    while (np2 < threads) np2 <<= 1;
-    for (ushort i = threads + tid.x; i < np2; i += threads) shmem[i] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (ushort step = np2 / 2; step > 0; step >>= 1) {
-        if (tid.x < step) {
-            shmem[tid.x] += shmem[tid.x + step];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    sum = shmem[0];
+    sum = tgmem_tree_sum<true>(sum, tid.x, threads, shmem);
     const float mean = sum / args.ne00;
     const float scale = 1.0f / sqrt(mean + args.eps);
     dst_sum[tid.x] = xv;

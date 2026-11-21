@@ -3,6 +3,65 @@
 // Used for token generation (N=1) and small batch sizes.
 #include "dequant.metal"
 
+// Reduces each row partial over the nxpsg threads of its row and writes the r1ptg outputs.
+template<short r1ptg>
+static inline void mv_ext_reduce_and_write(
+        constant ggml_metal_kargs_mul_mv_ext & args,
+        device       char * dst,
+        threadgroup  char * shmem,
+        thread float * sumf,
+        short NW, short nxpsg, ushort eff_tiisg, ushort eff_sgitg,
+        short tx, short ty, int i01, int i11, int i1m) {
+    if (FC_mul_mv_shmem_reduce) {
+        // Intel iGPU: threadgroup memory reduction (SIMD-width-independent)
+        threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW;
+        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            buf[eff_tiisg] = sumf[ir1];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tx == 0 && i01 < args.ne01 && i11 + ir1 < args.ne11) {
+                float tot = 0.0f;
+                for (short i = 0; i < nxpsg; ++i) {
+                    tot += buf[ty * nxpsg + i];
+                }
+                device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
+                dst_f32[i01] = tot;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        // reduce only the threads in each row
+        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+            if (nxpsg >= 32) {
+                sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
+            }
+            if (nxpsg >= 16) {
+                sumf[ir1] += simd_shuffle_down(sumf[ir1],  8);
+            }
+            if (nxpsg >= 8) {
+                sumf[ir1] += simd_shuffle_down(sumf[ir1],  4);
+            }
+            if (nxpsg >= 4) {
+                sumf[ir1] += simd_shuffle_down(sumf[ir1],  2);
+            }
+            if (nxpsg >= 2) {
+                sumf[ir1] += simd_shuffle_down(sumf[ir1],  1);
+            }
+
+            //sumf[ir1] = simd_sum(sumf[ir1]);
+        }
+
+        if (tx == 0) {
+            for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
+                if (i11 + ir1 < args.ne11 && i01 < args.ne01) {
+                    device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
+                    dst_f32[i01] = sumf[ir1];
+                }
+            }
+        }
+    }
+}
+
 // mat-vec kernel processing in chunks of float4
 // chpb - chunks per quantization block
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >
@@ -106,54 +165,7 @@ void kernel_mul_mv_ext_q4_f32_impl(
         }
     }
 
-    if (FC_mul_mv_shmem_reduce) {
-        // Intel iGPU: threadgroup memory reduction (SIMD-width-independent)
-        threadgroup float * buf = (threadgroup float *) shmem + eff_sgitg * NW;
-        // Loop unconditionally — uniform barrier count across simdgroups (Intel NW<32 fix)
-        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-            buf[eff_tiisg] = sumf[ir1];
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tx == 0 && i01 < args.ne01 && i11 + ir1 < args.ne11) {
-                float tot = 0.0f;
-                for (short i = 0; i < nxpsg; ++i) {
-                    tot += buf[ty * nxpsg + i];
-                }
-                device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
-                dst_f32[i01] = tot;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    } else {
-        // reduce only the threads in each row
-        for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-            if (nxpsg >= 32) {
-                sumf[ir1] += simd_shuffle_down(sumf[ir1], 16);
-            }
-            if (nxpsg >= 16) {
-                sumf[ir1] += simd_shuffle_down(sumf[ir1],  8);
-            }
-            if (nxpsg >= 8) {
-                sumf[ir1] += simd_shuffle_down(sumf[ir1],  4);
-            }
-            if (nxpsg >= 4) {
-                sumf[ir1] += simd_shuffle_down(sumf[ir1],  2);
-            }
-            if (nxpsg >= 2) {
-                sumf[ir1] += simd_shuffle_down(sumf[ir1],  1);
-            }
-
-            //sumf[ir1] = simd_sum(sumf[ir1]);
-        }
-
-        if (tx == 0) {
-            for (short ir1 = 0; ir1 < r1ptg; ++ir1) {
-                if (i11 + ir1 < args.ne11 && i01 < args.ne01) {
-                    device float * dst_f32 = (device float *) dst + (uint64_t)i1m*args.ne0*args.ne1 + (uint64_t)(i11 + ir1)*args.ne0;
-                    dst_f32[i01] = sumf[ir1];
-                }
-            }
-        }
-    }
+    mv_ext_reduce_and_write<r1ptg>(args, dst, shmem, sumf, NW, nxpsg, eff_tiisg, eff_sgitg, tx, ty, i01, i11, i1m);
 }
 
 // mat-vec kernel processing in chunks of float4x4

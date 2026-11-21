@@ -8,18 +8,11 @@
 // iq4_xs — 4-bit importance quantization with per-sub-block scales
 // ============================================================================
 
-inline void load_a_iq4_xs_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_iq4_xs * block_ptr = (device const block_iq4_xs *)(src0_row + loadc * nb01) + block_idx;
+struct tiled_dec_iq4_xs {
+    typedef block_iq4_xs block_t;
+    enum { units = 8 };
 
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         const int ls = ((block_ptr->scales_l[sub_block/2] >> 4*(sub_block%2)) & 0xf) |
                        (((block_ptr->scales_h >> 2*sub_block) & 3) << 4);
         const float d = (float)block_ptr->d * (ls - 32);
@@ -29,63 +22,26 @@ inline void load_a_iq4_xs_to_shmem(
         if (loadr < 8) {
             const uint8_t byte0 = qs[2*loadr];
             const uint8_t byte1 = qs[2*loadr + 1];
-            buf_a[buf_idx] = float2(d * kvalues_iq4nl_f[byte0 & 0x0F], d * kvalues_iq4nl_f[byte1 & 0x0F]);
+            return float2(d * kvalues_iq4nl_f[byte0 & 0x0F], d * kvalues_iq4nl_f[byte1 & 0x0F]);
         } else {
             const uint8_t byte0 = qs[2*(loadr - 8)];
             const uint8_t byte1 = qs[2*(loadr - 8) + 1];
-            buf_a[buf_idx] = float2(d * kvalues_iq4nl_f[byte0 >> 4], d * kvalues_iq4nl_f[byte1 >> 4]);
-        }
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_iq4_xs {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_iq4_xs_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
+            return float2(d * kvalues_iq4nl_f[byte0 >> 4], d * kvalues_iq4nl_f[byte1 >> 4]);
         }
     }
 };
+
+typedef tiled_loader_block<tiled_dec_iq4_xs> tiled_loader_iq4_xs;
 
 // ============================================================================
 // iq2_xxs — 2-bit importance quantization (xxs variant)
 // ============================================================================
 
-inline void load_a_iq2_xxs_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_iq2_xxs * block_ptr = (device const block_iq2_xxs *)(src0_row + loadc * nb01) + block_idx;
+struct tiled_dec_iq2_xxs {
+    typedef block_iq2_xxs block_t;
+    enum { units = 8 };
 
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         device const uint16_t * q2 = block_ptr->qs + 4 * sub_block;
         const uint32_t aux32_g = q2[0] | (q2[1] << 16);
         const uint32_t aux32_s = q2[2] | (q2[3] << 16);
@@ -106,58 +62,21 @@ inline void load_a_iq2_xxs_to_shmem(
         const float val0 = dl * grid[pos0] * (signs & kmask_iq2xs[pos0] ? -1.f : 1.f);
         const float val1 = dl * grid[pos1] * (signs & kmask_iq2xs[pos1] ? -1.f : 1.f);
 
-        buf_a[buf_idx] = float2(val0, val1);
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_iq2_xxs {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_iq2_xxs_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
-        }
+        return float2(val0, val1);
     }
 };
+
+typedef tiled_loader_block<tiled_dec_iq2_xxs> tiled_loader_iq2_xxs;
 
 // ============================================================================
 // iq2_xs — 2-bit importance quantization (xs variant, with per-sub-block scales)
 // ============================================================================
 
-inline void load_a_iq2_xs_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_iq2_xs * block_ptr = (device const block_iq2_xs *)(src0_row + loadc * nb01) + block_idx;
+struct tiled_dec_iq2_xs {
+    typedef block_iq2_xs block_t;
+    enum { units = 8 };
 
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         const uint elem0 = loadr * 2;
         const uint il_half = elem0 / 16;
 
@@ -176,58 +95,21 @@ inline void load_a_iq2_xs_to_shmem(
         const float val0 = dl * grid[pos0] * (signs & kmask_iq2xs[pos0] ? -1.f : 1.f);
         const float val1 = dl * grid[pos1] * (signs & kmask_iq2xs[pos1] ? -1.f : 1.f);
 
-        buf_a[buf_idx] = float2(val0, val1);
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_iq2_xs {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_iq2_xs_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
-        }
+        return float2(val0, val1);
     }
 };
+
+typedef tiled_loader_block<tiled_dec_iq2_xs> tiled_loader_iq2_xs;
 
 // ============================================================================
 // iq2_s — 2-bit importance quantization (s variant, with separate signs)
 // ============================================================================
 
-inline void load_a_iq2_s_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_iq2_s * block_ptr = (device const block_iq2_s *)(src0_row + loadc * nb01) + block_idx;
+struct tiled_dec_iq2_s {
+    typedef block_iq2_s block_t;
+    enum { units = 8 };
 
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         const uint elem0 = loadr * 2;
         const uint il_half = elem0 / 16;
 
@@ -249,58 +131,21 @@ inline void load_a_iq2_s_to_shmem(
         const float val0 = dl * grid[pos0] * select(1.f, -1.f, signs[local_group] & kmask_iq2xs[pos0]);
         const float val1 = dl * grid[pos1] * select(1.f, -1.f, signs[local_group] & kmask_iq2xs[pos1]);
 
-        buf_a[buf_idx] = float2(val0, val1);
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_iq2_s {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_iq2_s_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
-        }
+        return float2(val0, val1);
     }
 };
+
+typedef tiled_loader_block<tiled_dec_iq2_s> tiled_loader_iq2_s;
 
 // ============================================================================
 // iq3_xxs — 3-bit importance quantization (xxs variant)
 // ============================================================================
 
-inline void load_a_iq3_xxs_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_iq3_xxs * block_ptr = (device const block_iq3_xxs *)(src0_row + loadc * nb01) + block_idx;
+struct tiled_dec_iq3_xxs {
+    typedef block_iq3_xxs block_t;
+    enum { units = 8 };
 
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         device const uint8_t * q3 = block_ptr->qs + 8 * sub_block;
         device const uint16_t * gas = (device const uint16_t *)(block_ptr->qs + QK_K/4) + 2 * sub_block;
         const uint32_t aux32 = gas[0] | (gas[1] << 16);
@@ -325,41 +170,11 @@ inline void load_a_iq3_xxs_to_shmem(
         const float val0 = dl * grid[pos0] * (signs & kmask_iq2xs[kmask_base + pos0] ? -1.f : 1.f);
         const float val1 = dl * grid[pos1] * (signs & kmask_iq2xs[kmask_base + pos1] ? -1.f : 1.f);
 
-        buf_a[buf_idx] = float2(val0, val1);
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_iq3_xxs {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_iq3_xxs_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
-        }
+        return float2(val0, val1);
     }
 };
+
+typedef tiled_loader_block<tiled_dec_iq3_xxs> tiled_loader_iq3_xxs;
 
 // ============================================================================
 // iq3_s — 3-bit importance quantization (s variant, with separate signs and qh)
@@ -367,18 +182,11 @@ struct tiled_loader_iq3_xxs {
 
 // iq3_s: 4 grids per half (grid0..3), each grid has 4 values. signs are per 4-element group.
 // Reference: dequantize_iq3_s in dequant.metal
-inline void load_a_iq3_s_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_iq3_s * block_ptr = (device const block_iq3_s *)(src0_row + loadc * nb01) + block_idx;
+struct tiled_dec_iq3_s {
+    typedef block_iq3_s block_t;
+    enum { units = 8 };
 
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         const float d = (float)block_ptr->d;
         const float dl = d * (1 + 2*((block_ptr->scales[sub_block/2] >> 4*(sub_block%2)) & 0xf));
 
@@ -409,41 +217,11 @@ inline void load_a_iq3_s_to_shmem(
         const float val0 = dl * grid[pos0] * select(1.f, -1.f, signs[sign_byte_idx] & kmask_iq2xs[kmask_base + pos0]);
         const float val1 = dl * grid[pos1] * select(1.f, -1.f, signs[sign_byte_idx] & kmask_iq2xs[kmask_base + pos1]);
 
-        buf_a[buf_idx] = float2(val0, val1);
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_iq3_s {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_iq3_s_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
-        }
+        return float2(val0, val1);
     }
 };
+
+typedef tiled_loader_block<tiled_dec_iq3_s> tiled_loader_iq3_s;
 
 // ============================================================================
 // iq1_s — 1-bit importance quantization (s variant)
@@ -451,18 +229,11 @@ struct tiled_loader_iq3_s {
 
 // iq1_s: type4x4 layout = [grid_lo[0..3], grid_hi[0..3], grid2_lo[0..3], grid2_hi[0..3]]
 // Reference: dequantize_iq1_s in dequant.metal
-inline void load_a_iq1_s_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_iq1_s * block_ptr = (device const block_iq1_s *)(src0_row + loadc * nb01) + block_idx;
+struct tiled_dec_iq1_s {
+    typedef block_iq1_s block_t;
+    enum { units = 8 };
 
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         const float d = (float)block_ptr->d;
         device const uint16_t * qh = block_ptr->qh;
 
@@ -490,41 +261,11 @@ inline void load_a_iq1_s_to_shmem(
         const bool high1 = pos1 >= 4;
         const float val1 = dl * (high1 ? (grid[byte1] >> 4) : (grid[byte1] & 0xf)) + ml;
 
-        buf_a[buf_idx] = float2(val0, val1);
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_iq1_s {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_iq1_s_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
-        }
+        return float2(val0, val1);
     }
 };
+
+typedef tiled_loader_block<tiled_dec_iq1_s> tiled_loader_iq1_s;
 
 // ============================================================================
 // iq1_m — 1-bit importance quantization (m variant, with per-grid deltas)
@@ -532,18 +273,11 @@ struct tiled_loader_iq1_s {
 
 // iq1_m: no .d field, scale reconstructed from scales[] nibbles, qh is uint8_t
 // Reference: dequantize_iq1_m in dequant.metal
-inline void load_a_iq1_m_to_shmem(
-    device const char * src0_row,
-    threadgroup float2 * buf_a,
-    uint loadr, uint loadc,
-    uint idx_m, uint ne01,
-    uint block_idx, uint sub_block,
-    uint num_blocks, uint nb01
-) {
-    const uint buf_idx = loadc * SHMEM_STRIDE + loadr;
-    if (idx_m < ne01 && block_idx < num_blocks) {
-        device const block_iq1_m * block_ptr = (device const block_iq1_m *)(src0_row + loadc * nb01) + block_idx;
+struct tiled_dec_iq1_m {
+    typedef block_iq1_m block_t;
+    enum { units = 8 };
 
+    static inline float2 pair(device const block_t * block_ptr, uint sub_block, uint loadr) {
         // Reconstruct d from scales[] — iq1_m has no .d field
         device const uint16_t * sc = (device const uint16_t *)block_ptr->scales;
         iq1m_scale_t scale;
@@ -580,38 +314,8 @@ inline void load_a_iq1_m_to_shmem(
         const bool high1 = pos1 >= 4;
         const float val1 = dl * (high1 ? (grid[byte1] >> 4) : (grid[byte1] & 0xf)) + ml;
 
-        buf_a[buf_idx] = float2(val0, val1);
-    } else {
-        buf_a[buf_idx] = float2(0.0f);
-    }
-}
-
-struct tiled_loader_iq1_m {
-    device const char * src0_row;
-    uint num_blocks;
-    uint block_idx;
-    uint sub_block;
-    uint nb01;
-
-    void init(device const char * src0, uint64_t offset0, uint ir,
-              constant ggml_metal_kargs_mul_mm & args) {
-        src0_row = src0 + offset0 + args.nb01 * (ir * BM);
-        num_blocks = args.ne00 / QK_K;
-        block_idx = 0;
-        sub_block = 0;
-        nb01 = args.nb01;
-    }
-
-    void load(threadgroup float2 * buf_a, uint loadr, uint loadc,
-              uint idx_m, uint ne01, uint block, uint end_k) {
-        load_a_iq1_m_to_shmem(src0_row, buf_a, loadr, loadc, idx_m, ne01, block_idx, sub_block, num_blocks, nb01);
-    }
-
-    void advance() {
-        sub_block++;
-        if (sub_block == 8) {
-            sub_block = 0;
-            block_idx++;
-        }
+        return float2(val0, val1);
     }
 };
+
+typedef tiled_loader_block<tiled_dec_iq1_m> tiled_loader_iq1_m;

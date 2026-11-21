@@ -353,374 +353,8 @@ inline void flash_attn_ext_scalar_impl(
     }
 }
 
-// Kernel wrappers for all head sizes
-// F16 K/V variants (use half2 as placeholder type for F16 path)
-
-[[host_name("kernel_flash_attn_ext_scalar_dk32_dv32")]]
-kernel void kernel_flash_attn_ext_scalar_dk32_dv32(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<32, 32, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk40_dv40")]]
-kernel void kernel_flash_attn_ext_scalar_dk40_dv40(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<40, 40, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk48_dv48")]]
-kernel void kernel_flash_attn_ext_scalar_dk48_dv48(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<48, 48, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk64_dv64")]]
-kernel void kernel_flash_attn_ext_scalar_dk64_dv64(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<64, 64, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk128_dv128")]]
-kernel void kernel_flash_attn_ext_scalar_dk128_dv128(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<128, 128, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk256_dv256")]]
-kernel void kernel_flash_attn_ext_scalar_dk256_dv256(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<256, 256, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-// Q8_0 K/V variants
-[[host_name("kernel_flash_attn_ext_scalar_q8_0_dk64_dv64")]]
-kernel void kernel_flash_attn_ext_scalar_q8_0_dk64_dv64(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<64, 64, block_q8_0, block_q8_0>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_q8_0_dk128_dv128")]]
-kernel void kernel_flash_attn_ext_scalar_q8_0_dk128_dv128(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<128, 128, block_q8_0, block_q8_0>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_q8_0_dk256_dv256")]]
-kernel void kernel_flash_attn_ext_scalar_q8_0_dk256_dv256(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<256, 256, block_q8_0, block_q8_0>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-// Q4_0 K/V variants
-[[host_name("kernel_flash_attn_ext_scalar_q4_0_dk64_dv64")]]
-kernel void kernel_flash_attn_ext_scalar_q4_0_dk64_dv64(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<64, 64, block_q4_0, block_q4_0>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_q4_0_dk128_dv128")]]
-kernel void kernel_flash_attn_ext_scalar_q4_0_dk128_dv128(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<128, 128, block_q4_0, block_q4_0>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_q4_0_dk256_dv256")]]
-kernel void kernel_flash_attn_ext_scalar_q4_0_dk256_dv256(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<256, 256, block_q4_0, block_q4_0>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-// Additional head sizes for broader model support
-[[host_name("kernel_flash_attn_ext_scalar_dk72_dv72")]]
-kernel void kernel_flash_attn_ext_scalar_dk72_dv72(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<72, 72, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk80_dv80")]]
-kernel void kernel_flash_attn_ext_scalar_dk80_dv80(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<80, 80, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk96_dv96")]]
-kernel void kernel_flash_attn_ext_scalar_dk96_dv96(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<96, 96, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk112_dv112")]]
-kernel void kernel_flash_attn_ext_scalar_dk112_dv112(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<112, 112, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk192_dv192")]]
-kernel void kernel_flash_attn_ext_scalar_dk192_dv192(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<192, 192, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-[[host_name("kernel_flash_attn_ext_scalar_dk576_dv576")]]
-kernel void kernel_flash_attn_ext_scalar_dk576_dv576(
-    constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]],
-    device const char * q     [[buffer(1)]],
-    device const char * k     [[buffer(2)]],
-    device const char * v     [[buffer(3)]],
-    device const char * mask  [[buffer(4)]],
-    device       char * dst   [[buffer(5)]],
-    device const char * sinks [[buffer(6)]],
-    constant uint32_t * tg_offset [[buffer(7)]],
-    threadgroup  float * shmem [[threadgroup(0)]],
-    uint3   tgpig    [[threadgroup_position_in_grid]],
-    ushort3 tptg     [[threads_per_threadgroup]],
-    ushort  simd_gid [[simdgroup_index_in_threadgroup]],
-    ushort  simd_lid [[thread_index_in_simdgroup]],
-    ushort  simd_size [[threads_per_simdgroup]])
-{
-    flash_attn_ext_scalar_impl<576, 576, half2, half2>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size);
-}
-
-// Kernels per head pair whose K/V format is the function constant.
-#define FA_SCALAR_KV_KERNEL(NAME, DK, DV) \
+// One kernel per head pair and K/V block type; fa_scalar_kv_fc reads the format from the function constant.
+#define FA_SCALAR_KERNEL(NAME, DK, DV, KT, VT) \
 [[host_name(#NAME)]] \
 kernel void NAME( \
     constant ggml_metal_kargs_flash_attn_ext & args [[buffer(0)]], \
@@ -738,27 +372,48 @@ kernel void NAME( \
     ushort  simd_lid [[thread_index_in_simdgroup]], \
     ushort  simd_size [[threads_per_simdgroup]]) \
 { \
-    flash_attn_ext_scalar_impl<DK, DV, fa_scalar_kv_fc, fa_scalar_kv_fc>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size); \
+    flash_attn_ext_scalar_impl<DK, DV, KT, VT>(args, q, k, v, mask, dst, sinks, tg_offset, shmem, tgpig, tptg, simd_gid, simd_lid, simd_size); \
 }
 
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk32_dv32, 32, 32)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk40_dv40, 40, 40)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk48_dv48, 48, 48)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk64_dv64, 64, 64)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk72_dv72, 72, 72)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk80_dv80, 80, 80)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk96_dv96, 96, 96)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk112_dv112, 112, 112)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk128_dv128, 128, 128)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk192_dv192, 192, 192)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk256_dv256, 256, 256)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk512_dv512, 512, 512)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk576_dv576, 576, 576)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk96_dv64, 96, 64)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk128_dv96, 128, 96)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk192_dv128, 192, 128)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk320_dv256, 320, 256)
-FA_SCALAR_KV_KERNEL(kernel_flash_attn_ext_scalar_kv_dk576_dv512, 576, 512)
+// F16 K/V variants (use half2 as placeholder type for F16 path)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk32_dv32, 32, 32, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk40_dv40, 40, 40, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk48_dv48, 48, 48, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk64_dv64, 64, 64, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk128_dv128, 128, 128, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk256_dv256, 256, 256, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q8_0_dk64_dv64, 64, 64, block_q8_0, block_q8_0)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q8_0_dk128_dv128, 128, 128, block_q8_0, block_q8_0)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q8_0_dk256_dv256, 256, 256, block_q8_0, block_q8_0)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q4_0_dk64_dv64, 64, 64, block_q4_0, block_q4_0)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q4_0_dk128_dv128, 128, 128, block_q4_0, block_q4_0)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_q4_0_dk256_dv256, 256, 256, block_q4_0, block_q4_0)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk72_dv72, 72, 72, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk80_dv80, 80, 80, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk96_dv96, 96, 96, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk112_dv112, 112, 112, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk192_dv192, 192, 192, half2, half2)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_dk576_dv576, 576, 576, half2, half2)
+
+// Kernels per head pair whose K/V format is the function constant.
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk32_dv32, 32, 32, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk40_dv40, 40, 40, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk48_dv48, 48, 48, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk64_dv64, 64, 64, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk72_dv72, 72, 72, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk80_dv80, 80, 80, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk96_dv96, 96, 96, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk112_dv112, 112, 112, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk128_dv128, 128, 128, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk192_dv192, 192, 192, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk256_dv256, 256, 256, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk512_dv512, 512, 512, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk576_dv576, 576, 576, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk96_dv64, 96, 64, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk128_dv96, 128, 96, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk192_dv128, 192, 128, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk320_dv256, 320, 256, fa_scalar_kv_fc, fa_scalar_kv_fc)
+FA_SCALAR_KERNEL(kernel_flash_attn_ext_scalar_kv_dk576_dv512, 576, 512, fa_scalar_kv_fc, fa_scalar_kv_fc)
 
 // Lightning indexer, one thread per (K row, token): the sum over heads of max(q . k, 0) * weight, plus the mask.
 // The K format is the function constant of the scalar flash attention kernels.

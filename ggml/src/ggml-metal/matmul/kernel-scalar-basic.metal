@@ -251,7 +251,7 @@ void mul_vec_q_n_f32_impl(
 // at pipeline compile time. Since function constants are compile-time values, the
 // Metal compiler eliminates the dead branch — zero runtime overhead.
 // Supported values: 4 (default, safe), 8 (small models with low L1 pressure).
-#define BASIC_MV_ENTRY(host_name_str, block_type, arithmetic_lane)                  \
+#define BASIC_MV_ENTRY(host_name_str, block_type, arithmetic_lane, nr0_first)       \
 kernel void host_name_str(                                                          \
         constant ggml_metal_kargs_mul_mv & args,                                    \
         device const char * src0,                                                   \
@@ -262,8 +262,8 @@ kernel void host_name_str(                                                      
         ushort tiisg[[thread_index_in_simdgroup]],                                  \
         ushort sgitg[[simdgroup_index_in_threadgroup]],                             \
         ushort tidx [[thread_index_in_threadgroup]]) {                              \
-    if (FC_mul_mv_nr0 == N_R0_BASIC) {                                             \
-        mul_vec_q_n_f32_impl<block_type, N_R0_BASIC, constant ggml_metal_kargs_mul_mv &, arithmetic_lane>( \
+    if (FC_mul_mv_nr0 == nr0_first) {                                              \
+        mul_vec_q_n_f32_impl<block_type, nr0_first, constant ggml_metal_kargs_mul_mv &, arithmetic_lane>( \
             args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);              \
     } else if (FC_mul_mv_nr0 == 8) {                                              \
         mul_vec_q_n_f32_impl<block_type, 8, constant ggml_metal_kargs_mul_mv &, arithmetic_lane>( \
@@ -274,30 +274,10 @@ kernel void host_name_str(                                                      
     }                                                                               \
 }
 
-BASIC_MV_ENTRY(kernel_mul_mv_q4_0_f32, block_q4_0, block_dot_lane_fp32)
-BASIC_MV_ENTRY(kernel_mul_mv_q4_1_f32, block_q4_1, block_dot_lane_fp32)
-kernel void kernel_mul_mv_q5_0_f32(
-        constant ggml_metal_kargs_mul_mv & args,
-        device const char * src0,
-        device const char * src1,
-        device       char * dst,
-        threadgroup  char * shmem [[threadgroup(0)]],
-        uint3  tgpig[[threadgroup_position_in_grid]],
-        ushort tiisg[[thread_index_in_simdgroup]],
-        ushort sgitg[[simdgroup_index_in_threadgroup]],
-        ushort tidx [[thread_index_in_threadgroup]]) {
-    if (FC_mul_mv_nr0 == N_R0_Q5_0) {
-        mul_vec_q_n_f32_impl<block_q5_0, N_R0_Q5_0, constant ggml_metal_kargs_mul_mv &>(
-                args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
-    } else if (FC_mul_mv_nr0 == 8) {
-        mul_vec_q_n_f32_impl<block_q5_0, 8, constant ggml_metal_kargs_mul_mv &>(
-                args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
-    } else {
-        mul_vec_q_n_f32_impl<block_q5_0, 4, constant ggml_metal_kargs_mul_mv &>(
-                args, src0, src1, dst, shmem, tgpig, tiisg, sgitg, tidx);
-    }
-}
-BASIC_MV_ENTRY(kernel_mul_mv_q5_1_f32, block_q5_1, block_dot_lane_fp32)
+BASIC_MV_ENTRY(kernel_mul_mv_q4_0_f32, block_q4_0, block_dot_lane_fp32, N_R0_BASIC)
+BASIC_MV_ENTRY(kernel_mul_mv_q4_1_f32, block_q4_1, block_dot_lane_fp32, N_R0_BASIC)
+BASIC_MV_ENTRY(kernel_mul_mv_q5_0_f32, block_q5_0, block_dot_lane_fp32, N_R0_Q5_0)
+BASIC_MV_ENTRY(kernel_mul_mv_q5_1_f32, block_q5_1, block_dot_lane_fp32, N_R0_BASIC)
 
 #undef BASIC_MV_ENTRY
 

@@ -39,9 +39,6 @@ kernel void kernel_norm_fuse_impl(
     const ushort tid = tpitg.x;
     const ushort n_threads = ntg.x;
 
-    ushort np2 = 1;
-    while (np2 < n_threads) np2 <<= 1;
-
     T sumft(0.0f);
 
     float sumf = 0.0f;
@@ -51,14 +48,7 @@ kernel void kernel_norm_fuse_impl(
     }
     sumf = dot(sumft, T(1.0f));
 
-    shmem_f32[tid] = sumf;
-    if (tid == 0) { for (ushort i = n_threads; i < np2; i++) shmem_f32[i] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (ushort s = np2 / 2; s > 0; s >>= 1) {
-        if (tid < s) { shmem_f32[tid] += shmem_f32[tid + s]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    sumf = shmem_f32[0];
+    sumf = tgmem_tree_sum<false>(sumf, tid, n_threads, shmem_f32);
 
     const float mean = sumf/args.ne00;
 
@@ -70,14 +60,7 @@ kernel void kernel_norm_fuse_impl(
         sumf += dot(y[i00], y[i00]);
     }
 
-    shmem_f32[tid] = sumf;
-    if (tid == 0) { for (ushort i = n_threads; i < np2; i++) shmem_f32[i] = 0.0f; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (ushort s = np2 / 2; s > 0; s >>= 1) {
-        if (tid < s) { shmem_f32[tid] += shmem_f32[tid + s]; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    sumf = shmem_f32[0];
+    sumf = tgmem_tree_sum<false>(sumf, tid, n_threads, shmem_f32);
 
     const float variance = sumf/args.ne00;
 
@@ -150,24 +133,7 @@ kernel void kernel_rms_norm_fuse_impl(
     const ushort tid = tpitg.x;
     const ushort n_threads = ntg.x;
 
-    shmem_f32[tid] = sumf;
-    // Pad entries beyond n_threads to 0 for non-power-of-2 sizes.
-    // Thread 0 previously handled padding; widths such as 640 need 384 slots.
-    // Share those independent zero stores without changing the reduction tree.
-    ushort np2 = 1;
-    while (np2 < n_threads) np2 <<= 1;
-    for (ushort i = n_threads + tid; i < np2; i += n_threads) shmem_f32[i] = 0.0f;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Tree reduction — round up to next power-of-2
-    // Reuse the same bound computed for padding above; additions stay identical.
-    for (ushort s = np2 / 2; s > 0; s >>= 1) {
-        if (tid < s) {
-            shmem_f32[tid] += shmem_f32[tid + s];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    sumf = shmem_f32[0];
+    sumf = tgmem_tree_sum<true>(sumf, tid, n_threads, shmem_f32);
 
     const float mean  = sumf/args.ne00;
     const float scale = 1.0f/sqrt(mean + args.eps);

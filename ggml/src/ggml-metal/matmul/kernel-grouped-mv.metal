@@ -21,7 +21,6 @@
 
 #include "dequant.metal"
 #include "block-dot.metal"
-#include "block-dot.metal"
 
 // Function constant for NR0 (rows per simdgroup) — set at pipeline compile time
 // based on the model profile's L1 cache pressure ratio.
@@ -132,23 +131,7 @@ void kernel_mul_mv_grouped_kquant_f32_impl(
     constant const mv_group & grp = args.groups[group_idx];
     const int raw_local_tg = global_tg - grp.tg_start;  // threadgroup index within this group
 
-    // -------------------------------------------------------------------------
-    // CU-local row clustering: TESTED 2026-03-28, no improvement (-0.9%).
-    // -------------------------------------------------------------------------
-    // Same result as scalar kernel — GCN uses fill-first scheduling, not round-robin.
-    // Remapping disabled. Infrastructure kept for testing on other GPUs.
     int local_tg = raw_local_tg;
-    if (false && args.compute_units > 0) {
-        const int n_cus = args.compute_units;
-        const int group_tg_count = (grp.ne01 + NR0 * NSG - 1) / (NR0 * NSG);
-        if (group_tg_count > n_cus) {
-            const int tgs_per_cu = (group_tg_count + n_cus - 1) / n_cus;
-            const int cu_id     = raw_local_tg % n_cus;
-            const int local_idx = raw_local_tg / n_cus;
-            const int remapped  = cu_id * tgs_per_cu + local_idx;
-            local_tg = (remapped < group_tg_count) ? remapped : raw_local_tg;
-        }
-    }
 
     // -------------------------------------------------------------------------
     // Work distribution within a threadgroup.
@@ -232,34 +215,6 @@ void kernel_mul_mv_grouped_kquant_f32_impl(
             // by10/by132 cover the lower 128-element half, by20/by232 the upper half.
             const block_dot_q4_k_activation prepared = block_dot_q4_k_swar::prepare_activation<block_dot_lane_fp32>(owned, y + ib*QK_K);
             for (short row = 0; row < NR0; row++) {
-                // Weight data pointers — these advance per row in the inner loop.
-                // Inner row loop: process NR0 consecutive weight rows using the SAME
-                // activation data (by10/by132/by20/by232). This is the activation reuse
-                // optimization — each float4 load serves NR0 dot products instead of 1.
-                // Unpack 6-bit scales from the packed scales array.
-                // sc16[0..1] are the quantization scales, sc16[2..3] are the min scales.
-                // After unpacking, sc8[0..7] gives individual 8-bit scale values.
-                // Load and split 4-bit quantized weights into low and high nibbles.
-                // qs0 covers the lower 32 bytes, qs64 the upper 32 bytes of the
-                // 128-byte qs array within this superblock.
-                // 4 bytes of quants at q_offset
-                // 4 bytes of quants at q_offset + 64
-                // low nibbles
-                // upper 128 elements
-                // lower 128 elements
-                // Dot products: activation × dequantized weights for 4 sub-groups.
-                // sx/sy handle the lower 128 elements, sz/sw the upper 128.
-                // smin: sum of activation elements weighted by min-scales.
-                // q4_K stores weights as: dequant = d * (q * scale - dmin * min_scale)
-                // This term accumulates the dmin correction.
-                // Exact operation: d*quant_scale*quant - dmin*min_scale.
-                // Final accumulation: result = d * (weighted_quants) - dmin * smin
-                // dm.x = d (scale), dm.y = dmin (min scale)
-                // Advance pointers to the next weight row.
-                // nb01 is the byte stride between rows in the weight matrix.
-                // uint32_t pointer: advance by nb01 bytes / 4
-                // uint16_t pointer: advance by nb01 bytes / 2
-                // half pointer: advance by nb01 bytes / 2
                 // Preserve the original byte row stride before restoring the Q4 block type.
                 device const block_q4_K * block = (device const block_q4_K *) ((device const char *) (x + ib) + row*grp.nb01);
                 if (PREP) {
