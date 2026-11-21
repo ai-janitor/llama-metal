@@ -194,7 +194,7 @@ kernel void kernel_mul_mv_gcn_f32_f16(
 
 // ---- q4_0 x f32 → f32 ----
 // q4_0: 4-bit unsigned quants centered at 8. dequant = d * (q - 8).
-// Block size: QK4_0=32 elements. Each byte holds 2 quants (low/high nibble).
+// Block size: QK4_0=32 elements. Byte j holds element j (low half) and element j + 16 (high half).
 
 kernel void kernel_mul_mv_gcn_q4_0_f32(
         constant ggml_metal_kargs_mul_mv & args [[buffer(0)]],
@@ -231,12 +231,11 @@ kernel void kernel_mul_mv_gcn_q4_0_f32(
         const float d = xb->d;           // per-block scale
         device const uint8_t * qs = xb->qs;  // packed 4-bit quants
 
-        // Dequant and dot-product: loop over all QK4_0 elements in this block
-        for (int j = 0; j < QK4_0; ++j) {
-            const int idx = j / 2;           // byte index (2 quants per byte)
-            const int shift = (j % 2) * 4;   // 0 for low nibble, 4 for high nibble
-            const float xi = d * (((qs[idx] >> shift) & 0xF) - 8);  // dequant: scale * (q - 8)
-            sum += xi * yb[j];
+        // byte j: element j in the low half, element j + QK4_0/2 in the high half (dequantize_row_q4_0)
+        for (int j = 0; j < QK4_0/2; ++j) {
+            const int q = qs[j];
+            sum += d * ((q & 0xF) - 8) * yb[j];
+            sum += d * ((q >> 4)  - 8) * yb[j + QK4_0/2];
         }
     }
 
@@ -287,11 +286,10 @@ kernel void kernel_mul_mv_gcn_q4_1_f32(
         const float m = xb->m;
         device const uint8_t * qs = xb->qs;
 
-        for (int j = 0; j < QK4_1; ++j) {
-            const int idx = j / 2;
-            const int shift = (j % 2) * 4;
-            const float xi = d * ((qs[idx] >> shift) & 0xF) + m;
-            sum += xi * yb[j];
+        for (int j = 0; j < QK4_1/2; ++j) {
+            const int q = qs[j];
+            sum += (d * (q & 0xF) + m) * yb[j];
+            sum += (d * (q >> 4)  + m) * yb[j + QK4_1/2];
         }
     }
 
@@ -342,12 +340,13 @@ kernel void kernel_mul_mv_gcn_q5_0_f32(
         device const uint8_t * qs = xb->qs;
         const uint32_t qh = *((device const uint32_t *)xb->qh);
 
-        for (int j = 0; j < QK5_0; ++j) {
-            const int idx = j / 2;
-            const int shift = (j % 2) * 4;
-            const int hi_bit = (qh >> j) & 1;
-            const float xi = d * ((((qs[idx] >> shift) & 0xF) | (hi_bit << 4)) - 16);
-            sum += xi * yb[j];
+        // bit j of qh is the fifth bit of element j, bit j + QK5_0/2 that of element j + QK5_0/2 (dequantize_row_q5_0)
+        for (int j = 0; j < QK5_0/2; ++j) {
+            const int q  = qs[j];
+            const int x0 = (q & 0xF) | (int)(((qh >> j) & 1) << 4);
+            const int x1 = (q >> 4)  | (int)(((qh >> (j + QK5_0/2)) & 1) << 4);
+            sum += d * (x0 - 16) * yb[j];
+            sum += d * (x1 - 16) * yb[j + QK5_0/2];
         }
     }
 
@@ -399,12 +398,12 @@ kernel void kernel_mul_mv_gcn_q5_1_f32(
         device const uint8_t * qs = xb->qs;
         const uint32_t qh = *((device const uint32_t *)xb->qh);
 
-        for (int j = 0; j < QK5_1; ++j) {
-            const int idx = j / 2;
-            const int shift = (j % 2) * 4;
-            const int hi_bit = (qh >> j) & 1;
-            const float xi = d * (((qs[idx] >> shift) & 0xF) | (hi_bit << 4)) + m;
-            sum += xi * yb[j];
+        for (int j = 0; j < QK5_1/2; ++j) {
+            const int q  = qs[j];
+            const int x0 = (q & 0xF) | (int)(((qh >> j) & 1) << 4);
+            const int x1 = (q >> 4)  | (int)(((qh >> (j + QK5_1/2)) & 1) << 4);
+            sum += (d * x0 + m) * yb[j];
+            sum += (d * x1 + m) * yb[j + QK5_1/2];
         }
     }
 

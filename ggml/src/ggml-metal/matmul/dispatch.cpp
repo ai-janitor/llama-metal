@@ -39,6 +39,13 @@ const struct ggml_metal_matvec_forced * ggml_metal_matvec_forced_env(void) {
     }();
     return set ? &forced : nullptr;
 }
+// Test switch: a multiply of one packed activation column tries the width-64 fallback kernel before the scalar route.
+static bool ggml_metal_test_mv_gcn_first(const ggml_tensor * op) {
+    static const bool set = std::getenv("GGML_METAL_TEST_MV_GCN") != nullptr;
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * x = op->src[1];
+    return set && x->ne[1] == 1 && x->nb[0] == ggml_type_size(x->type) && w->nb[0] == ggml_type_size(w->type);
+}
 GGML_METAL_FAMILY(matmul) int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     int n;
 
@@ -53,6 +60,11 @@ GGML_METAL_FAMILY(matmul) int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx
     // 3. Matmul: simdgroup_mm or tiled matmul for large batches
     n = dispatch_mul_mat_matmul(ctx, idx);
     if (n > 0) return n;
+
+    if (ggml_metal_test_mv_gcn_first(ctx->node(idx))) {
+        n = dispatch_mul_mat_gcn(ctx, idx);
+        if (n > 0) { ggml_metal_tiled_test_route(ctx, idx, n, "gcn"); return n; }
+    }
 
     // 4. Scalar: per-type matvec (the workhorse for single-token generation)
     n = dispatch_mul_mat_scalar(ctx, idx);

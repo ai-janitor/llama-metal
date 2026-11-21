@@ -1,5 +1,5 @@
 // MUL_MAT cases of the Metal backend against the CPU backend, on the first GPU device, which must be a Metal device.
-// Run: test_metal_mul_mat_cases [tree | tiled | all] [routes]   (no set word, or all = both sets).
+// Run: test_metal_mul_mat_cases [tree | tiled | all | w64] [routes]   (no set word, or all = tree and tiled; w64 only when named).
 // routes: each case must also have run on the kernel family its set is about, read from the backend's dispatch
 // receipt: a tree case on one matvec pipeline (kernel_mul_mv_...), a tiled case on one tiled pipeline
 // (kernel_mul_mat_tiled_...). For cards that take those routes (the AMD cards); the pipeline is printed either way. Each case multiplies one random weight (fixed seed, converted to the case's type by ggml) by
@@ -10,6 +10,8 @@
 //          reduced by pairwise halving loses partial sums when the group count is 3.
 //   tiled: batch shapes of the tiled kernel for q4_K, q5_K, q6_K, q8_0: 128 rows x 128 columns x width 512, and
 //          200 x 130 x 768 (rows and columns that are not whole tiles).
+//   w64:   the width-64 fallback matvec kernels of eleven weights, forced by GGML_METAL_TEST_MV_GCN=1; on wave 64 each
+//          case must run on kernel_mul_mv_gcn_<weight>_f32 once, another wave prints SKIP, an unknown wave exits 1.
 // Prints one CASE line per case and a summary; exit 0 only when every case passes, 2 without a GPU device.
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -17,6 +19,7 @@
 #include "ggml-metal.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -32,7 +35,7 @@ static void fill(std::vector<float> & v, uint64_t seed) {
 }
 
 // The pipelines dispatched since the receipt was last reset, "name xcount + ...".
-static std::string dispatched(std::vector<std::string> * names) {
+static std::string dispatched(std::vector<std::string> * names, std::vector<long> * counts) {
     const int need = ggml_backend_metal_test_dispatch_receipt(nullptr, 0, 0);
     std::string js(need > 0 ? (size_t) need : 1, '\0'), out;
     if (need <= 0 || ggml_backend_metal_test_dispatch_receipt(&js[0], js.size(), 0) != need) {
@@ -52,6 +55,7 @@ static std::string dispatched(std::vector<std::string> * names) {
         const long count = atol(obj.c_str() + c + 8);
         if (count > 0) {
             names->push_back(name);
+            counts->push_back(count);
             out += (out.empty() ? "" : " + ") + name + " x" + std::to_string(count);
         }
     }
@@ -98,8 +102,12 @@ int main(int argc, char ** argv) {
     if (only == "all") {
         only = "";
     }
-    if (argc > 3 || (argc == 3 && !routes) || (!only.empty() && only != "tree" && only != "tiled")) {
-        printf("usage: test_metal_mul_mat_cases [tree | tiled | all] [routes]\n");
+    if (argc > 3 || (argc == 3 && !routes) || (!only.empty() && only != "tree" && only != "tiled" && only != "w64")) {
+        printf("usage: test_metal_mul_mat_cases [tree | tiled | all | w64] [routes]\n");
+        return 2;
+    }
+    if (only == "w64" && std::getenv("GGML_METAL_TEST_MV_GCN") == nullptr) {
+        printf("w64 needs GGML_METAL_TEST_MV_GCN=1\n");
         return 2;
     }
     std::vector<mm_case> cases;
@@ -111,6 +119,11 @@ int main(int argc, char ** argv) {
     for (ggml_type t : { GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0 }) {
         cases.push_back({ "tiled", t, 128, 128, 512 });
         cases.push_back({ "tiled", t, 200, 130, 768 });
+    }
+    for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
+                         GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K }) {
+        cases.push_back({ "w64", t, 16, 1, 256 });
+        cases.push_back({ "w64", t, 64, 1, 2304 });
     }
 
     ggml_backend_load_all();
@@ -127,10 +140,17 @@ int main(int argc, char ** argv) {
     }
     printf("device: %s (Metal)\n", ggml_backend_dev_description(dev));
 
+    uint32_t wave = 0, group_bytes = 0;
+    if (only == "w64" && ggml_backend_metal_tiled_card_shape(dev, &wave, &group_bytes) == 0) {
+        printf("w64: the card's wave is unknown\n");
+        return 1;
+    }
+    const bool w64_route = only == "w64" && wave == 64;
+
     const double bound = 5e-4;
     int run = 0, failed = 0;
     for (const mm_case & c : cases) {
-        if (!only.empty() && only != c.set) {
+        if (only.empty() ? strcmp(c.set, "w64") == 0 : only != c.set) {
             continue;
         }
         run++;
@@ -143,9 +163,16 @@ int main(int argc, char ** argv) {
         ggml_backend_metal_test_dispatch_receipt(nullptr, 0, 1); // a new recording window for this case
         const std::vector<float> got  = made ? multiply(gpu, c.type, c.m, c.n, c.k, w, x) : std::vector<float>();
         std::vector<std::string> names;
-        const std::string ran = dispatched(&names);
-        const char * family = strcmp(c.set, "tree") == 0 ? "kernel_mul_mv_" : "kernel_mul_mat_tiled_";
-        const bool route_ok = !routes || (names.size() == 1 && names[0].rfind(family, 0) == 0);
+        std::vector<long> counts;
+        const std::string ran = dispatched(&names, &counts);
+        bool route_ok = true;
+        if (strcmp(c.set, "w64") == 0) {
+            const std::string want_name = std::string("kernel_mul_mv_gcn_") + ggml_type_name(c.type) + "_f32";
+            route_ok = !w64_route || (names.size() == 1 && names[0] == want_name && counts[0] == 1);
+        } else {
+            const char * family = strcmp(c.set, "tree") == 0 ? "kernel_mul_mv_" : "kernel_mul_mat_tiled_";
+            route_ok = !routes || (names.size() == 1 && names[0].rfind(family, 0) == 0);
+        }
         double err = 0, ref = 0;
         bool finite = !want.empty() && want.size() == got.size();
         for (size_t i = 0; finite && i < want.size(); ++i) {
@@ -160,6 +187,9 @@ int main(int argc, char ** argv) {
                route_ok ? "" : " (not the route of this set)", ok ? "PASS" : "FAIL");
     }
     printf("mul_mat cases: %d run, %d failed (bound %.0e)\n", run, failed, bound);
+    if (only == "w64" && !w64_route && failed == 0) {
+        printf("SKIP w64: wave %u, this card takes no width-64 fallback kernel\n", wave);
+    }
     ggml_backend_free(gpu);
     ggml_backend_free(cpu);
     return failed == 0 && run > 0 ? 0 : 1;
