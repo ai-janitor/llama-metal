@@ -263,3 +263,10 @@ static inline bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml
 #endif
     return result;
 }
+
+#include "device/launch-plan.h"
+
+// The numbers of a launch on the op's card: data/device.tsv [launches].
+static inline struct ggml_metal_launch ggml_metal_op_launch(ggml_metal_op_t ctx, int id) {
+    return ggml_metal_launch_of(ggml_metal_device_get_profile(ctx->dev), id);
+}

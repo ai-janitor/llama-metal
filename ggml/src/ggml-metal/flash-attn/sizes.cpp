@@ -1,5 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
 #include "ggml-metal-probe.h"
+#include "launch.h"
 GGML_METAL_FAMILY(flash_attn) bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(encode);
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -7,7 +8,8 @@ GGML_METAL_FAMILY(flash_attn) bool ggml_metal_op_flash_attn_ext_use_vec(const gg
     const int64_t ne01 = op->src[0]->ne[1]; // batch size
 
     // use vec kernel if the batch size is small and if the head size is supported
-    return (ne01 < 20) && (ne00 % 32 == 0);
+    // the crossover holds for every card: no card is known where an op's workspace is sized
+    return (ne01 < fa_launch_pick(FA_LAUNCH_VEC, nullptr, 0).small_queries) && (ne00 % 32 == 0);
 }
 
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(encode);
@@ -112,7 +114,7 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) { GGML_MET
     // note: always reserve the temp buffer to avoid graph reallocations
     //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
     if (true) {
-        const int64_t nwg = 32;
+        const int64_t nwg = fa_launch_pick(FA_LAUNCH_VEC, nullptr, 0).workgroups;
         const int64_t ne01_max = std::min(ne01, 32);
 
         // temp buffer for writing the results from each workgroup

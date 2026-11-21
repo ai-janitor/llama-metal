@@ -89,7 +89,7 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(enco
 
     auto pipeline = ggml_metal_library_get_pipeline_pad(lib, op);
 
-    const int nth = std::min(1024, ne0);
+    const int nth = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_PAD).cap, ne0);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -135,7 +135,7 @@ int ggml_metal_op_pad_reflect_1d(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE
 
     auto pipeline = ggml_metal_library_get_pipeline_pad_reflect_1d(lib, op);
 
-    const int nth = std::min(1024, ne0);
+    const int nth = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_PAD_REFLECT_1D).cap, ne0);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -168,7 +168,7 @@ int ggml_metal_op_arange(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(e
         /*.step  =*/ step
     };
 
-    const int nth = std::min(1024, ne0);
+    const int nth = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_ARANGE).cap, ne0);
 
     auto pipeline = ggml_metal_library_get_pipeline_arange(lib, op);
 
@@ -203,7 +203,7 @@ int ggml_metal_op_timestep_embedding(ggml_metal_op_t ctx, int idx) { GGML_METAL_
 
     auto pipeline = ggml_metal_library_get_pipeline_timestep_embedding(lib, op);
 
-    const int nth = std::max(1, std::min(1024, dim/2));
+    const int nth = std::max(1, std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_TIMESTEP_EMBEDDING).cap, dim/2));
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -304,7 +304,7 @@ int ggml_metal_op_argsort(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(
         // merges per row
         const int nm = (ne00 + 2*len - 1) / (2*len);
 
-        const int nth = std::min(512, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_merge));
+        const int nth = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_ARGSORT_MERGE).cap, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_merge));
 
         ggml_metal_encoder_set_pipeline(enc, pipeline_merge);
         ggml_metal_encoder_set_bytes   (enc, &args_merge, sizeof(args_merge), 0);
@@ -399,7 +399,7 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(en
         // merges per row
         const int nm = (args.ne0 + 2*len - 1) / (2*len);
 
-        const int nth = std::min(512, std::min(len, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_merge)));
+        const int nth = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_ARGSORT_MERGE).cap, std::min(len, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_merge)));
 
         ggml_metal_kargs_argsort_merge args_merge = {
             /*.ne00  =*/ ne00,
@@ -466,7 +466,7 @@ int ggml_metal_op_tri(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(enco
 
     auto pipeline = ggml_metal_library_get_pipeline_tri(lib, op);
 
-    int nth = 32; // SIMD width
+    int nth = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_TRI).start;
 
     while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;

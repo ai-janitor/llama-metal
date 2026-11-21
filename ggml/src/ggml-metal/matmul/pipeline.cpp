@@ -8,6 +8,7 @@
 #include "tuning.h"
 #include "dispatch.h"
 #include "matvec-plan.h"
+#include "mv-launch.h"
 #include "../lanes/select.h"
 #include "ggml-metal-probe.h"
 #include <cassert>
@@ -384,7 +385,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         case GGML_TYPE_F16:
         case GGML_TYPE_BF16:
             {
-                nsg = std::min(4, (ne00 + 127) / 128);
+                const struct ggml_metal_launch launch = ggml_metal_mv_launch_of(ggml_metal_library_get_device_profile(lib), GGML_METAL_MV_LAUNCH_ID_DENSE);
+                nsg = (int) std::min<int64_t>(launch.nsg, ((int64_t) ne00 + launch.units - 1) / launch.units);
                 nr0 = 2;
                 nr1 = 1;
                 smem = (size_t)simd_width*sizeof(float)*nr0;

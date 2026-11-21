@@ -21,7 +21,7 @@ endfunction()
 # family:<name> must name one of them.
 set(family_names "")
 if (DEFINED DEVICES)
-    tsv_section("${DEVICES}" families "devices;families" family_lines)
+    tsv_section("${DEVICES}" families "devices;families;launches" family_lines)
     set(first 1)
     foreach(line IN LISTS family_lines)
         if (first)

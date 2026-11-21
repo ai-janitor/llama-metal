@@ -142,6 +142,10 @@ void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_met
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx);
 
+// Test hook GGML_METAL_TEST_LAUNCHES (any value): every launch prints one stderr line
+//   LAUNCH <pipeline name with its function constants> grid=<x>,<y>,<z> threads=<x>,<y>,<z> mem=<bytes>
+// where mem is the threadgroup memory set since the pipeline was bound. Two builds launch the same work when the
+// sorted lines of one run are equal.
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2);
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);

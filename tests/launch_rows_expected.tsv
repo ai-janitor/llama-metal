@@ -1,0 +1,170 @@
+l2_norm	no row	32	32	0	0	0	0	32
+l2_norm	no row	64	32	0	0	0	0	64
+l2_norm	AMD Radeon HD - FirePro D700	64	32	0	0	0	0	64
+l2_norm	AMD Radeon Pro 5500M	32	32	0	0	0	0	32
+l2_norm	AMD Radeon Pro Vega 64	64	32	0	0	0	0	64
+group_norm	no row	32	32	0	0	0	0	32
+group_norm	no row	64	32	0	0	0	0	64
+group_norm	AMD Radeon HD - FirePro D700	64	32	0	0	0	0	64
+group_norm	AMD Radeon Pro 5500M	32	32	0	0	0	0	32
+group_norm	AMD Radeon Pro Vega 64	64	32	0	0	0	0	64
+norm	no row	32	32	0	0	0	0	1024
+norm	no row	64	64	0	0	0	0	1024
+norm	AMD Radeon HD - FirePro D700	64	64	0	0	0	0	1024
+norm	AMD Radeon Pro 5500M	32	32	0	0	0	0	1024
+norm	AMD Radeon Pro Vega 64	64	64	0	0	0	0	1024
+concat	no row	32	32	0	1024	0	0	0
+concat	no row	64	32	0	1024	0	0	0
+concat	AMD Radeon HD - FirePro D700	64	32	0	1024	0	0	0
+concat	AMD Radeon Pro 5500M	32	32	0	1024	0	0	0
+concat	AMD Radeon Pro Vega 64	64	32	0	1024	0	0	0
+concat_packed	no row	32	0	0	256	0	0	0
+concat_packed	no row	64	0	0	256	0	0	0
+concat_packed	AMD Radeon HD - FirePro D700	64	0	0	256	0	0	0
+concat_packed	AMD Radeon Pro 5500M	32	0	0	256	0	0	0
+concat_packed	AMD Radeon Pro Vega 64	64	0	0	256	0	0	0
+unary	no row	32	0	0	256	0	0	0
+unary	no row	64	0	0	256	0	0	0
+unary	AMD Radeon HD - FirePro D700	64	0	0	256	0	0	0
+unary	AMD Radeon Pro 5500M	32	0	0	256	0	0	0
+unary	AMD Radeon Pro Vega 64	64	0	0	256	0	0	0
+glu	no row	32	0	0	256	0	0	0
+glu	no row	64	0	0	256	0	0	0
+glu	AMD Radeon HD - FirePro D700	64	0	0	256	0	0	0
+glu	AMD Radeon Pro 5500M	32	0	0	256	0	0	0
+glu	AMD Radeon Pro Vega 64	64	0	0	256	0	0	0
+binary	no row	32	0	0	256	0	0	0
+binary	no row	64	0	0	256	0	0	0
+binary	AMD Radeon HD - FirePro D700	64	0	0	256	0	0	0
+binary	AMD Radeon Pro 5500M	32	0	0	256	0	0	0
+binary	AMD Radeon Pro Vega 64	64	0	0	256	0	0	0
+conv_2d	no row	32	0	0	256	0	0	0
+conv_2d	no row	64	0	0	256	0	0	0
+conv_2d	AMD Radeon HD - FirePro D700	64	0	0	256	0	0	0
+conv_2d	AMD Radeon Pro 5500M	32	0	0	256	0	0	0
+conv_2d	AMD Radeon Pro Vega 64	64	0	0	256	0	0	0
+cpy	no row	32	0	0	256	0	0	0
+cpy	no row	64	0	0	256	0	0	0
+cpy	AMD Radeon HD - FirePro D700	64	0	0	256	0	0	0
+cpy	AMD Radeon Pro 5500M	32	0	0	256	0	0	0
+cpy	AMD Radeon Pro Vega 64	64	0	0	256	0	0	0
+act_copy	no row	32	0	0	256	0	0	0
+act_copy	no row	64	0	0	256	0	0	0
+act_copy	AMD Radeon HD - FirePro D700	64	0	0	256	0	0	0
+act_copy	AMD Radeon Pro 5500M	32	0	0	256	0	0	0
+act_copy	AMD Radeon Pro Vega 64	64	0	0	256	0	0	0
+small_gate	no row	32	0	0	256	0	0	0
+small_gate	no row	64	0	0	256	0	0	0
+small_gate	AMD Radeon HD - FirePro D700	64	0	0	256	0	0	0
+small_gate	AMD Radeon Pro 5500M	32	0	0	256	0	0	0
+small_gate	AMD Radeon Pro Vega 64	64	0	0	256	0	0	0
+rope	no row	32	0	0	1024	0	0	0
+rope	no row	64	0	0	1024	0	0	0
+rope	AMD Radeon HD - FirePro D700	64	0	0	1024	0	0	0
+rope	AMD Radeon Pro 5500M	32	0	0	1024	0	0	0
+rope	AMD Radeon Pro Vega 64	64	0	0	1024	0	0	0
+pad	no row	32	0	0	1024	0	0	0
+pad	no row	64	0	0	1024	0	0	0
+pad	AMD Radeon HD - FirePro D700	64	0	0	1024	0	0	0
+pad	AMD Radeon Pro 5500M	32	0	0	1024	0	0	0
+pad	AMD Radeon Pro Vega 64	64	0	0	1024	0	0	0
+pad_reflect_1d	no row	32	0	0	1024	0	0	0
+pad_reflect_1d	no row	64	0	0	1024	0	0	0
+pad_reflect_1d	AMD Radeon HD - FirePro D700	64	0	0	1024	0	0	0
+pad_reflect_1d	AMD Radeon Pro 5500M	32	0	0	1024	0	0	0
+pad_reflect_1d	AMD Radeon Pro Vega 64	64	0	0	1024	0	0	0
+arange	no row	32	0	0	1024	0	0	0
+arange	no row	64	0	0	1024	0	0	0
+arange	AMD Radeon HD - FirePro D700	64	0	0	1024	0	0	0
+arange	AMD Radeon Pro 5500M	32	0	0	1024	0	0	0
+arange	AMD Radeon Pro Vega 64	64	0	0	1024	0	0	0
+timestep_embedding	no row	32	0	0	1024	0	0	0
+timestep_embedding	no row	64	0	0	1024	0	0	0
+timestep_embedding	AMD Radeon HD - FirePro D700	64	0	0	1024	0	0	0
+timestep_embedding	AMD Radeon Pro 5500M	32	0	0	1024	0	0	0
+timestep_embedding	AMD Radeon Pro Vega 64	64	0	0	1024	0	0	0
+set_rows	no row	32	32	0	0	0	0	0
+set_rows	no row	64	32	0	0	0	0	0
+set_rows	AMD Radeon HD - FirePro D700	64	32	0	0	0	0	0
+set_rows	AMD Radeon Pro 5500M	32	32	0	0	0	0	0
+set_rows	AMD Radeon Pro Vega 64	64	32	0	0	0	0	0
+tri	no row	32	32	0	0	0	0	0
+tri	no row	64	32	0	0	0	0	0
+tri	AMD Radeon HD - FirePro D700	64	32	0	0	0	0	0
+tri	AMD Radeon Pro 5500M	32	32	0	0	0	0	0
+tri	AMD Radeon Pro Vega 64	64	32	0	0	0	0	0
+diag	no row	32	32	0	0	0	0	0
+diag	no row	64	32	0	0	0	0	0
+diag	AMD Radeon HD - FirePro D700	64	32	0	0	0	0	0
+diag	AMD Radeon Pro 5500M	32	32	0	0	0	0	0
+diag	AMD Radeon Pro Vega 64	64	32	0	0	0	0	0
+soft_max	no row	32	32	256	0	0	0	128
+soft_max	no row	64	32	256	0	0	0	128
+soft_max	AMD Radeon HD - FirePro D700	64	32	256	0	0	0	128
+soft_max	AMD Radeon Pro 5500M	32	32	256	0	0	0	128
+soft_max	AMD Radeon Pro Vega 64	64	32	256	0	0	0	128
+ssm_conv_batch	no row	32	2	0	256	0	0	0
+ssm_conv_batch	no row	64	2	0	256	0	0	0
+ssm_conv_batch	AMD Radeon HD - FirePro D700	64	2	0	256	0	0	0
+ssm_conv_batch	AMD Radeon Pro 5500M	32	2	0	256	0	0	0
+ssm_conv_batch	AMD Radeon Pro Vega 64	64	2	0	256	0	0	0
+argmax	no row	32	32	256	1024	0	0	256
+argmax	no row	64	32	256	1024	0	0	256
+argmax	AMD Radeon HD - FirePro D700	64	32	256	1024	0	0	256
+argmax	AMD Radeon Pro 5500M	32	32	256	1024	0	0	256
+argmax	AMD Radeon Pro Vega 64	64	32	256	1024	0	0	256
+top_k_mask	no row	32	32	0	0	0	0	0
+top_k_mask	no row	64	32	0	0	0	0	0
+top_k_mask	AMD Radeon HD - FirePro D700	64	32	0	0	0	0	0
+top_k_mask	AMD Radeon Pro 5500M	32	32	0	0	0	0	0
+top_k_mask	AMD Radeon Pro Vega 64	64	32	0	0	0	0	0
+sum	no row	32	32	0	0	0	0	0
+sum	no row	64	32	0	0	0	0	0
+sum	AMD Radeon HD - FirePro D700	64	32	0	0	0	0	0
+sum	AMD Radeon Pro 5500M	32	32	0	0	0	0	0
+sum	AMD Radeon Pro Vega 64	64	32	0	0	0	0	0
+sum_rows	no row	32	32	0	0	0	0	0
+sum_rows	no row	64	32	0	0	0	0	0
+sum_rows	AMD Radeon HD - FirePro D700	64	32	0	0	0	0	0
+sum_rows	AMD Radeon Pro 5500M	32	32	0	0	0	0	0
+sum_rows	AMD Radeon Pro Vega 64	64	32	0	0	0	0	0
+cumsum	no row	32	0	0	0	0	0	32
+cumsum	no row	64	0	0	0	0	0	32
+cumsum	AMD Radeon HD - FirePro D700	64	0	0	0	0	0	32
+cumsum	AMD Radeon Pro 5500M	32	0	0	0	0	0	32
+cumsum	AMD Radeon Pro Vega 64	64	0	0	0	0	0	32
+count_equal	no row	32	32	0	0	32	0	32
+count_equal	no row	64	32	0	0	32	0	32
+count_equal	AMD Radeon HD - FirePro D700	64	32	0	0	32	0	32
+count_equal	AMD Radeon Pro 5500M	32	32	0	0	32	0	32
+count_equal	AMD Radeon Pro Vega 64	64	32	0	0	32	0	32
+argsort_merge	no row	32	0	0	512	0	0	0
+argsort_merge	no row	64	0	0	512	0	0	0
+argsort_merge	AMD Radeon HD - FirePro D700	64	0	0	512	0	0	0
+argsort_merge	AMD Radeon Pro 5500M	32	0	0	512	0	0	0
+argsort_merge	AMD Radeon Pro Vega 64	64	0	0	512	0	0	0
+solve_tri	no row	32	0	0	0	8	0	0
+solve_tri	no row	64	0	0	0	8	0	0
+solve_tri	AMD Radeon HD - FirePro D700	64	0	0	0	8	0	0
+solve_tri	AMD Radeon Pro 5500M	32	0	0	0	8	0	0
+solve_tri	AMD Radeon Pro Vega 64	64	0	0	0	8	0	0
+ssm_scan	no row	32	32	0	0	0	0	0
+ssm_scan	no row	64	32	0	0	0	0	0
+ssm_scan	AMD Radeon HD - FirePro D700	64	32	0	0	0	0	0
+ssm_scan	AMD Radeon Pro 5500M	32	32	0	0	0	0	0
+ssm_scan	AMD Radeon Pro Vega 64	64	32	0	0	0	0	0
+dsv4_hc	no row	32	0	0	0	4	0	0
+dsv4_hc	no row	64	0	0	0	4	0	0
+dsv4_hc	AMD Radeon HD - FirePro D700	64	0	0	0	4	0	0
+dsv4_hc	AMD Radeon Pro 5500M	32	0	0	0	4	0	0
+dsv4_hc	AMD Radeon Pro Vega 64	64	0	0	0	4	0	0
+irfft	no row	32	0	0	1024	0	0	0
+irfft	no row	64	0	0	1024	0	0	0
+irfft	AMD Radeon HD - FirePro D700	64	0	0	1024	0	0	0
+irfft	AMD Radeon Pro 5500M	32	0	0	1024	0	0	0
+irfft	AMD Radeon Pro Vega 64	64	0	0	1024	0	0	0
+fold	no row	32	0	0	1024	0	0	0
+fold	no row	64	0	0	1024	0	0	0
+fold	AMD Radeon HD - FirePro D700	64	0	0	1024	0	0	0
+fold	AMD Radeon Pro 5500M	32	0	0	1024	0	0	0
+fold	AMD Radeon Pro Vega 64	64	0	0	1024	0	0	0

@@ -50,35 +50,34 @@ GGML_METAL_FAMILY(matmul) int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx)
         //
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
-        const int nsg    = 2;
+        const int nsg    = ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_EXT).nsg;
 
-        // num threads along row per simdgroup
+        // num threads along row per simdgroup: the wide, mid or narrow row of data/matmul.tsv [launches]
+        const struct ggml_metal_launch k_wide = ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_EXT_K_WIDE);
+        const struct ggml_metal_launch k_mid  = ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_EXT_K_MID);
         int16_t nxpsg = 0;
-        if (ne00 % 256 == 0 && ne11 < 3) {
-            nxpsg = 16;  // large K + tiny batch → maximize K parallelism
-        } else if (ne00 % 128 == 0) {
-            nxpsg = 8;   // default for K divisible by 128
+        if (ne00 % k_wide.work_min == 0 && ne11 < k_wide.cap) {
+            nxpsg = (int16_t) k_wide.units;  // large K + tiny batch → maximize K parallelism
+        } else if (ne00 % k_mid.work_min == 0) {
+            nxpsg = (int16_t) k_mid.units;
         } else {
-            nxpsg = 4;   // fallback for smaller K
+            nxpsg = (int16_t) ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_EXT_K_NARROW).units;
         }
 
-        int16_t r1ptg  = 4;                 // num src1 rows per threadgroup
-        // Chosen to evenly divide ne11 where possible, reducing tail waste.
+        // num src1 rows per threadgroup: the row of the launch's column count (chosen to divide ne11 evenly where
+        // possible, reducing tail waste), or the row of every other count
+        int cols_id = GGML_METAL_MV_LAUNCH_EXT_COLS_OTHER;
         switch (ne11) {
-            case 2:
-                r1ptg = 2; break;
-            case 3:
-            case 6:
-                r1ptg = 3; break;
-            case 4:
-            case 7:
-            case 8:
-                r1ptg = 4; break;
-            case 5:
-                r1ptg = 5; break;
-            default:
-                r1ptg = 4; break;
-        };
+            case 2: cols_id = GGML_METAL_MV_LAUNCH_EXT_COLS_2; break;
+            case 3: cols_id = GGML_METAL_MV_LAUNCH_EXT_COLS_3; break;
+            case 4: cols_id = GGML_METAL_MV_LAUNCH_EXT_COLS_4; break;
+            case 5: cols_id = GGML_METAL_MV_LAUNCH_EXT_COLS_5; break;
+            case 6: cols_id = GGML_METAL_MV_LAUNCH_EXT_COLS_6; break;
+            case 7: cols_id = GGML_METAL_MV_LAUNCH_EXT_COLS_7; break;
+            case 8: cols_id = GGML_METAL_MV_LAUNCH_EXT_COLS_8; break;
+            default: break;
+        }
+        const int16_t r1ptg = (int16_t) ggml_metal_mv_launch_of(profile, cols_id).units;
 
         // simd_sum and simd_shuffle_down produce wrong results when the hardware
         // SIMD width differs from 32 (Intel NW<32, AMD GCN NW=64).
@@ -91,8 +90,8 @@ GGML_METAL_FAMILY(matmul) int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx)
         // The adaptive recompile may change FC_SIMD_WIDTH (e.g., Intel: 32→16 or 32→8).
         const int ext_simd_w =
             (pipeline.pipeline ? ggml_metal_pipeline_thread_execution_width(pipeline) : 32);
-        const int16_t nypsg  = ext_simd_w/nxpsg;  // num threads along col per simdgroup
-        const int16_t r0ptg  = nypsg*nsg;          // num src0 rows per threadgroup
+        // num src0 rows per threadgroup; 0 = the K width does not divide the compiled width: the launch is not made
+        const int16_t r0ptg  = (int16_t) ggml_metal_mv_ext_rows(ext_simd_w, nxpsg, nsg);
 
         // Vendor verification — fall back to mul_mv if unverified
         bool vendor_ok = true;
@@ -105,7 +104,7 @@ GGML_METAL_FAMILY(matmul) int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx)
             }
         }
 
-        if (vendor_ok) {
+        if (vendor_ok && r0ptg > 0) {
             ggml_metal_kargs_mul_mv_ext args = {
             /*.ne00  =*/ ne00,
             /*.ne01  =*/ ne01,
@@ -149,7 +148,7 @@ GGML_METAL_FAMILY(matmul) int dispatch_mul_mat_ext(ggml_metal_op_t ctx, int idx)
         // AMD GCN hardware has a small max grid size (~65536 TGs); if we exceed
         // it, we split the grid into multiple dispatches with offset parameters.
         // The /16 factor gives headroom to avoid hitting the exact limit.
-        const int32_t ext_chunk = (int32_t)profile->max_threadgroups_per_dispatch / 16;
+        const int32_t ext_chunk = (int32_t)profile->max_threadgroups_per_dispatch / ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_SPLIT_EXT).units;
 
         if (ext_chunk > 0 && ext_total_tg > ext_chunk) {
             // 2D chunked dispatch: chunk along X (rows) first, then Y (batch) if needed

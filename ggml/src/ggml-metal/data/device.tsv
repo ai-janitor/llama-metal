@@ -40,6 +40,54 @@
 #   family: the family's name: lower-case letters and digits (for example gcn1). One row per family.
 #   vendor: amd | apple | intel | nvidia.
 #   metal_name: the architecture name Metal reports for the family's cards (MTLDevice.architecture.name, macOS 14 and later), or - = not known. Two families never share a name.
+#
+# [launches]: the launch numbers of the kernels that have no table of their own: how many threads a threadgroup starts
+# with, the amount of work up to which it grows, the most threads it takes, simdgroups and work units per threadgroup,
+# threadgroup memory. device/gen-launches.cmake compiles the rows in (launch-ids.h: one id per launch, launch-rows.h);
+# ggml_metal_launch_pick (device/launch-plan.cpp) gives the numbers of one launch on the card it runs on, in this order,
+# a later row's cell that is not - replacing the earlier value:
+#   1. the launch's default row: card any, wave any. Exactly one per launch, before its other rows; it writes every
+#      cell the launch reads and - in the others. A card without a row runs it.
+#   2. the launch's row of the card's wave: card any, wave a number. At most one per wave.
+#   3. the card's own row: card = its Metal device name, wave = the wave it reports. Used only while the card reports
+#      that wave. At most one per card and wave.
+# The arithmetic that uses a number stays in the launch's code (what is doubled, what is capped); a row changes the
+# number only. A row never lifts a limit: every launch still holds its threads to the compiled kernel's limit.
+# In [launches], card and wave are the row's key as above, and evidence says where each written cell comes from.
+# To change a number for a card: measure the op on the card with and without it, same output, and add the card's row.
+# To give a launch its numbers here: add its default row with the numbers its code holds, its lines in
+# device/launch-rules.cmake, then read them there.
+# device/launch-rules.cmake holds, per launch, the cells it reads and the values its code runs; the generator refuses a
+# default row that leaves a read cell -, a cell the launch does not read and a value outside the rule (to widen a rule,
+# see that file's header).
+# The launches and the cells each one reads (a cell not named is -):
+#     l2_norm: start = threads of a threadgroup before it doubles up to the row length; mem_units = threadgroup memory.
+#     group_norm: start = threads of a threadgroup (it does not grow); mem_units = threadgroup memory.
+#     norm: the norm and rms_norm launches, plain and fused with multiply and add. start = threads before they double up to the row length; mem_units = threadgroup memory (one unit per thread the launch may take).
+#     concat: start = a row of fewer storage units than this is packed with others into one threadgroup; cap = threads of a threadgroup otherwise.
+#     concat_packed: cap = threads of a threadgroup of packed rows.
+#     unary, glu, binary, conv_2d, cpy, act_copy (the activation copy), small_gate (the fused attention gate): cap = the most threads of a threadgroup.
+#     rope, pad, pad_reflect_1d, arange, timestep_embedding: cap = the most threads of a threadgroup.
+#     set_rows, tri: start = threads of a threadgroup before it doubles up to the row length.
+#     diag: start = threads of a threadgroup (it does not grow).
+#     soft_max: start = threads of a threadgroup before it doubles; work_min = it doubles while threads x rows is under this (and under the row length); mem_units = threadgroup memory.
+#     ssm_conv_batch: the batched ssm_conv launch (more than one token). start = tokens per threadgroup for up to 4 tokens; cap = the most tokens per threadgroup (from 5 tokens: the smallest power of two from 8 that holds them, up to cap).
+#     argmax: start = threads before they double; work_min = they double while threads x rows is under this; cap = threads of the entry that reads one aligned row as 4-float values; mem_units = threadgroup memory of both entries.
+#     top_k_mask (its fill and its scatter), sum, sum_rows: start = threads of a threadgroup before they double.
+#     cumsum: mem_units = threadgroup memory of the block pass.
+#     count_equal: start = threads per simdgroup; nsg = the most simdgroups per threadgroup; mem_units = threadgroup memory.
+#     argsort_merge (the merge pass of argsort and top_k): cap = the most threads of a threadgroup.
+#     solve_tri: nsg = simdgroups per threadgroup.
+#     ssm_scan: start = threads per simdgroup the launch counts its simdgroups by.
+#     dsv4_hc (the head-combining launches): nsg = the most independent tokens or tiles packed into one threadgroup, one simdgroup each.
+#     irfft, fold: cap = the most threads of a threadgroup.
+#   launch: the launch's name: lower-case letters, digits and _ (for example rms_norm). Its id is GGML_METAL_LAUNCH_<NAME>.
+#   start: threads of a threadgroup before it grows: a number, wave (the card's wave), or - = the launch has no start.
+#   work_min: the amount of work (in the launch's own unit: threads x rows, or elements) up to which the threadgroup grows, or -.
+#   cap: the most threads of a threadgroup the launch asks for, or - = only the compiled kernel's limit.
+#   nsg: simdgroups per threadgroup, or -.
+#   units: work units per threadgroup (rows, tokens, members: the launch's own unit), or -.
+#   mem_units: threadgroup memory in 4-byte units: a number, wave (one unit per thread of a wave), or -.
 [families]
 family	vendor	metal_name	wave	group_bytes	evidence
 gcn1	amd	-	64	32768	wave and group_bytes: as the FirePro D700 reports them. metal_name: not read (the D700 runs macOS 12, which has no architecture name).
@@ -50,3 +98,39 @@ card	chip	architecture	wave	group_bytes	cu	l1_bytes_per_cu	l2_bytes	local_Bps	tr
 AMD Radeon HD - FirePro D700	FirePro D700 (GCN 1.0, Tahiti)	gcn1	64	32768	32	16384	786432	263000000000	-	on	on	on	4	on	on	on	off	on	on	wave: probed on the card. group_bytes: MTLDevice maxThreadgroupMemoryLength. cu, local_Bps: specification (techpowerup, FirePro D700). l1, l2: the specification values the backend held in code before they were rows; not measured here. Graph switches: each measured faster on the card with equal logits (ms per token 23.41 -> 22.99, 23.14 -> 22.93, 22.95 -> 22.79). cb_seq: the shipped value. Uploads and staging: measured 2026-11-17, eval 56.06 -> 57.34 and 56.13 t/s. Probes: measured on the card.
 AMD Radeon Pro 5500M	Radeon Pro 5500M (RDNA 1, Navi 14)	rdna1	32	65536	24	16384	4194304	192000000000	-	on	off	off	4	on	on	on	off	on	on	wave: probed on the card. group_bytes: MTLDevice maxThreadgroupMemoryLength. cu: specification (techpowerup, Radeon Pro 5500M). local_Bps: estimate, not verified. l1, l2: the specification values the backend held in code before they were rows; not measured here. attn_gate_fuse: measured, 5 rounds median 10.98 -> 10.58 ms per token, logits equal. conv_l2_fold: measured slower (10.22 -> 10.59 ms), off. add_norm_fuse: measured slower (10.39 -> 12.46 ms), off. cb_seq: the shipped value. Uploads and staging: measured 2026-11-17, eval 84.81 -> 92.08 and 90.86 t/s. Probes: measured on the card.
 AMD Radeon Pro Vega 64	Radeon Pro Vega 64 (GCN 5, Vega 10)	gcn5	64	65536	64	16384	4194304	484000000000	-	on	on	on	4	on	on	on	off	on	on	wave: probed on the card. group_bytes: MTLDevice maxThreadgroupMemoryLength. cu 64, local_Bps 484 GB/s, l1, l2: the specification values the backend held in code for this card before they were rows; not verified here. Graph switches: each measured faster on the card with equal logits (ms per token 7.24 -> 7.13, 7.16 -> 7.09, 7.07 -> 6.97). cb_seq: the shipped value. Uploads and staging: measured 2026-11-17, eval 111.42 -> 114.63 and 116.39 t/s. Probes: measured on the card.
+[launches]
+launch	card	wave	start	work_min	cap	nsg	units	mem_units	evidence
+l2_norm	any	any	32	-	-	-	-	wave	The number the launch held in code before it was a row; not tuned on any card.
+group_norm	any	any	32	-	-	-	-	wave	The number the launch held in code before it was a row; not tuned on any card.
+norm	any	any	wave	-	-	-	-	1024	The numbers the launch held in code before they were rows (start: the card's wave; memory for 1024 threads); not tuned on any card.
+concat	any	any	32	-	1024	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+concat_packed	any	any	-	-	256	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+unary	any	any	-	-	256	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+glu	any	any	-	-	256	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+binary	any	any	-	-	256	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+conv_2d	any	any	-	-	256	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+cpy	any	any	-	-	256	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+act_copy	any	any	-	-	256	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+small_gate	any	any	-	-	256	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+rope	any	any	-	-	1024	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+pad	any	any	-	-	1024	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+pad_reflect_1d	any	any	-	-	1024	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+arange	any	any	-	-	1024	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+timestep_embedding	any	any	-	-	1024	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+set_rows	any	any	32	-	-	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+tri	any	any	32	-	-	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+diag	any	any	32	-	-	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+soft_max	any	any	32	256	-	-	-	128	The number the launch held in code before it was a row; not tuned on any card.
+ssm_conv_batch	any	any	2	-	256	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+argmax	any	any	32	256	1024	-	-	256	The number the launch held in code before it was a row; not tuned on any card.
+top_k_mask	any	any	32	-	-	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+sum	any	any	32	-	-	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+sum_rows	any	any	32	-	-	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+cumsum	any	any	-	-	-	-	-	32	The number the launch held in code before it was a row; not tuned on any card.
+count_equal	any	any	32	-	-	32	-	32	The number the launch held in code before it was a row; not tuned on any card.
+argsort_merge	any	any	-	-	512	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+solve_tri	any	any	-	-	-	8	-	-	The number the launch held in code before it was a row; not tuned on any card.
+ssm_scan	any	any	32	-	-	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+dsv4_hc	any	any	-	-	-	4	-	-	The number the launch held in code before it was a row; not tuned on any card.
+irfft	any	any	-	-	1024	-	-	-	The number the launch held in code before it was a row; not tuned on any card.
+fold	any	any	-	-	1024	-	-	-	The number the launch held in code before it was a row; not tuned on any card.

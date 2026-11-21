@@ -1,5 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
 #include "fa-shared.h"
+#include "launch.h"
 
 // Scalar route: cards without simdgroup matrices, every K/V format pair.
 int ggml_metal_fa_route_scalar(ggml_metal_op_t ctx, int idx, const struct fa_shared & s) {
@@ -137,7 +138,9 @@ int ggml_metal_fa_route_scalar(ggml_metal_op_t ctx, int idx, const struct fa_sha
     // BD comes from pipeline's threadExecutionWidth, but Intel Gen9 may run with
     // smaller BD at runtime (8 instead of 32), yielding more simdgroups (BN).
     // Shared memory must accommodate worst case: BD=8 → BN=tg_size/8.
-    const int BN = 4;
+    // simdgroups per query: the row's number, held to the threads the compiled kernel takes
+    const int BN = std::min<int>(fa_launch_pick(FA_LAUNCH_SCALAR, profile->name, (int32_t) profile->simd_width).simdgroups,
+                                 (int) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline) / BD);
     const int tg_size = BN * BD;
     const int BN_max = tg_size / 8;  // worst case: Intel Gen9 with BD=8
     const size_t smem = (2 * BN_max + tg_size) * sizeof(float);

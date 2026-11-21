@@ -2,9 +2,16 @@
 #include "../ggml-metal-impl.h"
 #include "../../ggml-impl.h"
 #include "ggml-metal-probe.h"
+#include "device/launch-plan.h"
 #include <cassert>
 #include <memory>
 #include <string>
+// threadgroup memory of a norm launch on the library's card, in bytes
+static size_t norm_launch_mem(ggml_metal_library_t lib, int id) {
+    const struct ggml_device_profile * profile = ggml_metal_library_get_device_profile(lib);
+    return (size_t) ggml_metal_launch_pick(id, profile->name, ggml_metal_library_get_simd_width(lib)).mem_units*sizeof(float);
+}
+
 GGML_METAL_FAMILY(norm)
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm(ggml_metal_library_t lib, const ggml_tensor * op) { GGML_METAL_ZONE_BEGIN(pipeline);
     assert(op->op == GGML_OP_L2_NORM);
@@ -25,10 +32,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm(ggml_met
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    int simd_width = ggml_metal_library_get_simd_width(lib);
-
     res.c4   = is_c4;
-    res.smem = simd_width*sizeof(float);
+    res.smem = norm_launch_mem(lib, GGML_METAL_LAUNCH_L2_NORM);
 
     return res;
 }
@@ -49,9 +54,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm(ggml_
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    int simd_width = ggml_metal_library_get_simd_width(lib);
-
-    res.smem = simd_width*sizeof(float);
+    res.smem = norm_launch_mem(lib, GGML_METAL_LAUNCH_GROUP_NORM);
 
     return res;
 }
@@ -101,7 +104,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
     // Norm kernels use shmem tree reduction (simd_sum broken at NW=16 on Intel).
     // Need nth * sizeof(float) where nth can be up to 1024. The actual nth is
     // computed at dispatch time; allocate for max possible (1024 threads).
-    res.smem = 1024*sizeof(float);
+    res.smem = norm_launch_mem(lib, GGML_METAL_LAUNCH_NORM);
 
     return res;
 }
@@ -138,7 +141,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale(ggml_
     }
 
     res.c4 = op->ne[0] % 4 == 0;
-    res.smem = 1024*sizeof(float);
+    res.smem = norm_launch_mem(lib, GGML_METAL_LAUNCH_NORM);
 
     return res;
 }

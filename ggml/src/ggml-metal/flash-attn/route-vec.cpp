@@ -1,5 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
 #include "fa-shared.h"
+#include "launch.h"
 
 // Vec route: small batches; workgroups write partial results that a reduce kernel folds.
 int ggml_metal_fa_route_vec(ggml_metal_op_t ctx, int idx, const struct fa_shared & s) {
@@ -7,6 +8,8 @@ int ggml_metal_fa_route_vec(ggml_metal_op_t ctx, int idx, const struct fa_shared
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
+    const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
+    const struct fa_launch launch = fa_launch_pick(FA_LAUNCH_VEC, profile->name, (int32_t) profile->simd_width);
 
     GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
     GGML_TENSOR_LOCALS(uint64_t, nb0, op->src[0], nb);
@@ -84,9 +87,9 @@ int ggml_metal_fa_route_vec(ggml_metal_op_t ctx, int idx, const struct fa_shared
         nwg = 1;
         nsg = 4;
     } else {
-        nwg = 32;
+        nwg = launch.workgroups;
         nsg = 1;
-        while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) {
+        while (2*nwg*nsg*ncpsg < ne11 && nsg < launch.simdgroups) {
             nsg *= 2;
         }
     }

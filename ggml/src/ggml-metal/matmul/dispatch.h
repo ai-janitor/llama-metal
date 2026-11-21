@@ -8,6 +8,7 @@
 #include "formats.h"
 #include "batch-route.h"
 #include "matvec-plan.h"
+#include "mv-launch.h"
 
 #include <cstdlib>
 #include <cstring>

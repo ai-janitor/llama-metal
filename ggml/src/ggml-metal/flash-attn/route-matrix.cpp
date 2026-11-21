@@ -1,5 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
 #include "fa-shared.h"
+#include "launch.h"
 
 // Matrix route: the simdgroup matrix kernel, with the pad and mask-block pre-passes.
 int ggml_metal_fa_route_matrix(ggml_metal_op_t ctx, int idx, const struct fa_shared & s) {
@@ -92,7 +93,9 @@ int ggml_metal_fa_route_matrix(ggml_metal_op_t ctx, int idx, const struct fa_sha
 
     // simdgroups per threadgroup (a.k.a. warps)
     //nsg = ne01 <= nqptg ? MAX(4, MIN(nsgmax, MIN(ne11/ncpsg, (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32))) : 4;
-    int32_t nsg = ne00 >= 512 ? 8 : 4;
+    const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
+    const struct fa_launch launch = fa_launch_pick(FA_LAUNCH_MATRIX, profile->name, (int32_t) profile->simd_width);
+    int32_t nsg = ne00 >= launch.wide_head ? launch.wide_simdgroups : launch.simdgroups;
 
     const size_t smem = FATTN_SMEM(nsg);
 

@@ -1,5 +1,6 @@
 #include "../ops/ggml-metal-ops-internal.h"
 #include "ggml-metal-probe.h"
+#include "device/launch-plan.h"
 GGML_METAL_FAMILY(norm) int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(encode);
     ggml_tensor * op = ctx->node(idx);
 
@@ -46,7 +47,7 @@ GGML_METAL_FAMILY(norm) int ggml_metal_op_l2_norm(ggml_metal_op_t ctx, int idx) 
         args.ne0  = ne0/4;
     }
 
-    int nth = 32; // SIMD width
+    int nth = ggml_metal_launch_of(ggml_metal_device_get_profile(ctx->dev), GGML_METAL_LAUNCH_L2_NORM).start;
 
     while (nth < ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -97,7 +98,7 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEG
 
     auto pipeline = ggml_metal_library_get_pipeline_group_norm(lib, op);
 
-    int nth = 32; // SIMD width
+    int nth = ggml_metal_launch_of(ggml_metal_device_get_profile(ctx->dev), GGML_METAL_LAUNCH_GROUP_NORM).start;
     //while (nth < ne00/4 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
     //    nth *= 2;
     //}
@@ -250,7 +251,7 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(enc
         args.ne00_t = ne00/4;
     }
 
-    int nth = (int) ggml_metal_device_get_profile(ctx->dev)->simd_width;
+    int nth = ggml_metal_launch_of(ggml_metal_device_get_profile(ctx->dev), GGML_METAL_LAUNCH_NORM).start;
 
     while (nth < args.ne00_t && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;

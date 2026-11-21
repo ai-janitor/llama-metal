@@ -1,5 +1,12 @@
 #include "../ops/ggml-metal-ops-internal.h"
 #include "fa-shared.h"
+#include "launch.h"
+
+// threads per threadgroup of both pre-pass launches on the card
+static int fa_prepass_threads(ggml_metal_op_t ctx) {
+    const struct ggml_device_profile * profile = ggml_metal_device_get_profile(ctx->dev);
+    return fa_launch_pick(FA_LAUNCH_PREPASS, profile->name, (int32_t) profile->simd_width).threads;
+}
 
 // Pad the K/V tail (and the mask) to a multiple of ncpsg cache values.
 void ggml_metal_fa_encode_pad(ggml_metal_op_t ctx, int idx, const struct fa_shared & s, int ncpsg) {
@@ -56,7 +63,7 @@ void ggml_metal_fa_encode_pad(ggml_metal_op_t ctx, int idx, const struct fa_shar
     assert(ne12 == ne22);
     assert(ne13 == ne23);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, ncpsg, std::max(ne12, ne32), std::max(ne13, ne33), 32, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ncpsg, std::max(ne12, ne32), std::max(ne13, ne33), fa_prepass_threads(ctx), 1, 1);
 }
 
 // Mark the (query block, cache block) pairs the mask rules out.
@@ -102,5 +109,5 @@ void ggml_metal_fa_encode_blk(ggml_metal_op_t ctx, int idx, const struct fa_shar
     const int32_t nblk1 = ((ne01 + nqptg - 1)/nqptg);
     const int32_t nblk0 = ((ne30 + ncpsg - 1)/ncpsg);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, nblk0, nblk1, ne32*ne33, 32, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, nblk0, nblk1, ne32*ne33, fa_prepass_threads(ctx), 1, 1);
 }

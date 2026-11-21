@@ -125,6 +125,9 @@ struct ggml_metal_encoder {
     // Selects the receipt key only; binding never counts, only an actual dispatch does.
     char                  receipt_name[128];
     char                  receipt_sha[65];
+
+    // Bytes of threadgroup memory set since the pipeline was bound (index 0). Read by the launch print only.
+    size_t                launch_mem;
 };
 
 struct ggml_metal_device {

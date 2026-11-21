@@ -150,7 +150,7 @@ int ggml_metal_op_cpy(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(enco
         nk0 = ne00/ggml_blck_size(op->type);
     }
 
-    int nth = std::min<int>(nk0*ne01, 256);
+    int nth = std::min<int>(nk0*ne01, ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_CPY).cap);
 
     // when rows are small, we can batch them together in a single threadgroup
     int nrptg = 1;
@@ -263,7 +263,7 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN
 
     const int32_t nk0 = ne0/ggml_blck_size(op->type);
 
-    int nth = 32; // SIMD width
+    int nth = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_SET_ROWS).start;
 
     while (nth < nk0 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -345,7 +345,7 @@ int ggml_metal_op_diag(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(enc
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[0]), 1);
     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),         2);
 
-    ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, 32, 1, 1);
+    ggml_metal_encoder_dispatch_threadgroups(enc, ne1, ne2, ne3, ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_DIAG).start, 1, 1);
 
     return 1;
 }

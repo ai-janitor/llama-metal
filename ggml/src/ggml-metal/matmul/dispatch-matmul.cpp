@@ -526,7 +526,7 @@ int dispatch_mul_mat_matmul(ggml_metal_op_t ctx, int idx) {
         const int32_t tiled_total_tg = tiled_grid_x * tiled_grid_y * tiled_grid_z;
         long tiled_dispatches = 0; // Metal dispatches encoded for this node (the test hook's receipt)
         // Tiled TGs are heavy (64×64 output tile with full K reduction) — use 1/64 of FA limit
-        const int32_t tiled_chunk = (int32_t)profile->max_threadgroups_per_dispatch / 64;
+        const int32_t tiled_chunk = (int32_t)profile->max_threadgroups_per_dispatch / ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_SPLIT_TILED).units;
 
         ggml_metal_encoder_set_pipeline(enc, pipeline);
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);

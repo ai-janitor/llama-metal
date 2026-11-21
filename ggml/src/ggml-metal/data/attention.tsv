@@ -4,7 +4,10 @@
 # decline (no kernel for the head size), and the walk goes on. No row matches = the op is not taken here. No file is read at run time.
 # To add a route: write flash-attn/route-<name>.cpp, add its name to the generator and the router, then add its row.
 # In every condition column, any = the column does not restrict the row.
-# The first row is the header and is required as written: the generator reads the cells by position.
+# A line that is exactly [name] starts a section; the next row is that section's header and is required as written: the
+# generators read the cells by position.
+#
+# [routes]: which route encodes an op (the rows described above).
 # Columns
 #   order: the place in the walk, counting up from 1 with no gap.
 #   route: intel-tiled | scalar | matrix | vec. The encoder the row selects.
@@ -17,6 +20,30 @@
 #   fp8: K is f8_e4m3: yes | no | any.
 #   head: the head size the route has a kernel for: a number | any.
 #   note: why the row exists or what limits it. Free text, no tab. The code does not read this cell.
+#
+# [launch]: the launch numbers of a route. flash-attn/gen-routes.cmake compiles the rows in (fa-launch-table.h);
+# fa_launch_pick (flash-attn/launch.cpp) gives the numbers of one route on the card it runs on, in this order, a later
+# row's cell that is not - replacing the earlier value: the route's default row (card any, wave any; exactly one, before
+# the route's other rows, writing every cell the route reads), the route's row of the card's wave (card any, wave a
+# number), the card's own row (card = its Metal device name, wave = the wave it reports).
+# workgroups and small_queries hold for every card (the workspace of an op is sized before the card is known,
+# flash-attn/sizes.cpp), so only a default row writes them. What a kernel fixes stays in code: queries and cache values
+# per simdgroup of the vec and matrix kernels, the Intel tiled kernel's 128 threads and tile of 32.
+# The generator holds the values each cell takes (the bound_ lines of flash-attn/gen-routes.cmake) and refuses a value
+# outside them: scalar simdgroups 1 to 8; vec simdgroups 1, 2 or 4, workgroups 32, small_queries 1 to 32; matrix
+# simdgroups and wide_simdgroups 4 or 8; prepass threads 32. To widen one, read the consumer named beside its line first.
+# To change a number for a card: measure FLASH_ATTN_EXT on the card with and without it, same output, and add the card's row.
+#   launch_route: scalar | vec | matrix | prepass (the pad and block pre-pass). Each route reads only its own cells; the others are -.
+#   card: [launch]: any | the card's name as Metal reports it.
+#   wave: [launch]: any | the threads of one wave the card reports. A card's row writes a number.
+#   simdgroups: scalar: simdgroups per query. vec: the most simdgroups per threadgroup (they double from 1 while the cache is longer than the launch covers). matrix: simdgroups per threadgroup.
+#   wide_simdgroups: matrix: simdgroups per threadgroup from a head size of wide_head. - on the other routes.
+#   wide_head: matrix: the head size from which wide_simdgroups apply. - on the other routes.
+#   workgroups: vec: the parts the cache is split into; the launch, the merge stage and the workspace size read it. - on the other routes.
+#   small_queries: vec: an op of fewer queries than this (and a head size that is a multiple of 32) is a small batch (the batch column of [routes]). - on the other routes.
+#   threads: prepass: threads per threadgroup. - on the other routes.
+#   evidence: where each written cell comes from. Free text, no tab.
+[routes]
 order	route	file	needs_matrix	vendor	width	batch	kv	fp8	head	note
 1	intel-tiled	flash-attn/route-intel-tiled.cpp	no	intel	any	any	same	no	64	K/V tiled into threadgroup memory; head size 64 only
 2	scalar	flash-attn/route-scalar.cpp	no	intel	any	any	any	any	any	the vec kernel compiles narrower than it assumes on Intel
@@ -26,3 +53,9 @@ order	route	file	needs_matrix	vendor	width	batch	kv	fp8	head	note
 6	scalar	flash-attn/route-scalar.cpp	no	any	any	any	any	yes	any	fp8 is read by the scalar kernels only
 7	matrix	flash-attn/route-matrix.cpp	any	any	any	large	any	any	any	simdgroup matrix kernel
 8	vec	flash-attn/route-vec.cpp	any	any	any	small	any	any	any	small batches
+[launch]
+launch_route	card	wave	simdgroups	wide_simdgroups	wide_head	workgroups	small_queries	threads	evidence
+scalar	any	any	4	-	-	-	-	-	The number the route held in code before it was a row; not tuned on any card.
+vec	any	any	4	-	-	32	20	-	The numbers the route and the size functions held in code before they were rows (upstream's values); not tuned on any card.
+matrix	any	any	4	8	512	-	-	-	The numbers the route held in code before they were rows (upstream's values); not tuned on any card.
+prepass	any	any	-	-	-	-	-	32	The number both pre-pass launches held in code before it was a row; not tuned on any card.

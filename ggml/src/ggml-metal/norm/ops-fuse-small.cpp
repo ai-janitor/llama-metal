@@ -72,7 +72,7 @@ static int small_encode_gate(ggml_metal_op_t ctx, int idx, int count) {
     args.nb2 = mul->nb[2];
     args.nb3 = mul->nb[3];
     const int threads = std::min(args.ne0,
-            std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)));
+            std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_SMALL_GATE).cap, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)));
     small_check_concurrency(ctx, idx, count);
     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
     ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);

@@ -51,6 +51,7 @@ void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_m
     // P12.34: remember which pipeline (and which binary) the next dispatch will use; does not count
     memcpy(encoder->receipt_name, pipeline.pipeline->name,       sizeof(encoder->receipt_name));
     memcpy(encoder->receipt_sha,  pipeline.pipeline->binary_sha, sizeof(encoder->receipt_sha));
+    encoder->launch_mem = 0;
 
     // capture pipeline name for profiler dispatch labels (if active)
     // uses the name stored on the pipeline struct at compile time (not Metal label,
@@ -89,6 +90,19 @@ bool ggml_metal_buffer_get_gpu_address(struct ggml_metal_buffer_id buffer, uint6
 
 void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder, size_t size, int idx) {
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
+    if (idx == 0) {
+        encoder->launch_mem = size;
+    }
+}
+
+// GGML_METAL_TEST_LAUNCHES set: one stderr line per launch (see ggml-metal-device.h).
+static bool ggml_metal_launch_print_on(void) {
+    static bool on;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        on = getenv("GGML_METAL_TEST_LAUNCHES") != NULL;
+    });
+    return on;
 }
 
 void ggml_metal_encoder_set_op_name(ggml_metal_encoder_t encoder, const char * op_name) {
@@ -105,6 +119,10 @@ void ggml_metal_encoder_set_dispatch_shape(ggml_metal_encoder_t encoder, int32_t
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
+    if (ggml_metal_launch_print_on()) {
+        fprintf(stderr, "LAUNCH %s grid=%d,%d,%d threads=%d,%d,%d mem=%zu\n",
+                encoder->receipt_name, tg0, tg1, tg2, tptg0, tptg1, tptg2, encoder->launch_mem);
+    }
     // P12.34: count this encoded dispatch exactly once, before the profiled/normal split below
     // (the profiled wrapper is only reached from here, so it must not record again)
     if (tg0 > 0 && tg1 > 0 && tg2 > 0) {

@@ -2,6 +2,7 @@
 #include "../ggml-metal-impl.h"
 #include "../ggml-impl.h"
 #include "ggml-metal-probe.h"
+#include "device/launch-plan.h"
 #include <algorithm>
 #include <cassert>
 #include <memory>
@@ -99,7 +100,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan(ggml_me
     char base[256];
     char name[256];
 
-    const int nsg = (ne00 + 31)/32;
+    const int per_sg = ggml_metal_launch_pick(GGML_METAL_LAUNCH_SSM_SCAN, ggml_metal_library_get_device_profile(lib)->name, ggml_metal_library_get_simd_width(lib)).start;
+    const int nsg = (int) (((int64_t) ne00 + per_sg - 1)/per_sg);
 
     snprintf(base, 256, "kernel_ssm_scan_%s", ggml_type_name(op->src[0]->type));
     snprintf(name, 256, "%s_nsg=%d", base, nsg);
@@ -164,7 +166,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri(ggml_m
     char base[256];
     char name[256];
 
-    const int nsg = 8;
+    const int nsg = ggml_metal_launch_pick(GGML_METAL_LAUNCH_SOLVE_TRI, ggml_metal_library_get_device_profile(lib)->name, ggml_metal_library_get_simd_width(lib)).nsg;
     const int n   = op->src[1]->ne[1];
     const int k   = op->src[1]->ne[0];
 

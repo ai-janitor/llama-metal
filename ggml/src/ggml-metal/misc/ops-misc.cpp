@@ -20,15 +20,16 @@ GGML_METAL_FAMILY(misc) int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
 
     const int64_t nrows = ggml_nrows(op->src[0]);
 
-    int nth = 32; // SIMD width
-    while (nth < ne00 && nth*ne01*ne02*ne03 < 256) {
+    const struct ggml_metal_launch launch = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_ARGMAX);
+    int nth = launch.start;
+    while (nth < ne00 && nth*ne01*ne02*ne03 < launch.work_min) {
         nth *= 2;
     }
 
     // a single aligned f32 row is read as 16-byte values by one threadgroup
     if (op->src[0]->type == GGML_TYPE_F32 && nrows == 1 && ne00 % 4 == 0 && ggml_metal_get_buffer_id(op->src[0]).offs % 16 == 0) {
         pipeline = ggml_metal_library_get_pipeline_argmax_w4(lib);
-        nth = std::min(1024, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        nth = std::min(launch.cap, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
     }
 
     const size_t smem = pipeline.smem;
@@ -159,7 +160,7 @@ int ggml_metal_op_count_equal(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BE
 
         const size_t smem = pipeline.smem;
 
-        int nth = 32*pipeline.nsg;
+        int nth = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_COUNT_EQUAL).start*pipeline.nsg;
 
         if (nth > (int) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
             nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
@@ -254,7 +255,7 @@ int ggml_metal_op_top_k_mask(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEG
         const int64_t n_fill  = n_elems/(vec ? 4 : 1);
         const int32_t nth_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_fill);
 
-        int nth = 32; // SIMD width
+        int nth = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_TOP_K_MASK).start;
 
         while (nth < nth_max && nth < n_fill) {
             nth *= 2;
@@ -275,7 +276,7 @@ int ggml_metal_op_top_k_mask(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEG
         const int32_t n_max   = n_top + n_extra;
         const int32_t nth_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
 
-        int nth = 32; // SIMD width
+        int nth = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_TOP_K_MASK).start;
 
         while (nth < nth_max && nth < n_max) {
             nth *= 2;
@@ -343,7 +344,7 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(
                 // One SIMDgroup owns one 4x4 Sinkhorn matrix. Packing up to four
                 // independent tokens per threadgroup keeps both decode and prompt
                 // dispatches compact without any threadgroup-memory synchronization.
-                const int nsg = std::min(4, args.n_tokens);
+                const int nsg = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_DSV4_HC).nsg, args.n_tokens);
                 ggml_metal_encoder_dispatch_threadgroups(
                         enc, (args.n_tokens + nsg - 1)/nsg, 1, 1, nw, nsg, 1);
             } break;
@@ -376,7 +377,7 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(
                 ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),      3);
 
                 const int n_tiles = (args.n_embd + nw - 1)/nw;
-                const int nsg = std::min(4, n_tiles);
+                const int nsg = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_DSV4_HC).nsg, n_tiles);
                 ggml_metal_encoder_dispatch_threadgroups(
                         enc, (n_tiles + nsg - 1)/nsg, args.n_tokens, 1, nw, nsg, 1);
             } break;
@@ -423,7 +424,7 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(
                 }
 
                 const int n_tiles = (args.n_embd + nw - 1)/nw;
-                const int nsg = std::min(4, n_tiles);
+                const int nsg = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_DSV4_HC).nsg, n_tiles);
                 ggml_metal_encoder_dispatch_threadgroups(
                         enc, (n_tiles + nsg - 1)/nsg, args.n_tokens, 1, nw, nsg, 1);
             } break;

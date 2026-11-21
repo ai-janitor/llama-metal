@@ -421,7 +421,10 @@ static int dispatch_mul_mat_q8_rows8(ggml_metal_op_t ctx, int idx, const struct 
         return 0;
     }
     const int width = (int) profile->simd_width;
-    const int nsg = plan->nsg, nr0 = 8, lanes_per_block = 4;
+    const int nsg = plan->nsg, nr0 = ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_Q8_ROWS8).units, lanes_per_block = 4;
+    if (nr0 != 4 && nr0 != 8) {
+        return 0; // the kernel has instances of 4 and 8 rows only; matmul/mv-launch-rules.cmake takes no other cell
+    }
     // same bytes as the default kernel: tree row sum, and one block per lane there (blocks = nsg x width / lanes per block)
     if (width != 64 || plan->reduce != 2 || src0->ne[0] != (int64_t) nsg*(width/lanes_per_block)*32) {
         return 0;
@@ -481,7 +484,9 @@ static int dispatch_mul_mat_q8_group(ggml_metal_op_t ctx, int idx, const struct 
     const ggml_tensor * act = op->src[1];
     ggml_tensor * mm[4] = { nullptr, nullptr, nullptr, nullptr };
     int nmat = 0;
-    while (nmat < 4 && idx + nmat < ctx->n_nodes() && ggml_metal_norm_matvec_mm_ok(ctx->node(idx + nmat), act)) {
+    // the most matrices of one launch: the card's number, never above the kernel's four slots
+    const int group_max = std::min(4, (int) ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_GROUP_Q8).units);
+    while (nmat < group_max && idx + nmat < ctx->n_nodes() && ggml_metal_norm_matvec_mm_ok(ctx->node(idx + nmat), act)) {
         mm[nmat] = ctx->node(idx + nmat);
         nmat++;
     }
@@ -844,7 +849,7 @@ int dispatch_mul_mat_scalar(ggml_metal_op_t ctx, int idx) {
     args.grid_x = grid_x;
 
     const int32_t total_tg = grid_x * grid_y * grid_z;
-    const int32_t chunk = (int32_t)profile->max_threadgroups_per_dispatch / 16;
+    const int32_t chunk = (int32_t)profile->max_threadgroups_per_dispatch / ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_SPLIT_MV).units;
 
     // Persistent threadgroup dispatch: DISABLED — regresses all model sizes.
     //

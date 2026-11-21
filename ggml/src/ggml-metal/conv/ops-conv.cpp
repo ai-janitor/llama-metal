@@ -128,7 +128,7 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(
     auto pipeline = ggml_metal_library_get_pipeline_conv_2d(lib, op);
 
     int nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
-    nth = std::min(nth, 256);
+    nth = std::min(nth, (int) ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_CONV_2D).cap);
     nth = std::max(nth, 1);
 
     const uint64_t n_out = ggml_nelements(op);

@@ -57,15 +57,18 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN
     const bool use_batched = (ne1 > 1);
 
     if (use_batched) {
-        // Determine the smallest power of 2 that's >= ne1, but <= 256
+        // Tokens per threadgroup: up to 4 tokens the smallest size (start), else the smallest power of two from 8
+        // that holds them, up to the cap (data/device.tsv [launches] ssm_conv_batch).
+        const struct ggml_metal_launch launch = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_SSM_CONV_BATCH);
         int BATCH_SIZE;
-        if      (ne1 > 128) BATCH_SIZE = 256;
-        else if (ne1 > 64 ) BATCH_SIZE = 128;
-        else if (ne1 > 32 ) BATCH_SIZE = 64;
-        else if (ne1 > 16 ) BATCH_SIZE = 32;
-        else if (ne1 > 8  ) BATCH_SIZE = 16;
-        else if (ne1 > 4  ) BATCH_SIZE = 8;
-        else                BATCH_SIZE = 2;
+        if (ne1 <= 4) {
+            BATCH_SIZE = launch.start;
+        } else {
+            BATCH_SIZE = 8;
+            while (BATCH_SIZE < ne1 && BATCH_SIZE < launch.cap) {
+                BATCH_SIZE *= 2;
+            }
+        }
 
         auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_batched(lib, op, BATCH_SIZE, use_silu);
 

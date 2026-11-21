@@ -2,6 +2,7 @@
 #include "../ggml-metal-impl.h"
 #include "../../ggml-impl.h"
 #include "ggml-metal-probe.h"
+#include "device/launch-plan.h"
 #include <cassert>
 #include <memory>
 #include <string>
@@ -28,7 +29,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
         res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
     }
 
-    res.smem = 128*sizeof(float);
+    const struct ggml_device_profile * profile = ggml_metal_library_get_device_profile(lib);
+    res.smem = (size_t) ggml_metal_launch_pick(GGML_METAL_LAUNCH_SOFT_MAX, profile->name, ggml_metal_library_get_simd_width(lib)).mem_units*sizeof(float);
 
     return res;
 }

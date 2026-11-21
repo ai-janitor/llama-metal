@@ -14,7 +14,7 @@ GGML_METAL_FAMILY(reduction) int ggml_metal_op_sum(ggml_metal_op_t ctx, int idx)
 
     auto pipeline = ggml_metal_library_get_pipeline_sum(lib, op);
 
-    int nth = 32; // SIMD width
+    int nth = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_SUM).start;
 
     while (nth < (int) n && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -81,7 +81,7 @@ int ggml_metal_op_sum_rows(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN
         args.nb00 = 4*nb00; // the kernel steps by nb00 per float4
     }
 
-    int nth = 32; // SIMD width
+    int nth = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_SUM_ROWS).start;
 
     while (nth < args.ne00 && nth < ggml_metal_pipeline_max_theads_per_threadgroup(pipeline)) {
         nth *= 2;
@@ -137,7 +137,7 @@ int ggml_metal_op_cumsum(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(e
     const uint64_t nbt2 = net1*nbt1;
     const uint64_t nbt3 = net2*nbt2;
 
-    const size_t smem = GGML_PAD(32*sizeof(float), 16);
+    const size_t smem = GGML_PAD(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_CUMSUM).mem_units*sizeof(float), 16);
 
     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);

@@ -24,7 +24,7 @@ GGML_METAL_FAMILY(fft) int ggml_metal_op_irfft(ggml_metal_op_t ctx, int idx) { G
 
     auto pipeline = ggml_metal_library_get_pipeline_irfft(lib, op);
 
-    const int nth = std::min(1024, ne0);
+    const int nth = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_IRFFT).cap, ne0);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
@@ -69,7 +69,7 @@ int ggml_metal_op_fold(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(enc
     auto pipeline = ggml_metal_library_get_pipeline_fold(lib, op);
 
     // Output length might be large, need multiple threadgroups if > 1024
-    const int nth = std::min(1024, ne0);
+    const int nth = std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_FOLD).cap, ne0);
     const int n_tg = (ne0 + nth - 1) / nth;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);

@@ -2,6 +2,7 @@
 #include "../ggml-metal-impl.h"
 #include "ggml-impl.h"
 #include "ggml-metal-probe.h"
+#include "device/launch-plan.h"
 #include <cassert>
 #include <memory>
 #include <string>
@@ -73,7 +74,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
     char name[256];
 
     int nsg = 1;
-    while (32*nsg < ne00 && nsg < 32) {
+    const struct ggml_metal_launch launch = ggml_metal_launch_pick(GGML_METAL_LAUNCH_COUNT_EQUAL, ggml_metal_library_get_device_profile(lib)->name, ggml_metal_library_get_simd_width(lib));
+    while (launch.start*nsg < ne00 && nsg < launch.nsg) {
         nsg *= 2;
     }
 
@@ -91,7 +93,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
         ggml_metal_cv_free(cv);
     }
 
-    res.smem = 32 * sizeof(int32_t);
+    res.smem = (size_t) launch.mem_units * sizeof(int32_t);
     res.nsg  = nsg;
 
     return res;

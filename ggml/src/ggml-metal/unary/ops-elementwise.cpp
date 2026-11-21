@@ -58,9 +58,9 @@ GGML_METAL_FAMILY(unary) int ggml_metal_op_concat(ggml_metal_op_t ctx, int idx) 
 
     // Narrow rows otherwise leave most native lanes idle. Pack independent rows
     // into one TG; use the actual width so the kernel agrees on every device.
-    const bool pack_rows = ne0_arg < 32;
-    const int nth = pack_rows ? std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline))
-                              : std::min(1024, ne0_arg);
+    const bool pack_rows = ne0_arg < ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_CONCAT).start;
+    const int nth = pack_rows ? std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_CONCAT_PACKED).cap, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline))
+                              : std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_CONCAT).cap, ne0_arg);
     const int rows_per_group = pack_rows ? std::max(1, nth/ne0_arg) : 1;
     ggml_metal_encoder_dispatch_threadgroups(enc, (ne1 + rows_per_group - 1)/rows_per_group,
                                             ne2, ne3, nth, 1, 1);
@@ -304,11 +304,11 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(en
     if (pipeline.cnt) {
         const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
 
-        const int nth = MIN(256, n);
+        const int nth = MIN(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_UNARY).cap, n);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
     } else {
-        const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        const int nth_max = MIN(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_UNARY).cap, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
         const int nth = MIN(args.ne00, nth_max);
 
@@ -362,7 +362,7 @@ int ggml_metal_op_glu(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(enco
     const int64_t nrows = ggml_nrows(op->src[0]);
 
     // split each row over several threadgroups: with a single row (decode) one threadgroup would run on one GPU core
-    const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), std::min(256, ne0)));
+    const int32_t nth = std::max(1, std::min(ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), std::min(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_GLU).cap, ne0)));
     const int32_t nk  = (ne0 + nth - 1)/nth;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -530,11 +530,11 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) { GGML_METAL_ZONE_BEGIN(enco
     if (pipeline.cnt) {
         const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
 
-        const int nth = MIN(256, n);
+        const int nth = MIN(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_BINARY).cap, n);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
     } else {
-        const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+        const int nth_max = MIN(ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_BINARY).cap, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
         int nth = 1;
 

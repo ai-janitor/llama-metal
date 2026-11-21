@@ -137,6 +137,38 @@
 #       of a 64-thread wave works nr0 / 2 rows; 2 or 3 columns, nr0 from 2, wave 64 only), hap with the weights kept packed.
 #   source: the measurement behind the row: the time before and after, the thread limit, that the bytes are the same. Free text, no tab.
 #       In [matvec_shapes], weight is q4_K | q5_K | q6_K and nr0 is the rows per simdgroup: 1 | 2 | 4 | 8.
+#
+# [launches]: launch numbers of the matmul launches that are one number each. matmul/CMakeLists step: device/gen-launches.cmake
+# compiles the rows in (mv-launch-ids.h, mv-launch-rows.h); ggml_metal_mv_launch_pick (matmul/mv-launch.cpp) gives the
+# numbers of one launch on the card it runs on, in this order, a later row's cell that is not - replacing the earlier
+# value: the launch's default row (card any, wave any; exactly one, before its other rows), its row of the card's wave
+# (card any, wave a number), the card's own row (card = its Metal device name, wave = the wave it reports).
+# In [launches], card and wave are that key, nsg is simdgroups per threadgroup or -, and evidence says where each
+# written cell comes from. matmul/mv-launch-rules.cmake holds, per launch, the cells it reads and the values its code
+# runs; the generator refuses a default row that leaves a read cell -, a cell the launch does not read and a value
+# outside the rule (to widen a rule, see that file's header). The launches and the cell each one reads:
+#   group_kq, units: the most K-quant matvecs of one activation in one grouped launch, 2 to 8 (8 is the size of the
+#       kernel's member array).
+#   group_q8, units: the most Q8_0 matvecs of one activation in one grouped launch, 2 to 4 (the kernel has four slots).
+#   q8_rows8, units: rows per simdgroup of the single Q8_0 matvec that runs whole rows (taken from q8_rows8_min of
+#       [matvec_defaults]): 4 or 8, the kernel's two instances.
+#   ext, nsg: simdgroups per threadgroup of the small-batch (ext) matvec.
+#   ext_k_wide, ext_k_mid, ext_k_narrow: threads along K per simdgroup of the small-batch matvec. units = the threads. The
+#       wide row is taken when K is a multiple of its work_min and the launch has fewer activation columns than its cap;
+#       else the mid row when K is a multiple of its work_min; else the narrow row. units divides the wave.
+#   ext_cols_2 to ext_cols_8, ext_cols_other, units: activation columns per threadgroup of the small-batch matvec for a
+#       launch of that many columns (other = every other count): 2 to 5, the kernel's instances. Each row is picked by its name.
+#   split_tiled, split_mv, split_ext, units: where the card limits the threadgroups of one launch (a limit the backend
+#       holds per vendor; none on the AMD cards), the tiled matmul, the matvec and the small-batch matvec split a launch
+#       at that limit divided by units.
+#   id_dense: the expert-indexed matvec of a dense float weight. units = input columns per simdgroup; nsg = the most simdgroups per threadgroup.
+# To change a number for a card: measure decode speed on the card with and without it, same output, and add the card's row.
+#   launch: the launch's name (see the list above). Its id is GGML_METAL_MV_LAUNCH_<NAME>.
+#   start: threads of a threadgroup before it grows, or - (no launch of this section reads it yet).
+#   work_min: the amount of work up to which the threadgroup grows, or - (no launch of this section reads it yet).
+#   cap: the most threads of a threadgroup the launch asks for, or - (no launch of this section reads it yet).
+#   units: work units per threadgroup or per launch, in the launch's own unit (see the list above), or -.
+#   mem_units: threadgroup memory in 4-byte units, or - (no launch of this section reads it yet).
 [tiles]
 card	weight	plan	plan_cols	role	ext_from	tiled_from	wave	group_bytes	warp	threads	bm	bn	bk	wm	wn	wmiter	tm	tn	pad	route_source	route_test	plan_source	plan_test
 AMD Radeon Pro 5500M	q8_0	-	-	tuned	-	64	32	65536	-	-	-	-	-	-	-	-	-	-	-	measured 2026-11-19, prefill crossover sweep, Qwen 0.8B Q8_0, llama-bench prompt t/s, 5 repetitions: 64 columns 593.3 -> 642.2, 32 columns 573.9 -> 395.3 / 33-63 columns not measured, keep the small-batch kernel	test-backend-ops -o MUL_MAT -p type_a=q8_0	-	-
@@ -284,3 +316,24 @@ family:gcn1	64	32768	single	q6_K	2560	8192	4	off	2	wp	copy of the row of AMD Rad
 family:gcn1	64	32768	single	q6_K	9216	2560	4	off	2	wp	copy of the row of AMD Radeon HD - FirePro D700, where it was measured: (952.26 -> 691.67 us for 4 columns, 5 rounds, th_max 512 vs 768, bytes same); a sweep candidate for another gcn1 card, never applied unmeasured
 family:gcn1	64	32768	single	q6_K	2560	1024	4	off	1	w	copy of the row of AMD Radeon HD - FirePro D700, where it was measured: (126.48 -> 95.64 us for 4 columns, 5 rounds, th_max 512 vs 768, bytes same); a sweep candidate for another gcn1 card, never applied unmeasured
 family:gcn1	64	32768	single	q6_K	2560	248320	4	off	1	ap	copy of the row of AMD Radeon HD - FirePro D700, where it was measured: (21826.63 -> 19510 us for 4 columns, 5 rounds, th_max 512 vs 1024, bytes same); a sweep candidate for another gcn1 card, never applied unmeasured
+[launches]
+launch	card	wave	start	work_min	cap	nsg	units	mem_units	evidence
+group_kq	any	any	-	-	-	-	8	-	The number the grouped launch held in code before it was a row (the size of the kernel's member array); not tuned on any card.
+group_q8	any	any	-	-	-	-	4	-	The number the grouped Q8_0 launch held in code before it was a row (its four buffer slots); not tuned on any card.
+q8_rows8	any	any	-	-	-	-	8	-	The number the whole-rows Q8_0 entry held in code before it was a row; the D700 row of [matvec_defaults] that turns the entry on was measured with it.
+ext	any	any	-	-	-	2	-	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_k_wide	any	any	-	256	3	-	16	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_k_mid	any	any	-	128	-	-	8	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_k_narrow	any	any	-	-	-	-	4	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_cols_2	any	any	-	-	-	-	2	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_cols_3	any	any	-	-	-	-	3	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_cols_4	any	any	-	-	-	-	4	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_cols_5	any	any	-	-	-	-	5	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_cols_6	any	any	-	-	-	-	3	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_cols_7	any	any	-	-	-	-	4	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_cols_8	any	any	-	-	-	-	4	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+ext_cols_other	any	any	-	-	-	-	4	-	The number the small-batch launch held in code before it was a row (upstream's value); not tuned on any card.
+split_tiled	any	any	-	-	-	-	64	-	The divisor the tiled launch held in code before it was a row; not tuned on any card.
+split_mv	any	any	-	-	-	-	16	-	The divisor the matvec launch held in code before it was a row; not tuned on any card.
+split_ext	any	any	-	-	-	-	16	-	The divisor the small-batch launch held in code before it was a row; not tuned on any card.
+id_dense	any	any	-	-	-	4	128	-	The numbers the indexed launch held in code before they were rows (upstream's values); its own row, so a setting of the single matvec never regroups an expert dot.

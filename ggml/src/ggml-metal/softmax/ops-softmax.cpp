@@ -54,14 +54,15 @@ GGML_METAL_FAMILY(softmax) int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int i
 
     auto pipeline = ggml_metal_library_get_pipeline_soft_max(lib, op);
 
-    int nth = 32; // SIMD width
+    const struct ggml_metal_launch launch = ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_SOFT_MAX);
+    int nth = launch.start;
 
     if (ne00%4 == 0) {
-        while (nth < ne00/4 && nth*ne01*ne02*ne03 < 256) {
+        while (nth < ne00/4 && nth*ne01*ne02*ne03 < launch.work_min) {
             nth *= 2;
         }
     } else {
-        while (nth < ne00 && nth*ne01*ne02*ne03 < 256) {
+        while (nth < ne00 && nth*ne01*ne02*ne03 < launch.work_min) {
             nth *= 2;
         }
     }

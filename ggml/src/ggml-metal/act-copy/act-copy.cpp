@@ -136,7 +136,7 @@ void ggml_metal_act_copy_encode(ggml_metal_op_t ctx, int idx, const struct ggml_
 
     // threadgroup shape as ggml_metal_op_cpy picks it for two plain element types
     const int64_t nk0 = ne00;
-    int nth = std::min<int>(nk0*ne01, 256);
+    int nth = std::min<int>(nk0*ne01, ggml_metal_op_launch(ctx, GGML_METAL_LAUNCH_ACT_COPY).cap);
     int nrptg = 1;
     if (nth > nk0) {
         nrptg = (nth + nk0 - 1)/nk0;

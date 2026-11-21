@@ -3,7 +3,7 @@
 # The policies of CMake 3.14 (the project's minimum), so that a quoted word in if() is a string under CMake 3.x too.
 cmake_policy(VERSION 3.14)
 include("${CMAKE_CURRENT_LIST_DIR}/../data/tsv-read.cmake")
-set(device_sections devices families)
+set(device_sections devices families launches)
 set(device_families_header "family;vendor;metal_name;wave;group_bytes;evidence")
 set(device_devices_header "card;chip;architecture;wave;group_bytes;cu;l1_bytes_per_cu;l2_bytes;local_Bps;transfer_Bps;attn_gate_fuse;conv_l2_fold;add_norm_fuse;cb_seq;set_nowait;staging_keep;probe_dispatch;probe_stage;probe_blit;probe_timestamp;evidence")
 set(where "device.tsv [devices]")

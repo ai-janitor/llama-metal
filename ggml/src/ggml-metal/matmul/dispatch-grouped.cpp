@@ -157,6 +157,8 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     bool kq_prep = false;
     ggml_metal_buffer_id bid_kq_prep = { nullptr, 0 };
     const ggml_tensor * member_src0[8] = {};
+    // the most members of one launch: the card's number, never above the 8 descriptors the kernel holds
+    const int group_max = std::min(8, (int) ggml_metal_mv_launch_of(profile, GGML_METAL_MV_LAUNCH_GROUP_KQ).units);
     for (int pass = 0; pass < 2; pass++) {
     gargs = {};
     n_groups = 0;
@@ -166,7 +168,7 @@ int dispatch_mul_mat_grouped(ggml_metal_op_t ctx, int idx) {
     bid_dst_base  = ggml_metal_get_buffer_id(op);
 
     bool whole = true; // every member's rows are whole threadgroups at nr0
-    for (int g = 0; g < 8 && (idx + g) < ctx->n_nodes(); g++) {
+    for (int g = 0; g < group_max && (idx + g) < ctx->n_nodes(); g++) {
         ggml_tensor * gop = ctx->node(idx + g);
         if (gop->op != GGML_OP_MUL_MAT) break;
 
