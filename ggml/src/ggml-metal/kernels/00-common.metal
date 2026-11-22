@@ -62,6 +62,11 @@ inline float tgmem_tree_sum(float partial, ushort tid, ushort n_threads, threadg
     return buf[0];
 }
 
+// The weight row a row position reads: positions from the last row on read the last row; their sums are not stored.
+static inline int mv_tail_row(int row, int rows) { return row < rows ? row : rows - 1; }
+// True when all nr0 row positions from first_row on are rows of the weight.
+static inline bool mv_rows_whole(int first_row, int nr0, int rows) { return rows - first_row >= nr0; }
+
 // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf
 //
 // cmd:

@@ -173,7 +173,7 @@ void kernel_mul_mv_iq1_s_f32_impl(
     const uint i12 = im%args.ne12;
     const uint i13 = im/args.ne12;
 
-    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
     const uint64_t offset1 =        r1*args.nb11 + (i12        )*args.nb12 + (i13        )*args.nb13;
 
     device const block_iq1_s * x = (device const block_iq1_s *) (src0 + offset0);
@@ -198,12 +198,12 @@ void kernel_mul_mv_iq1_s_f32_impl(
         const int ibl = ib32 / (QK_K / 32);
         const int ib  = ib32 % (QK_K / 32);
 
-        device const block_iq1_s * xr = x + ibl;
-        device const uint8_t  * qs = xr->qs + 4 * ib;
-        device const uint16_t * qh = xr->qh + ib;
-        device const half     * dh = &xr->d;
-
         for (short row = 0; row < nr0; row++) {
+            const int rb = mv_tail_row(first_row + row, args.ne01);
+            device const block_iq1_s * xr = (device const block_iq1_s *) ((device const char *) (x + ibl) + (uint64_t) rb*args.nb01);
+            device const uint8_t  * qs = xr->qs + 4 * ib;
+            device const uint16_t * qh = xr->qh + ib;
+            device const half     * dh = &xr->d;
             constant uint8_t * grid1 = (constant uint8_t *)(iq1s_grid_gpu + (qs[0] | ((qh[0] << 8) & 0x700)));
             constant uint8_t * grid2 = (constant uint8_t *)(iq1s_grid_gpu + (qs[1] | ((qh[0] << 5) & 0x700)));
             constant uint8_t * grid3 = (constant uint8_t *)(iq1s_grid_gpu + (qs[2] | ((qh[0] << 2) & 0x700)));
@@ -217,10 +217,6 @@ void kernel_mul_mv_iq1_s_f32_impl(
                      + yl[j+24] * (grid4[j] & 0xf) + yl[j+28] * (grid4[j] >> 4);
             }
             sumf[row] += (float)dh[0] * (sum + sumy * (qh[0] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA)) * (2*((qh[0] >> 12) & 7) + 1);
-
-            dh += args.nb01/2;
-            qs += args.nb01;
-            qh += args.nb01/2;
         }
 
         y4 += 32 * NW;

@@ -163,7 +163,9 @@ void kernel_mul_mv_grouped_kquant_f32_impl(
 
     // Byte offsets into the weight (src0) and activation (src1) buffers.
     // grp.src0_off is the offset from the base buffer to this group's weights.
-    const uint64_t offset0 = grp.src0_off + first_row * grp.nb01 + (i12 / args.r2) * grp.nb02 + (i13 / args.r3) * grp.nb03;
+    // A simdgroup whose rows all exist reads them as they come; one with spare row positions reads bounded rows.
+    const bool rows_whole = mv_rows_whole(first_row, NR0, grp.ne01);
+    const uint64_t offset0 = grp.src0_off + (rows_whole ? first_row * grp.nb01 : 0) + (i12 / args.r2) * grp.nb02 + (i13 / args.r3) * grp.nb03;
     const uint64_t offset1 = r1 * args.nb11 + (i12) * args.nb12 + (i13) * args.nb13;
 
     // y = input activation vector (same for all weight rows)
@@ -209,6 +211,7 @@ void kernel_mul_mv_grouped_kquant_f32_impl(
         const block_dot_q4_k_fragment owned = block_dot_q4_k_swar::owned_fragment(lane_in_block);
         // Main loop: iterate over superblocks, striding by CONCURRENT_BLOCKS
         // so that 4 blocks process 4 different superblocks in parallel.
+        if (rows_whole) {
         for (int ib = block_id; ib < nb; ib += CONCURRENT_BLOCKS) {
             // Load 4 float4 vectors from the activation (input) vector.
             // These are REUSED across NR0 weight rows — this is the key optimization.
@@ -225,6 +228,21 @@ void kernel_mul_mv_grouped_kquant_f32_impl(
                 }
             }
         }
+        } else {
+        for (int ib = block_id; ib < nb; ib += CONCURRENT_BLOCKS) {
+            const block_dot_q4_k_activation prepared = block_dot_q4_k_swar::prepare_activation<block_dot_lane_fp32>(owned, y + ib*QK_K);
+            for (short row = 0; row < NR0; row++) {
+                const int rb = mv_tail_row(first_row + row, grp.ne01);
+                device const block_q4_K * block = (device const block_q4_K *) ((device const char *) (x + ib) + (uint64_t) rb*grp.nb01);
+                if (PREP) {
+                    device const uint * header = (device const uint *) (prep + (grp.src0_off / 144 + (uint64_t) (rb * nb + ib)) * 32);
+                    block_dot_q4_k_swar::accumulate_prepared<block_dot_lane_fp32>(block, owned, prepared, sumf[row], header);
+                } else {
+                    block_dot_q4_k_swar::accumulate<block_dot_lane_fp32>(block, owned, prepared, sumf[row]);
+                }
+            }
+        }
+        }
     } else {
         // =====================================================================
         // q6_K dequantization
@@ -238,6 +256,7 @@ void kernel_mul_mv_grouped_kquant_f32_impl(
 
         const block_dot_q6_k_fragment owned = block_dot_q6_k_grouped_legacy::owned_fragment(lane_in_block);
 
+        if (rows_whole) {
         for (int i = block_id; i < nb; i += CONCURRENT_BLOCKS) {
             const block_dot_q6_k_grouped_activation prepared = block_dot_q6_k_grouped_legacy::prepare_activation<block_dot_lane_fp32>(owned, y + i * QK_K);
 
@@ -246,6 +265,16 @@ void kernel_mul_mv_grouped_kquant_f32_impl(
                 device const block_q6_K * block = (device const block_q6_K *) ((device const char *) (x + i) + row * grp.nb01);
                 block_dot_q6_k_grouped_legacy::accumulate<block_dot_lane_fp32>(block, owned, prepared, sumf[row]);
             }
+        }
+        } else {
+        for (int i = block_id; i < nb; i += CONCURRENT_BLOCKS) {
+            const block_dot_q6_k_grouped_activation prepared = block_dot_q6_k_grouped_legacy::prepare_activation<block_dot_lane_fp32>(owned, y + i * QK_K);
+            for (short row = 0; row < NR0; ++row) {
+                const int rb = mv_tail_row(first_row + row, grp.ne01);
+                device const block_q6_K * block = (device const block_q6_K *) ((device const char *) (x + i) + (uint64_t) rb*grp.nb01);
+                block_dot_q6_k_grouped_legacy::accumulate<block_dot_lane_fp32>(block, owned, prepared, sumf[row]);
+            }
+        }
         }
     }
 

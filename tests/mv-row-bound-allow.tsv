@@ -1,0 +1,95 @@
+# The lines of ggml/src/ggml-metal/matmul/*.metal that check_mv_row_bound.sh accepts, each matched character for
+# character after trimming. kind allow: a line that holds a row stride (nb01, ns01) or a logical row (r0 + row, first_row + row,
+# first_row + ltid) and forms no weight address from it, or forms one only where every row it names exists (why says where).
+# kind pin: a line that declares or reads the bounded row (the word rb or mv_tail_row) or names the whole-rows selection
+# (rows_whole, mv_rows_whole); a changed or new one fails PIN-OTHER until its row is changed in a reviewed diff. kind file:
+# the file holds no one-column matvec body (line and count are *). count: how many lines of that file carry exactly this
+# text, each line counted once; another number fails ALLOW-COUNT, none fails STALE-ALLOW. A change to a body changes the
+# row's line and count in the same diff; the count cannot say which body a line is in, that stays review of the row.
+# Fields: file, kind, line, why, count.
+file	kind	line	why	count
+matmul/kernel-gcn.metal	file	*	width-64 fallback: one row per threadgroup, a row past m returns	*
+matmul/kernel-tiled-body.metal	file	*	tiled matrix kernel: no one-column body	*
+matmul/kernel-tiled-loaders-kquant.metal	file	*	tiled matrix loaders: no one-column body	*
+matmul/kernel-tiled-loaders-qk32.metal	file	*	tiled matrix loaders: no one-column body	*
+matmul/kernel-grouped-mv.metal	allow	int32_t  nb01;       // byte stride between rows of this group's weights	the stride field of the group descriptor	1
+matmul/kernel-grouped-mv.metal	pin	const bool rows_whole = mv_rows_whole(first_row, NR0, grp.ne01);	declares the whole-rows selection	1
+matmul/kernel-grouped-mv.metal	pin	const uint64_t offset0 = grp.src0_off + (rows_whole ? first_row * grp.nb01 : 0) + (i12 / args.r2) * grp.nb02 + (i13 / args.r3) * grp.nb03;	the base selection: the first row when every row of this simdgroup exists, else the bounded first row	1
+matmul/kernel-grouped-mv.metal	pin	if (rows_whole) {	selects the plain block loop (q4_K, q6_K)	2
+matmul/kernel-grouped-mv.metal	allow	device const block_q4_K * block = (device const block_q4_K *) ((device const char *) (x + ib) + row*grp.nb01);	inside if (rows_whole): every row of this simdgroup exists	1
+matmul/kernel-grouped-mv.metal	allow	device const uint * header = (device const uint *) (prep + (grp.src0_off / 144 + (uint64_t) ((first_row + row) * nb + ib)) * 32);	inside if (rows_whole): every row of this simdgroup exists	1
+matmul/kernel-grouped-mv.metal	allow	device const block_q6_K * block = (device const block_q6_K *) ((device const char *) (x + i) + row * grp.nb01);	inside if (rows_whole): every row of this simdgroup exists	1
+matmul/kernel-grouped-mv.metal	pin	const int rb = mv_tail_row(first_row + row, grp.ne01);	declares the bounded row	2
+matmul/kernel-grouped-mv.metal	pin	device const block_q4_K * block = (device const block_q4_K *) ((device const char *) (x + ib) + (uint64_t) rb*grp.nb01);	reads the weight through the bounded row	1
+matmul/kernel-grouped-mv.metal	pin	device const uint * header = (device const uint *) (prep + (grp.src0_off / 144 + (uint64_t) (rb * nb + ib)) * 32);	reads the weight through the bounded row	1
+matmul/kernel-grouped-mv.metal	pin	device const block_q6_K * block = (device const block_q6_K *) ((device const char *) (x + i) + (uint64_t) rb*grp.nb01);	reads the weight through the bounded row	1
+matmul/kernel-grouped-mv.metal	allow	if (tiisg == 0 && first_row + row < grp.ne01) {	a store or its guard: keeps the logical row	1
+matmul/kernel-grouped-mv.metal	allow	dst_f32[first_row + row] = total;	a store or its guard: keeps the logical row	1
+matmul/kernel-grouped-mv.metal	allow	if (ltid < NR0 && first_row + ltid < grp.ne01) {	a store or its guard: keeps the logical row	1
+matmul/kernel-grouped-mv.metal	allow	dst_f32[first_row + ltid] = tot;	a store or its guard: keeps the logical row	1
+matmul/kernel-grouped-mv.metal	allow	if (ltid == 0 && first_row + row < grp.ne01) {	a store or its guard: keeps the logical row	1
+matmul/kernel-grouped-mv.metal	allow	dst_f32[first_row + row] = tot;	a store or its guard: keeps the logical row	1
+matmul/kernel-mm.metal	allow	device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;	matrix kernel (batch of columns, whole tiles), not a one-column body	2
+matmul/kernel-mm.metal	allow	/*.nb01 =*/ args.nb01,	an argument passed on to a body	1
+matmul/kernel-q8-lab.metal	allow	uint64_t nb01,	the stride definition or a parameter	1
+matmul/kernel-q8-lab.metal	allow	device const char  * wrow = src0 + (uint64_t)(valid ? row : 0)*nb01;	lab body, opt-in: a position past m reads row 0 (redirects)	1
+matmul/kernel-q8-lab.metal	allow	kernel_mul_mv_q8_0_f32_lab_impl<64, 8>(args.ne00, args.ne01, args.nb01, FC_mul_mv_nsg, src0, (device const float *) src1, (device float *) dst, partial, (int) tgpig.x, tiisg, sgitg);	an argument passed on to a body	1
+matmul/kernel-q8-lab.metal	allow	kernel_mul_mv_q8_0_f32_lab_impl<64, 4>(args.ne00, args.ne01, args.nb01, FC_mul_mv_nsg, src0, (device const float *) src1, (device float *) dst, partial, (int) tgpig.x, tiisg, sgitg);	an argument passed on to a body	1
+matmul/kernel-q8-lab.metal	allow	kernel_mul_mv_q8_0_f32_lab_impl<32, 8>(args.ne00, args.ne01, args.nb01, FC_mul_mv_nsg, src0, (device const float *) src1, (device float *) dst, partial, (int) tgpig.x, tiisg, sgitg);	an argument passed on to a body	1
+matmul/kernel-q8-lab.metal	allow	kernel_mul_mv_q8_0_f32_lab_impl<32, 4>(args.ne00, args.ne01, args.nb01, FC_mul_mv_nsg, src0, (device const float *) src1, (device float *) dst, partial, (int) tgpig.x, tiisg, sgitg);	an argument passed on to a body	1
+matmul/kernel-q8-lab.metal	allow	uint64_t nb01  = args.nb01_0;	the stride definition or a parameter	1
+matmul/kernel-q8-lab.metal	allow	if (K >= 2 && gid >= args.start1) { w = w1; y = y1; rows = args.rows1; nb01 = args.nb01_1; first = args.start1; }	an argument passed on to a body	1
+matmul/kernel-q8-lab.metal	allow	if (K >= 3 && gid >= args.start2) { w = w2; y = y2; rows = args.rows2; nb01 = args.nb01_2; first = args.start2; }	an argument passed on to a body	1
+matmul/kernel-q8-lab.metal	allow	if (K >= 4 && gid >= args.start3) { w = w3; y = y3; rows = args.rows3; nb01 = args.nb01_3; first = args.start3; }	an argument passed on to a body	1
+matmul/kernel-q8-lab.metal	allow	device const char * wrow = w + (uint64_t)(valid ? row : 0)*nb01;	lab body, opt-in: a position past m reads row 0 (redirects)	1
+matmul/kernel-scalar-basic.metal	allow	if (r0 + row < ne01) {	a store or its guard: keeps the logical row	2
+matmul/kernel-scalar-basic.metal	allow	dst_f32[r0 + row] = buf[group_size * row];	a store or its guard: keeps the logical row	1
+matmul/kernel-scalar-basic.metal	allow	dst_f32[r0 + row] = tot;	a store or its guard: keeps the logical row	3
+matmul/kernel-scalar-basic.metal	allow	if (tiisg == 0 && sgitg == 0 && r0 + row < ne01) {	a store or its guard: keeps the logical row	1
+matmul/kernel-scalar-basic.metal	pin	const int rb = mv_tail_row(r0 + row, args.ne01);	declares the bounded row	2
+matmul/kernel-scalar-basic.metal	pin	const uint64_t offset0 = (uint64_t) rb*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;	reads the weight through the bounded row	2
+matmul/kernel-scalar-basic.metal	allow	if (tiisg == 0 && r0 + row < args.ne01) {	a store or its guard: keeps the logical row	1
+matmul/kernel-scalar-basic.metal	allow	const int ne00, const int rows, const uint64_t nb01, const int r0,	the stride definition or a parameter	1
+matmul/kernel-scalar-basic.metal	pin	const int rb = mv_tail_row(r0 + row, rows);	declares the bounded row	2
+matmul/kernel-scalar-basic.metal	pin	ax[row] = (device const block_q8_0 *) (w + (uint64_t) rb*nb01);	reads the weight through the bounded row	1
+matmul/kernel-scalar-basic.metal	pin	block_dot_q8_0_scalar::accumulate_words(w, (uint64_t) rb*nb01 + (uint64_t) ib*sizeof(block_q8_0), owned, prepared, sumf[row]);	reads the weight through the bounded row	1
+matmul/kernel-scalar-basic.metal	allow	mul_mvg_q8_0_rows<NR0>(args.ne00, args.rows0, args.nb01_0, r0, w0, x, y0, shmem, eff_tiisg, eff_sgitg, tidx);	an argument passed on to a body	1
+matmul/kernel-scalar-basic.metal	allow	mul_mvg_q8_0_rows<NR0>(args.ne00, args.rows1, args.nb01_1, r0, w1, x, y1, shmem, eff_tiisg, eff_sgitg, tidx);	an argument passed on to a body	1
+matmul/kernel-scalar-basic.metal	allow	mul_mvg_q8_0_rows<NR0>(args.ne00, args.rows2, args.nb01_2, r0, w2, x, y2, shmem, eff_tiisg, eff_sgitg, tidx);	an argument passed on to a body	1
+matmul/kernel-scalar-basic.metal	allow	mul_mvg_q8_0_rows<NR0>(args.ne00, args.rows3, args.nb01_3, r0, w3, x, y3, shmem, eff_tiisg, eff_sgitg, tidx);	an argument passed on to a body	1
+matmul/kernel-scalar-basic.metal	pin	aoff[row] = (uint64_t) mv_tail_row(r0 + row, args.ne01)*args.nb01;	reads the weight through the bounded row	1
+matmul/kernel-scalar-kquant.metal	pin	const int rb = mv_tail_row(first_row + row, args.ne01);	declares the bounded row	1
+matmul/kernel-scalar-kquant.metal	pin	device const block_iq1_s * xr = (device const block_iq1_s *) ((device const char *) (x + ibl) + (uint64_t) rb*args.nb01);	reads the weight through the bounded row	1
+matmul/kernel-scalar-kquant.metal	allow	if (ltid == 0 && first_row + row < args.ne0) {	a store or its guard: keeps the logical row	1
+matmul/kernel-scalar-kquant.metal	allow	dst_f32[first_row + row] = tot;	a store or its guard: keeps the logical row	1
+matmul/kernel-scalar-kquant.metal	allow	if (tiisg == 0 && first_row + row < args.ne0) {	a store or its guard: keeps the logical row	1
+matmul/kernel-scalar-kquant.metal	allow	dst_f32[first_row + row] = sum_all;	a store or its guard: keeps the logical row	1
+matmul/kernel-scalar.metal	allow	const uint64_t offset0 = i01*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;	ext body (2 to 8 columns): a position past m reads the weight base (redirects)	2
+matmul/kernel-scalar.metal	pin	const int rb = mv_tail_row(r0 + row, args.ne01);	declares the bounded row	2
+matmul/kernel-scalar.metal	pin	const uint64_t offset0 = (uint64_t) rb*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;	reads the weight through the bounded row	2
+matmul/kernel-scalar.metal	allow	const uint64_t offset0 = r0*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;	short body: a thread past m returns before its address	1
+matmul/mul-mv.metal	pin	int rb,	declares the bounded row	1
+matmul/mul-mv.metal	allow	int ns01,	the stride definition or a parameter	1
+matmul/mul-mv.metal	pin	? x + ((int64_t) rb*ns01 + ibl)	reads the weight through the bounded row	1
+matmul/mul-mv.metal	pin	: (device const typename Fmt::block_t *) ((device const char *) (x + ibl) + (uint64_t) rb*args.nb01);	reads the weight through the bounded row	1
+matmul/mul-mv.metal	allow	const int ns01 = args.nb01/args.nb00;	the stride definition or a parameter	1
+matmul/mul-mv.metal	allow	for (int ib = block_id; ib < nb && (!Fmt::rows_by_blocks || ib < ns01); ib += stride) {	a loop bound over blocks (mul-mv.metal shared loop)	2
+matmul/mul-mv.metal	pin	const int rb = mv_tail_row(first_row + row, args.ne01);	declares the bounded row	2
+matmul/mul-mv.metal	pin	const bool rows_whole = mv_rows_whole(first_row, NR0, args.ne01);	declares the whole-rows selection	1
+matmul/mul-mv.metal	pin	const int fb = mv_tail_row(first_row, args.ne01);	declares the bounded first row of the base	1
+matmul/mul-mv.metal	pin	const uint64_t offset0 = rows_whole ? first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03 : (uint64_t) fb*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;	the base selection: the row base only when every row of this simdgroup exists	1
+matmul/mul-mv.metal	pin	if (rows_whole) {	selects the plain block loop	1
+matmul/mul-mv.metal	allow	mul_mv_row<Fmt, NR0, args_t, LANE, false>(args, x, ib, row, first_row + row, ns01, (first_row + row) * nb + ib, owned, prepared, acc[row], prep, shmem);	inside if (rows_whole): every row of this simdgroup exists	2
+matmul/mul-mv.metal	pin	mul_mv_row<Fmt, NR0, args_t, LANE, true>(args, x, ib, row, rb - fb, ns01, rb * nb + ib, owned, prepared, acc[row], prep, shmem);	reads the weight through the bounded row, local to the bounded first row	2
+matmul/mul-mv.metal	allow	? x + (row*ns01 + ibl)	the BOUND false branch of mul_mv_row, called only inside if (rows_whole): every row of this simdgroup exists	1
+matmul/mul-mv.metal	allow	: (device const typename Fmt::block_t *) ((device const char *) (x + ibl) + row*args.nb01);	the BOUND false branch of mul_mv_row, called only inside if (rows_whole): every row of this simdgroup exists	1
+matmul/mul-mv.metal	allow	if (first_row + row < args.ne0) {	a store or its guard: keeps the logical row	1
+matmul/mul-mv.metal	allow	dst_f32[first_row + row] = add_residual ? tot + residual[first_row + row] : tot;	a store or its guard: keeps the logical row	4
+matmul/mul-mv.metal	allow	if (ltid == 0 && first_row + row < args.ne0) {	a store or its guard: keeps the logical row	1
+matmul/mul-mv.metal	allow	for (int row = 0; row < NR0 && first_row + row < args.ne0; ++row) {	a store or its guard: keeps the logical row	1
+matmul/mul-mv.metal	allow	if (tiisg == 0 && first_row + row < args.ne0) {	a store or its guard: keeps the logical row	1
+matmul/mul-mv.metal	allow	const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;	column and half bodies: launched for whole threadgroups only	2
+matmul/mul-mv.metal	allow	device const typename Fmt::block_t * block = (device const typename Fmt::block_t *) ((device const char *) (x + ib) + row*args.nb01);	column and half bodies: launched for whole threadgroups only	2
+matmul/mul-mv.metal	allow	const int entry = (first_row + row) * nb + ib;	column and half bodies: launched for whole threadgroups only	2
+matmul/mul-mv.metal	allow	if (first_row + row < args.ne0 && r1 + c < args.ne11) {	a store or its guard: keeps the logical row	2
+matmul/mul-mv.metal	allow	dst_f32[(int64_t) c*args.ne0 + first_row + row] = tot;	a store or its guard: keeps the logical row	2

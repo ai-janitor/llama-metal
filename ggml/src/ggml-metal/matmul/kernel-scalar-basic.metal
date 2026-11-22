@@ -204,7 +204,8 @@ void mul_vec_q_n_f32_impl(
     // pointers to src0 rows (change per slice — different weight rows each iteration)
     device const block_q_type * ax[NR0];
     FOR_UNROLL (int row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        const int rb = mv_tail_row(r0 + row, args.ne01);
+        const uint64_t offset0 = (uint64_t) rb*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
         ax[row] = (device const block_q_type *) ((device char *) src0 + offset0);
     }
 
@@ -326,7 +327,8 @@ void kernel_mul_mv_q8_0_f32_impl(
     device const block_q8_0 * ax[NR0];
     uint64_t aoff[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+        const int rb = mv_tail_row(r0 + row, args.ne01);
+        const uint64_t offset0 = (uint64_t) rb*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
 
         ax[row] = (device const block_q8_0 *) ((device char *) src0 + offset0);
         aoff[row] = offset0;
@@ -405,7 +407,8 @@ static inline void mul_mvg_q8_0_rows(
 
     device const block_q8_0 * ax[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        ax[row] = (device const block_q8_0 *) (w + (uint64_t)(r0 + row)*nb01);
+        const int rb = mv_tail_row(r0 + row, rows);
+        ax[row] = (device const block_q8_0 *) (w + (uint64_t) rb*nb01);
     }
 
     float sumf[NR0] = { 0.f };
@@ -419,7 +422,8 @@ static inline void mul_mvg_q8_0_rows(
 
         for (short row = 0; row < NR0; row++) {
             if (FC_mul_mv_q8_load == 4) {
-                block_dot_q8_0_scalar::accumulate_words(w, (uint64_t)(r0 + row)*nb01 + (uint64_t) ib*sizeof(block_q8_0), owned, prepared, sumf[row]);
+                const int rb = mv_tail_row(r0 + row, rows);
+                block_dot_q8_0_scalar::accumulate_words(w, (uint64_t) rb*nb01 + (uint64_t) ib*sizeof(block_q8_0), owned, prepared, sumf[row]);
             } else {
                 block_dot_q8_0_scalar::accumulate<block_dot_lane_fp32>(ax[row] + ib, owned, prepared, sumf[row]);
             }
@@ -503,7 +507,7 @@ void kernel_mul_mv_q8_0_f32_rows_impl(
 
     uint64_t aoff[NR0];
     FOR_UNROLL (short row = 0; row < NR0; ++row) {
-        aoff[row] = (uint64_t) min(r0 + row, args.ne01 - 1)*args.nb01;
+        aoff[row] = (uint64_t) mv_tail_row(r0 + row, args.ne01)*args.nb01;
     }
 
     float sumf[NR0] = { 0.f };

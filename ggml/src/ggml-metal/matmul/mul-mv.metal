@@ -18,12 +18,15 @@ constant short FC_mul_mv_col_form = is_function_constant_defined(FC_mul_mv_col_f
 // residual is read only when the format allows it and FC_mul_mv_residual is set; prep only by a prepared format.
 // Format hooks: a lookup table in threadgroup memory (has_table), 32-element units inside a block (units_per_block),
 // rows addressed by block count (rows_by_blocks), one row slice per threadgroup (persistent 0), a scale after the row sum.
-template<typename Fmt, int NR0, typename args_t, short LANE>
+// BOUND false: a row of a simdgroup whose rows all exist, read as local row from its base;
+// true: the bounded row, counted from the bounded first row of the base.
+template<typename Fmt, int NR0, typename args_t, short LANE, bool BOUND>
 static inline void mul_mv_row(
         args_t args,
         device const typename Fmt::block_t * x,
         int ib,
         short row,
+        int rb,
         int ns01,
         int entry,
         thread const typename Fmt::fragment_t & owned,
@@ -33,9 +36,16 @@ static inline void mul_mv_row(
         threadgroup char * shmem) {
     const int ibl = ib / Fmt::units_per_block;
     // nb01 is a byte stride between rows; cast before applying it.
-    device const typename Fmt::block_t * block = Fmt::rows_by_blocks
-        ? x + (row*ns01 + ibl)
-        : (device const typename Fmt::block_t *) ((device const char *) (x + ibl) + row*args.nb01);
+    device const typename Fmt::block_t * block;
+    if (BOUND) {
+        block = Fmt::rows_by_blocks
+            ? x + ((int64_t) rb*ns01 + ibl)
+            : (device const typename Fmt::block_t *) ((device const char *) (x + ibl) + (uint64_t) rb*args.nb01);
+    } else {
+        block = Fmt::rows_by_blocks
+            ? x + (row*ns01 + ibl)
+            : (device const typename Fmt::block_t *) ((device const char *) (x + ibl) + row*args.nb01);
+    }
     Fmt::template accumulate<LANE>(block, owned, prepared, acc, prep, entry, shmem, (short) (ib % Fmt::units_per_block));
 }
 
@@ -86,24 +96,44 @@ void mul_mv_impl(
     for (int slice = (int)tgpig.x + args.tg_x_offset; slice < total_slices; slice += grid_stride) {
 
     const int first_row = (slice * NSG + eff_sgitg) * NR0;
-    const uint64_t offset0 = first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+    // A simdgroup whose rows all exist reads them as they come; one with spare row positions reads bounded rows.
+    const bool rows_whole = mv_rows_whole(first_row, NR0, args.ne01);
+    const int fb = mv_tail_row(first_row, args.ne01);
+    const uint64_t offset0 = rows_whole ? first_row*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03 : (uint64_t) fb*args.nb01 + (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
 
     device const typename Fmt::block_t * x = (device const typename Fmt::block_t *) (src0 + offset0);
     device const float                 * y = (device const float                 *) (src1 + offset1);
 
     typename Fmt::acc_t acc[NR0] = {};
 
+    if (rows_whole) {
     for (int ib = block_id; ib < nb && (!Fmt::rows_by_blocks || ib < ns01); ib += stride) {
         const typename Fmt::activation_t prepared = Fmt::template prepare_activation<LANE>(owned, y + ib*Fmt::block_elems);
         if (Fmt::unroll_rows) {
             FOR_UNROLL (short row = 0; row < NR0; row++) {
-                mul_mv_row<Fmt, NR0, args_t, LANE>(args, x, ib, row, ns01, (first_row + row) * nb + ib, owned, prepared, acc[row], prep, shmem);
+                mul_mv_row<Fmt, NR0, args_t, LANE, false>(args, x, ib, row, first_row + row, ns01, (first_row + row) * nb + ib, owned, prepared, acc[row], prep, shmem);
             }
         } else {
             for (short row = 0; row < NR0; ++row) {
-                mul_mv_row<Fmt, NR0, args_t, LANE>(args, x, ib, row, ns01, (first_row + row) * nb + ib, owned, prepared, acc[row], prep, shmem);
+                mul_mv_row<Fmt, NR0, args_t, LANE, false>(args, x, ib, row, first_row + row, ns01, (first_row + row) * nb + ib, owned, prepared, acc[row], prep, shmem);
             }
         }
+    }
+    } else {
+    for (int ib = block_id; ib < nb && (!Fmt::rows_by_blocks || ib < ns01); ib += stride) {
+        const typename Fmt::activation_t prepared = Fmt::template prepare_activation<LANE>(owned, y + ib*Fmt::block_elems);
+        if (Fmt::unroll_rows) {
+            FOR_UNROLL (short row = 0; row < NR0; row++) {
+                const int rb = mv_tail_row(first_row + row, args.ne01);
+                mul_mv_row<Fmt, NR0, args_t, LANE, true>(args, x, ib, row, rb - fb, ns01, rb * nb + ib, owned, prepared, acc[row], prep, shmem);
+            }
+        } else {
+            for (short row = 0; row < NR0; ++row) {
+                const int rb = mv_tail_row(first_row + row, args.ne01);
+                mul_mv_row<Fmt, NR0, args_t, LANE, true>(args, x, ib, row, rb - fb, ns01, rb * nb + ib, owned, prepared, acc[row], prep, shmem);
+            }
+        }
+    }
     }
 
     float sumf[NR0];
@@ -133,8 +163,8 @@ void mul_mv_impl(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         } else {
-            // One row at a time; the barrier count is the same in every simdgroup unless the format stops at the last row.
-            for (int row = 0; row < NR0 && (!Fmt::bound_in_loop || first_row + row < args.ne0); ++row) {
+            // One row at a time; every simdgroup passes the same barriers, the store below is bounded.
+            for (int row = 0; row < NR0; ++row) {
                 buf[NW * row + ltid] = sumf[row];
                 threadgroup_barrier(mem_flags::mem_threadgroup);
                 if (ltid == 0 && first_row + row < args.ne0) {

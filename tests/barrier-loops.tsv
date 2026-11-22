@@ -22,7 +22,7 @@ matmul/kernel-scalar-kquant.metal	C	if (FC_mul_mv_shmem_reduce) {	34e23b4194b8	r
 matmul/kernel-scalar.metal	C	if (FC_mul_mv_shmem_reduce) {	d2edd4d13196	reviewed	the function constant FC_mul_mv_shmem_reduce; the loop runs to the template parameter r1ptg
 matmul/kernel-scalar.metal	C	if (FC_mul_mv_shmem_reduce) {	d2edd4d13196	reviewed	the function constant FC_mul_mv_shmem_reduce; the loop runs to the template parameter r1ptg
 matmul/mul-mv.metal	C	if (Fmt::has_table) {	8c951955c9f0	reviewed	a format trait
-matmul/mul-mv.metal	C	if (FC_mul_mv_shmem_reduce) {	86e186bbe456	open	the loop over rows holds two threadgroup barriers and, for a format with bound_in_loop (iq4_nl, iq4_xs), stops at first_row + row < ne0 with first_row from eff_sgitg: simdgroups of one threadgroup can make different trip counts in the last slice; reachability not established; owner: the matvec tail change
+matmul/mul-mv.metal	C	if (FC_mul_mv_shmem_reduce) {	6135baaf40b8	reviewed	the function constant FC_mul_mv_shmem_reduce; both row loops around the barriers run to the template parameter NR0 in every simdgroup, the stores inside are bounded
 matmul/mul-mv.metal	C	if (FC_mul_mv_shmem_reduce) {	7b15f338c655	reviewed	the function constant FC_mul_mv_shmem_reduce; no loop around its three barriers
 misc/solve-argmax.metal	L	for (short rr = 0; rr < N; rr += NSG) {	e23ad457cf5b	reviewed	the continue follows both barriers of the pass and no barrier follows it in the body
 misc/solve-argmax.metal	C	if (ntg > simd_width) {	dd2bd781815a	reviewed	the launch threads per threadgroup against the simd width: the same for every thread
